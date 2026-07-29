@@ -3,7 +3,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 use toml_edit::{DocumentMut, Item, Table, value};
 #[cfg(windows)]
 use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, KEY_QUERY_VALUE, REG_DWORD, REG_SZ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW};
@@ -209,6 +209,111 @@ pub fn sync_all(config: &AppConfig, preferred_openai: Option<&str>) -> Result<St
     Ok(format!("Codex={codex}, Claude={claude}"))
 }
 
+pub fn sync_provider_models(
+    config: &AppConfig,
+    protocol: Protocol,
+    provider: &str,
+) -> Result<Option<String>> {
+    if !config.cc_switch_db.exists() {
+        return Ok(None);
+    }
+    let app_type = if protocol == Protocol::OpenAi { "codex" } else { "claude" };
+    let Some(row) = sqlite::providers(&config.cc_switch_db, app_type)?
+        .into_iter()
+        .find(|row| row.id == provider)
+    else {
+        return Ok(None);
+    };
+    let settings: Value = serde_json::from_str(&row.settings)
+        .with_context(|| format!("CC-Switch Provider {} 配置无法解析", row.name))?;
+    if protocol == Protocol::OpenAi {
+        sync_codex_model(config, &settings)
+    } else {
+        sync_claude_models(config, &settings)
+    }
+}
+
+fn sync_codex_model(config: &AppConfig, settings: &Value) -> Result<Option<String>> {
+    let provider_text = settings
+        .get("config")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("CC-Switch Codex Provider 缺少 config"))?;
+    let provider_doc = provider_text
+        .parse::<DocumentMut>()
+        .context("CC-Switch Codex TOML 无法解析")?;
+    let target = provider_doc
+        .get("model")
+        .and_then(Item::as_str)
+        .map(str::to_owned);
+
+    let original = fs::read_to_string(&config.codex_config)
+        .with_context(|| format!("无法读取 {}", config.codex_config.display()))?;
+    let mut current = original.parse::<DocumentMut>().context("Codex TOML 无法解析")?;
+    let previous = current
+        .get("model")
+        .and_then(Item::as_str)
+        .map(str::to_owned);
+    if previous == target {
+        return Ok(None);
+    }
+    match target.as_deref() {
+        Some(model) => current["model"] = value(model),
+        None => {
+            current.remove("model");
+        }
+    }
+    atomic_write(&config.codex_config, current.to_string().as_bytes())?;
+    Ok(Some(format!(
+        "Codex 模型已从 {} 切换为 {}，请重启 Codex 生效",
+        previous.as_deref().unwrap_or("默认模型"),
+        target.as_deref().unwrap_or("默认模型")
+    )))
+}
+
+fn sync_claude_models(config: &AppConfig, settings: &Value) -> Result<Option<String>> {
+    let target = settings
+        .get("env")
+        .and_then(Value::as_object)
+        .map(claude_model_values)
+        .unwrap_or_default();
+    let original = if config.claude_settings.exists() {
+        fs::read_to_string(&config.claude_settings)?
+    } else {
+        "{}".into()
+    };
+    let mut root: Value = serde_json::from_str(&original).context("Claude settings.json 无法解析")?;
+    if !root.is_object() {
+        return Err(anyhow!("Claude settings.json 根节点必须是对象"));
+    }
+    let root_obj = root.as_object_mut().unwrap();
+    if !root_obj.get("env").is_some_and(Value::is_object) {
+        root_obj.insert("env".into(), Value::Object(Map::new()));
+    }
+    let env = root_obj.get_mut("env").and_then(Value::as_object_mut).unwrap();
+    let previous = claude_model_values(env);
+    if previous == target {
+        return Ok(None);
+    }
+    env.retain(|key, _| !is_claude_model_key(key));
+    env.extend(target);
+    atomic_write(&config.claude_settings, &serde_json::to_vec_pretty(&root)?)?;
+    Ok(Some("Claude Code 模型及角色模型已更新，请重启 Claude Code 生效".into()))
+}
+
+fn claude_model_values(env: &Map<String, Value>) -> BTreeMap<String, Value> {
+    env.iter()
+        .filter(|(key, value)| is_claude_model_key(key) && value.is_string())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn is_claude_model_key(key: &str) -> bool {
+    key == "ANTHROPIC_MODEL"
+        || key == "CLAUDE_CODE_SUBAGENT_MODEL"
+        || (key.starts_with("ANTHROPIC_DEFAULT_")
+            && (key.ends_with("_MODEL") || key.ends_with("_MODEL_NAME")))
+}
+
 pub fn capture_baseline(config: &AppConfig) -> Result<()> {
     let manifest_path = config.state_dir.join("install-manifest.json");
     if manifest_path.exists() { return Ok(()); }
@@ -255,6 +360,13 @@ fn restore_codex(config: &AppConfig, baseline_path: Option<&str>) -> Result<()> 
         if let Some(item) = baseline.as_ref().and_then(|doc| doc.get("openai_base_url")).cloned() { current["openai_base_url"] = item; } else { current.remove("openai_base_url"); }
     }
     if let Some(providers) = current.get_mut("model_providers").and_then(Item::as_table_mut) { providers.remove("headroom"); }
+    if let Some(baseline) = baseline.as_ref() {
+        if let Some(item) = baseline.get("model").cloned() {
+            current["model"] = item;
+        } else {
+            current.remove("model");
+        }
+    }
     let restored = current.to_string();
     if restored != original { backup(&config.codex_config, &original)?; atomic_write(&config.codex_config, restored.as_bytes())?; }
     Ok(())
@@ -269,6 +381,19 @@ fn restore_claude(config: &AppConfig, baseline_path: Option<&str>) -> Result<()>
     if local {
         let env = current.as_object_mut().and_then(|root| root.get_mut("env")).and_then(Value::as_object_mut).ok_or_else(|| anyhow!("Claude env 配置无效"))?;
         if let Some(value) = baseline.as_ref().and_then(|root| root.pointer("/env/ANTHROPIC_BASE_URL")).cloned() { env.insert("ANTHROPIC_BASE_URL".into(), value); } else { env.remove("ANTHROPIC_BASE_URL"); }
+    }
+    if let Some(baseline) = baseline.as_ref() {
+        if let Some(env) = current
+            .as_object_mut()
+            .and_then(|root| root.get_mut("env"))
+            .and_then(Value::as_object_mut)
+        {
+            env.retain(|key, _| !is_claude_model_key(key));
+            if let Some(baseline_env) = baseline.get("env").and_then(Value::as_object)
+            {
+                env.extend(claude_model_values(baseline_env));
+            }
+        }
     }
     let restored = serde_json::to_vec_pretty(&current)?;
     if restored != original.as_bytes() { backup(&config.claude_settings, &original)?; atomic_write(&config.claude_settings, &restored)?; }
@@ -374,6 +499,55 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     if path.exists() { fs::remove_file(path)?; }
     fs::rename(temp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod model_sync_tests {
+    use super::*;
+
+    #[test]
+    fn syncs_codex_model_only_when_it_changes() {
+        let dir = std::env::temp_dir().join(format!("headroom-route-codex-model-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::default();
+        config.codex_config = dir.join("config.toml");
+        fs::write(&config.codex_config, "model = \"old-model\"\nmodel_provider = \"headroom\"\n").unwrap();
+        let settings = serde_json::json!({"config": "model = \"new-model\"\n"});
+
+        assert!(sync_codex_model(&config, &settings).unwrap().is_some());
+        let doc = fs::read_to_string(&config.codex_config).unwrap().parse::<DocumentMut>().unwrap();
+        assert_eq!(doc.get("model").and_then(Item::as_str), Some("new-model"));
+        assert!(sync_codex_model(&config, &settings).unwrap().is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn syncs_all_claude_model_roles_and_preserves_unrelated_env() {
+        let dir = std::env::temp_dir().join(format!("headroom-route-claude-model-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::default();
+        config.claude_settings = dir.join("settings.json");
+        fs::write(&config.claude_settings, r#"{"env":{"KEEP":"yes","ANTHROPIC_MODEL":"old","ANTHROPIC_DEFAULT_HAIKU_MODEL":"old-haiku"}}"#).unwrap();
+        let settings = serde_json::json!({"env": {
+            "ANTHROPIC_MODEL": "new",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "new-opus",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME": "fable-name",
+            "CLAUDE_CODE_SUBAGENT_MODEL": "subagent"
+        }});
+
+        assert!(sync_claude_models(&config, &settings).unwrap().is_some());
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&config.claude_settings).unwrap()).unwrap();
+        assert_eq!(saved["env"]["KEEP"], "yes");
+        assert_eq!(saved["env"]["ANTHROPIC_MODEL"], "new");
+        assert_eq!(saved["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "new-opus");
+        assert_eq!(saved["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"], "fable-name");
+        assert_eq!(saved["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "subagent");
+        assert!(saved["env"].get("ANTHROPIC_DEFAULT_HAIKU_MODEL").is_none());
+        assert!(sync_claude_models(&config, &settings).unwrap().is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]

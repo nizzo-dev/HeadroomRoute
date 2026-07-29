@@ -56,6 +56,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 if let Some((ok, message)) = app.take_sync_result() {
                     if ok { notify(hwnd, "同步完成", &message); } else { notify(hwnd, "同步失败", &message); }
                 }
+                if let Some(message) = app.take_model_change_notice() {
+                    notify(hwnd, "模型配置已更新", &message);
+                }
                 if let Some((ok, message)) = app.take_restart_result() {
                     if ok { notify(hwnd, "Headroom 重启完成", &message); } else { notify(hwnd, "Headroom 重启失败", &message); }
                 }

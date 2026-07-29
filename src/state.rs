@@ -27,6 +27,7 @@ pub struct AppState {
     pub restart_in_progress: AtomicBool,
     pub restart_status: Mutex<String>,
     pub restart_result: Mutex<Option<(bool, String)>>,
+    pub model_change_notice: Mutex<Option<String>>,
     pub maintenance_action: Mutex<Option<String>>,
 }
 
@@ -56,6 +57,7 @@ impl AppState {
             stop: AtomicBool::new(false), restart_headroom: AtomicBool::new(false), force_probe: AtomicBool::new(false),
             sync_in_progress: AtomicBool::new(false), sync_status: Mutex::new("未同步".into()), sync_result: Mutex::new(None),
             restart_in_progress: AtomicBool::new(false), restart_status: Mutex::new("未重启".into()), restart_result: Mutex::new(None),
+            model_change_notice: Mutex::new(None),
             maintenance_action: Mutex::new(None),
         })
     }
@@ -88,6 +90,10 @@ impl AppState {
 
     pub fn take_restart_result(&self) -> Option<(bool, String)> { self.restart_result.lock().unwrap().take() }
 
+    pub fn take_model_change_notice(&self) -> Option<String> {
+        self.model_change_notice.lock().unwrap().take()
+    }
+
     pub fn snapshot(&self) -> Snapshot { self.snapshot_unlocked(&self.inner.lock().unwrap()) }
     pub fn active_route(&self) -> Option<Route> { self.active_route_for(Protocol::OpenAi) }
     pub fn active_route_for(&self, protocol: Protocol) -> Option<Route> {
@@ -101,9 +107,22 @@ impl AppState {
     pub fn active_url(&self) -> Option<String> { self.active_route().map(|route| route.base_url) }
 
     pub fn switch_index(&self, index: usize, reason: &str) -> bool {
+        let (protocol, provider, app_config) = {
+            let state = self.inner.lock().unwrap();
+            let Some(route) = state.routes.get(index) else { return false };
+            (route.protocol, route.provider.clone(), state.config.clone())
+        };
+        let model_notice = match config::sync_provider_models(&app_config, protocol, &provider) {
+            Ok(notice) => notice,
+            Err(error) => {
+                self.inner.lock().unwrap().last_error = Some(format!("同步目标模型配置失败: {error}"));
+                return false;
+            }
+        };
         let mut state = self.inner.lock().unwrap();
-        let Some(route) = state.routes.get(index) else { return false };
-        let protocol = route.protocol; let provider = route.provider.clone();
+        if !state.routes.get(index).is_some_and(|route| route.protocol == protocol && route.provider == provider) {
+            return false;
+        }
         if protocol == Protocol::OpenAi {
             state.active = Some(index); state.selected_provider = Some(provider.clone()); state.config.selected_openai_provider = Some(provider);
         } else {
@@ -114,6 +133,7 @@ impl AppState {
         let saved = state.config.clone();
         drop(state);
         if let Err(error) = config::save(&path, &saved) { self.inner.lock().unwrap().last_error = Some(format!("保存上游选择失败: {error}")); }
+        if let Some(notice) = model_notice { *self.model_change_notice.lock().unwrap() = Some(notice); }
         true
     }
 
@@ -226,7 +246,7 @@ mod tests {
         ];
         let app = Arc::new(AppState {
             inner: Mutex::new(RuntimeState { config, routes, active: Some(0), active_anthropic: None, selected_provider: Some("cc-current".into()), selected_anthropic_provider: None, headroom_state: "test".into(), headroom_pid: None, last_switch_reason: None, last_error: None }),
-            stop: AtomicBool::new(false), restart_headroom: AtomicBool::new(false), force_probe: AtomicBool::new(false), sync_in_progress: AtomicBool::new(false), sync_status: Mutex::new("未同步".into()), sync_result: Mutex::new(None), restart_in_progress: AtomicBool::new(false), restart_status: Mutex::new("未重启".into()), restart_result: Mutex::new(None), maintenance_action: Mutex::new(None),
+            stop: AtomicBool::new(false), restart_headroom: AtomicBool::new(false), force_probe: AtomicBool::new(false), sync_in_progress: AtomicBool::new(false), sync_status: Mutex::new("未同步".into()), sync_result: Mutex::new(None), restart_in_progress: AtomicBool::new(false), restart_status: Mutex::new("未重启".into()), restart_result: Mutex::new(None), model_change_notice: Mutex::new(None), maintenance_action: Mutex::new(None),
         });
         assert!(app.switch_index(1, "test"));
         let saved: AppConfig = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
