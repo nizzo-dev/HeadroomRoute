@@ -80,14 +80,19 @@ fn headroom_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
         let client = Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
         let mut child: Option<Child> = None;
         let mut restart_deadline: Option<Instant> = None;
+        let mut spawn_failures: u32 = 0;
         while !should_stop(&app) {
             let restart = app.restart_headroom.swap(false, Ordering::Relaxed);
-            let (port, manage) = { let state = app.inner.lock().unwrap(); (state.config.headroom_port, state.config.manage_headroom) };
+            let (port, manage, state_dir) = {
+                let state = app.inner.lock().unwrap();
+                (state.config.headroom_port, state.config.manage_headroom, state.config.state_dir.clone())
+            };
             let health = client.get(format!("http://127.0.0.1:{port}/livez")).send().ok().and_then(|r| r.json::<Value>().ok());
             let verified = health.as_ref().and_then(|v| v.get("service")).and_then(Value::as_str) == Some("headroom-proxy");
             if restart {
                 if !app.restart_in_progress.load(Ordering::Acquire) { let _ = app.begin_restart(); }
                 restart_deadline = Some(Instant::now() + Duration::from_secs(45));
+                spawn_failures = 0;
                 app.inner.lock().unwrap().headroom_state = "restarting".into();
                 if let Some(mut running) = child.take() { let _ = running.kill(); let _ = running.wait(); }
                 else if verified {
@@ -101,20 +106,48 @@ fn headroom_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
                 }
             }
             let child_dead = child.as_mut().is_some_and(|value| value.try_wait().ok().flatten().is_some());
-            if child_dead { child = None; }
+            if child_dead {
+                child = None;
+                spawn_failures = spawn_failures.saturating_add(1);
+                let detail = recent_headroom_error(&state_dir).unwrap_or_else(|| "Headroom 进程已退出".into());
+                let message = format!("Headroom 异常退出: {detail}");
+                app.inner.lock().unwrap().last_error = Some(message.clone());
+                if restart_deadline.take().is_some() {
+                    app.finish_restart(false, message);
+                }
+            }
             if verified && !restart {
+                spawn_failures = 0;
                 let mut state = app.inner.lock().unwrap(); state.headroom_state = if child.is_some() { "healthy" } else { "external" }.into(); state.headroom_pid = listener_pid(port);
                 drop(state);
                 if restart_deadline.take().is_some() { app.finish_restart(true, "Headroom 健康检查已恢复".into()); }
-            } else if manage && child.is_none() {
+            } else if manage && child.is_none() && spawn_failures < 3 {
                 match spawn_headroom(&app) {
-                    Ok(process) => { let pid = process.id(); child = Some(process); let mut state = app.inner.lock().unwrap(); state.headroom_state="starting".into(); state.headroom_pid=Some(pid); }
-                    Err(error) => { let message=format!("Headroom 启动失败: {error}"); let mut state=app.inner.lock().unwrap(); state.headroom_state="unavailable".into(); state.headroom_pid=None; state.last_error=Some(message.clone()); drop(state); if restart_deadline.take().is_some(){app.finish_restart(false,message);} }
+                    Ok(process) => {
+                        let pid = process.id();
+                        child = Some(process);
+                        let mut state = app.inner.lock().unwrap();
+                        state.headroom_state = "starting".into();
+                        state.headroom_pid = Some(pid);
+                    }
+                    Err(error) => {
+                        spawn_failures = spawn_failures.saturating_add(1);
+                        let message = format!("Headroom 启动失败: {error}");
+                        let mut state = app.inner.lock().unwrap();
+                        state.headroom_state = "unavailable".into();
+                        state.headroom_pid = None;
+                        state.last_error = Some(message.clone());
+                        drop(state);
+                        if restart_deadline.take().is_some() { app.finish_restart(false, message); }
+                    }
                 }
-            } else if !verified { app.inner.lock().unwrap().headroom_state = "unavailable".into(); }
+            } else if !verified {
+                app.inner.lock().unwrap().headroom_state = "unavailable".into();
+            }
             if restart_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 restart_deadline = None;
-                app.finish_restart(false, "45 秒内未通过 Headroom 健康检查".into());
+                let detail = recent_headroom_error(&state_dir).unwrap_or_else(|| "未通过健康检查".into());
+                app.finish_restart(false, format!("45 秒内未恢复 Headroom: {detail}"));
             }
             sleep_interruptible(&app, Duration::from_secs(3));
         }
@@ -133,13 +166,40 @@ fn spawn_headroom(app: &AppState) -> anyhow::Result<Child> {
     let agent_url = format!("http://127.0.0.1:{}", state.config.agent_port);
     let port = state.config.headroom_port.to_string();
     let log_file = state.config.state_dir.join("headroom-proxy.jsonl");
-    command.args(["-m","headroom.cli","proxy","--host","127.0.0.1","--port",&port,"--mode","token","--code-aware","--intercept-tool-results","--openai-api-url",&agent_url,"--anthropic-api-url",&agent_url,"--log-file",log_file.to_string_lossy().as_ref(),"--no-telemetry"]);
+    command.args([
+        "-m", "headroom.cli", "proxy",
+        "--host", "127.0.0.1", "--port", &port,
+        "--mode", "token", "--code-aware", "--intercept-tool-results",
+        "--target-ratio", "0.35", "--no-ccr-proactive-expansion",
+        "--read-maturation", "--read-maturation-quiesce-turns", "2",
+        "--read-maturation-max-hold-turns", "8", "--read-maturation-min-size-bytes", "1024",
+        "--openai-api-url", &agent_url, "--anthropic-api-url", &agent_url,
+        "--log-file", log_file.to_string_lossy().as_ref(),
+        "--no-telemetry", "--no-http2",
+    ]);
     if state.config.no_subscription_tracking { command.arg("--no-subscription-tracking"); }
     command.env("OPENAI_TARGET_API_URL", &agent_url).env("ANTHROPIC_TARGET_API_URL", &agent_url)
-        .env("HEADROOM_OUTPUT_SHAPER","1").env("HEADROOM_TELEMETRY","off").env("HEADROOM_UPDATE_CHECK","off").env("HEADROOM_SKIP_UPSTREAM_CHECK","1")
+        .env("HEADROOM_OUTPUT_SHAPER", "1").env("HEADROOM_TELEMETRY", "off")
+        .env("HEADROOM_VERBOSITY_LEVEL", "4").env("HEADROOM_INTERCEPT_READ_MIN_CHARS", "200")
+        .env("HEADROOM_UPDATE_CHECK", "off").env("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+        .env("HEADROOM_HTTP2", "0")
         .stdin(Stdio::null()).stdout(stdout).stderr(stderr);
     #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x08000000 | 0x00000200); }
     Ok(command.spawn()?)
+}
+
+fn recent_headroom_error(state_dir: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(state_dir.join("headroom.stderr.log")).ok()?;
+    let interesting = text.lines().rev().find(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("importerror")
+            || lower.contains("modulenotfounderror")
+            || lower.contains("error:")
+            || lower.contains("traceback")
+            || lower.contains("address already in use")
+            || lower.contains("oserror")
+    })?;
+    Some(interesting.chars().take(240).collect())
 }
 
 fn sleep_interruptible(app: &AppState, duration: Duration) {

@@ -1,0 +1,209 @@
+#![cfg(windows)]
+
+use anyhow::{Result, anyhow};
+use std::{
+    ptr,
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+use windows_sys::Win32::{
+    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+    Graphics::Gdi::{COLOR_WINDOW, GetSysColorBrush, UpdateWindow},
+    System::LibraryLoader::GetModuleHandleW,
+    UI::WindowsAndMessaging::*,
+};
+
+const STATIC_CENTERED: u32 = 0x0001 | 0x0200;
+
+enum ProgressMessage {
+    Status(String),
+    Close,
+}
+
+pub struct ProgressWindow {
+    sender: Sender<ProgressMessage>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ProgressWindow {
+    pub fn open() -> Result<Self> {
+        let (sender, receiver) = mpsc::channel();
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let thread = thread::spawn(move || progress_thread(receiver, ready_sender));
+        match ready_receiver.recv() {
+            Ok(Ok(())) => Ok(Self {
+                sender,
+                thread: Some(thread),
+            }),
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                Err(anyhow!(error))
+            }
+            Err(_) => {
+                let _ = thread.join();
+                Err(anyhow!("修复进度窗口意外退出"))
+            }
+        }
+    }
+
+    pub fn set_status(&self, status: &str) {
+        let _ = self.sender.send(ProgressMessage::Status(status.to_owned()));
+    }
+
+    pub fn close(mut self) {
+        self.stop();
+    }
+
+    fn stop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = self.sender.send(ProgressMessage::Close);
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for ProgressWindow {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn progress_thread(
+    receiver: Receiver<ProgressMessage>,
+    ready: mpsc::SyncSender<Result<(), String>>,
+) {
+    unsafe {
+        let instance = GetModuleHandleW(ptr::null());
+        let class_name = wide("HeadroomRouteProgressWindow");
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(window_proc),
+            hInstance: instance,
+            hbrBackground: GetSysColorBrush(COLOR_WINDOW),
+            lpszClassName: class_name.as_ptr(),
+            ..std::mem::zeroed()
+        };
+        if RegisterClassW(&class) == 0 {
+            let _ = ready.send(Err("无法注册修复进度窗口".into()));
+            return;
+        }
+
+        let width = 500;
+        let height = 170;
+        let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
+        let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            class_name.as_ptr(),
+            wide("修复 Headroom 运行环境").as_ptr(),
+            WS_CAPTION | WS_POPUP | WS_SYSMENU,
+            x,
+            y,
+            width,
+            height,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            instance,
+            ptr::null(),
+        );
+        if hwnd.is_null() {
+            let _ = ready.send(Err("无法创建修复进度窗口".into()));
+            return;
+        }
+
+        let label = CreateWindowExW(
+            0,
+            wide("STATIC").as_ptr(),
+            wide("正在准备修复...").as_ptr(),
+            WS_CHILD | WS_VISIBLE | STATIC_CENTERED,
+            20,
+            15,
+            width - 40,
+            height - 55,
+            hwnd,
+            ptr::null_mut(),
+            instance,
+            ptr::null(),
+        );
+        if label.is_null() {
+            DestroyWindow(hwnd);
+            let _ = ready.send(Err("无法创建修复进度提示".into()));
+            return;
+        }
+
+        ShowWindow(hwnd, SW_SHOW);
+        UpdateWindow(hwnd);
+        if ready.send(Ok(())).is_err() {
+            DestroyWindow(hwnd);
+            return;
+        }
+        run_message_loop(hwnd, label, receiver);
+    }
+}
+
+unsafe fn run_message_loop(hwnd: HWND, label: HWND, receiver: Receiver<ProgressMessage>) {
+    let mut message: MSG = unsafe { std::mem::zeroed() };
+    let mut status = "正在准备修复".to_owned();
+    let mut animation = Instant::now();
+    let mut dots = 0;
+    loop {
+        while unsafe { PeekMessageW(&mut message, ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+            if message.message == WM_QUIT {
+                return;
+            }
+            unsafe {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+
+        match receiver.try_recv() {
+            Ok(ProgressMessage::Status(next)) => {
+                status = next.trim_end_matches(['.', '。']).to_owned();
+                dots = 0;
+                animation = Instant::now();
+                unsafe { update_label(label, &status, dots) };
+            }
+            Ok(ProgressMessage::Close) | Err(TryRecvError::Disconnected) => {
+                unsafe { DestroyWindow(hwnd) };
+                return;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+
+        if animation.elapsed() >= Duration::from_millis(500) {
+            dots = (dots + 1) % 4;
+            unsafe { update_label(label, &status, dots) };
+            animation = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+}
+
+unsafe fn update_label(label: HWND, status: &str, dots: usize) {
+    let text = format!(
+        "{status}{}\r\n\r\n请勿关闭程序，完成后将自动提示。",
+        ".".repeat(dots)
+    );
+    unsafe { SetWindowTextW(label, wide(&text).as_ptr()) };
+}
+
+unsafe extern "system" fn window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_CLOSE => 0,
+        WM_DESTROY => {
+            unsafe { PostQuitMessage(0) };
+            0
+        }
+        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}

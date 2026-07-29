@@ -2,6 +2,7 @@
 
 mod config;
 mod model;
+mod progress;
 mod proxy;
 mod runtime;
 mod sqlite;
@@ -13,11 +14,21 @@ use anyhow::{Context, Result};
 use state::AppState;
 use std::{path::PathBuf, ptr, sync::atomic::Ordering};
 use windows_sys::Win32::{Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError}, System::Threading::CreateMutexW, UI::WindowsAndMessaging::{MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MessageBoxW}};
+use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 
 fn main() {
+    enable_dpi_awareness();
     if let Err(error) = run() {
         let message = format!("Headroom Route 启动失败：\r\n\r\n{error:#}");
         unsafe { MessageBoxW(ptr::null_mut(), wide(&message).as_ptr(), wide("Headroom Route").as_ptr(), MB_OK | MB_ICONERROR); }
+    }
+}
+
+fn enable_dpi_awareness() {
+    unsafe {
+        if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 0 {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetProcessDPIAware();
+        }
     }
 }
 
@@ -51,7 +62,7 @@ fn run() -> Result<()> {
     }
     if args.iter().any(|arg| arg == "--repair-runtime") {
         let mut cfg = app.inner.lock().unwrap().config.clone();
-        let python = runtime::repair_runtime(&cfg, |_| {})?;
+        let python = repair_runtime_with_progress(&cfg)?;
         cfg.headroom_python = Some(python); config::save(&config_path, &cfg)?;
         show_info("Headroom 运行环境修复完成");
         unsafe { CloseHandle(mutex); }
@@ -107,7 +118,7 @@ fn run() -> Result<()> {
         let mut cfg = app.inner.lock().unwrap().config.clone();
         match action.as_str() {
             "restore" => { config::restore_clients(&cfg)?; show_info("Codex 与 Claude Code 配置已恢复"); }
-            "repair" => { let python = runtime::repair_runtime(&cfg, |_| {})?; cfg.headroom_python = Some(python); config::save(&config_path, &cfg)?; show_info("Headroom 运行环境修复完成，请重新启动程序"); }
+            "repair" => { let python = repair_runtime_with_progress(&cfg)?; cfg.headroom_python = Some(python); config::save(&config_path, &cfg)?; show_info("Headroom 运行环境修复完成，请重新启动程序"); }
             "uninstall" => { runtime::uninstall(&cfg)?; show_info("已恢复配置并删除托管环境；程序文件将在 Windows 重启后清理"); }
             _ => {}
         }
@@ -118,6 +129,13 @@ fn run() -> Result<()> {
 
 fn wide(value: &str) -> Vec<u16> { value.encode_utf16().chain(Some(0)).collect() }
 fn show_info(message: &str) { unsafe { MessageBoxW(ptr::null_mut(), wide(message).as_ptr(), wide("Headroom Route").as_ptr(), MB_OK | MB_ICONINFORMATION); } }
+
+fn repair_runtime_with_progress(config: &model::AppConfig) -> Result<PathBuf> {
+    let progress = progress::ProgressWindow::open()?;
+    let result = runtime::repair_runtime(config, |status| progress.set_status(status));
+    progress.close();
+    result
+}
 
 #[allow(dead_code)]
 fn app_data_dir() -> PathBuf { model::AppConfig::default().state_dir }

@@ -1,5 +1,5 @@
 #![cfg(windows)]
-use crate::{config, state::AppState};
+use crate::{config, model::{Protocol, Snapshot}, state::AppState};
 use std::{cell::Cell, ffi::c_void, mem::size_of, process::Command, ptr, sync::{Arc, OnceLock, atomic::Ordering}, thread};
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
@@ -71,21 +71,27 @@ unsafe fn show_menu(hwnd: HWND) {
     let Some(app) = APP.get() else { return };
     let snapshot = app.snapshot();
     let menu = unsafe { CreatePopupMenu() };
-    let title = format!("Codex：{} · Claude：{} · {}", snapshot.active_name.as_deref().unwrap_or("未配置"), snapshot.active_anthropic_name.as_deref().unwrap_or("未配置"), health_cn(snapshot.state));
-    unsafe { AppendMenuW(menu, MF_STRING | MF_DISABLED, ID_OPEN_STATUS, wide(&title).as_ptr()) };
-    unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null()) };
-    for (index, route) in snapshot.routes.iter().take(32).enumerate() {
-        let selected = snapshot.active_url.as_deref() == Some(&route.base_url)
-            || snapshot.active_anthropic_url.as_deref() == Some(&route.base_url);
-        let flags = MF_STRING | if selected { MF_CHECKED } else { 0 };
-        let text = format!("[{}] {}  {} · {}ms", route.protocol.label(), route.name, route.state.label(), route.latency_ms.map(|v|v.to_string()).unwrap_or_else(||"--".into()));
-        unsafe { AppendMenuW(menu, flags, ID_ROUTE_BASE + index, wide(&text).as_ptr()) };
+    let codex_menu = unsafe { route_menu(&snapshot, Protocol::OpenAi, snapshot.active_url.as_deref()) };
+    let claude_menu = unsafe { route_menu(&snapshot, Protocol::Anthropic, snapshot.active_anthropic_url.as_deref()) };
+    let service = format!("Headroom：{}  ·  路由{}", headroom_cn(&snapshot.headroom_state), health_cn(snapshot.state));
+    let codex = format!("Codex：{}  ·  {} ms", snapshot.active_name.as_deref().unwrap_or("未配置"), latency_text(snapshot.latency_ms));
+    let claude = format!("Claude：{}  ·  {} ms", snapshot.active_anthropic_name.as_deref().unwrap_or("未配置"), latency_text(snapshot.anthropic_latency_ms));
+    unsafe {
+        AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, wide(&service).as_ptr());
+        AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, wide(&codex).as_ptr());
+        AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, wide(&claude).as_ptr());
+        AppendMenuW(menu, MF_STRING, ID_OPEN_STATUS, wide("查看完整状态...").as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+        let codex_label = format!("切换 Codex 上游（{}）", snapshot.active_name.as_deref().unwrap_or("未配置"));
+        let claude_label = format!("切换 Claude 上游（{}）", snapshot.active_anthropic_name.as_deref().unwrap_or("未配置"));
+        AppendMenuW(menu, MF_POPUP, codex_menu as usize, wide(&codex_label).as_ptr());
+        AppendMenuW(menu, MF_POPUP, claude_menu as usize, wide(&claude_label).as_ptr());
     }
     unsafe {
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-        AppendMenuW(menu, MF_STRING, ID_CHECK, wide("立即检查").as_ptr());
+        AppendMenuW(menu, MF_STRING, ID_CHECK, wide("立即检查上游").as_ptr());
         let (sync_flags, sync_text) = if app.sync_in_progress.load(Ordering::Acquire) {
-            (MF_STRING | MF_DISABLED, "正在同步 Codex + Claude...")
+            (MF_STRING | MF_DISABLED | MF_GRAYED, "正在同步 Codex + Claude...")
         } else if snapshot.sync_status == "同步完成" {
             (MF_STRING, "同步配置（上次已完成）")
         } else {
@@ -93,36 +99,57 @@ unsafe fn show_menu(hwnd: HWND) {
         };
         AppendMenuW(menu, sync_flags, ID_SYNC, wide(sync_text).as_ptr());
         let (restart_flags, restart_text) = if app.restart_in_progress.load(Ordering::Acquire) {
-            (MF_STRING | MF_DISABLED, "正在重启 Headroom...")
+            (MF_STRING | MF_DISABLED | MF_GRAYED, "正在重启 Headroom...")
         } else if snapshot.restart_status == "重启完成" {
             (MF_STRING, "重启 Headroom（上次已完成）")
         } else {
             (MF_STRING, "重启 Headroom")
         };
         AppendMenuW(menu, restart_flags, ID_RESTART, wide(restart_text).as_ptr());
-        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+        let settings_menu = CreatePopupMenu();
         let startup = app.inner.lock().unwrap().config.start_with_windows;
-        AppendMenuW(menu, MF_STRING | if startup { MF_CHECKED } else { 0 }, ID_STARTUP, wide("开机启动").as_ptr());
-        AppendMenuW(menu, MF_STRING, ID_DIAG, wide("复制诊断报告").as_ptr());
-        AppendMenuW(menu, MF_STRING, ID_CONFIG, wide("打开配置文件").as_ptr());
-        AppendMenuW(menu, MF_STRING, ID_LOGS, wide("打开数据目录").as_ptr());
+        AppendMenuW(settings_menu, MF_STRING | if startup { MF_CHECKED } else { 0 }, ID_STARTUP, wide("随 Windows 启动").as_ptr());
+        AppendMenuW(settings_menu, MF_SEPARATOR, 0, ptr::null());
+        AppendMenuW(settings_menu, MF_STRING, ID_CONFIG, wide("打开 config.json").as_ptr());
+        AppendMenuW(settings_menu, MF_STRING, ID_LOGS, wide("打开数据与日志目录").as_ptr());
+        AppendMenuW(settings_menu, MF_STRING, ID_DIAG, wide("复制脱敏诊断报告").as_ptr());
+        let maintenance_menu = CreatePopupMenu();
+        AppendMenuW(maintenance_menu, MF_STRING, ID_REPAIR_RUNTIME, wide("修复 Headroom 运行环境...").as_ptr());
+        AppendMenuW(maintenance_menu, MF_STRING, ID_RESTORE, wide("恢复 Codex / Claude 原始配置...").as_ptr());
+        AppendMenuW(maintenance_menu, MF_SEPARATOR, 0, ptr::null());
+        AppendMenuW(maintenance_menu, MF_STRING, ID_UNINSTALL, wide("完全卸载并还原...").as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-        AppendMenuW(menu, MF_STRING, ID_RESTORE, wide("恢复 Codex / Claude 配置").as_ptr());
-        AppendMenuW(menu, MF_STRING, ID_REPAIR_RUNTIME, wide("修复 Headroom 运行环境").as_ptr());
-        AppendMenuW(menu, MF_STRING, ID_UNINSTALL, wide("完全卸载并还原").as_ptr());
+        AppendMenuW(menu, MF_POPUP, settings_menu as usize, wide("设置与诊断").as_ptr());
+        AppendMenuW(menu, MF_POPUP, maintenance_menu as usize, wide("维护与还原").as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-        AppendMenuW(menu, MF_STRING, ID_EXIT, wide("退出").as_ptr());
+        AppendMenuW(menu, MF_STRING, ID_EXIT, wide("退出 HeadroomRoute").as_ptr());
         let mut point = POINT::default(); GetCursorPos(&mut point); SetForegroundWindow(hwnd);
         TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, ptr::null());
         DestroyMenu(menu);
     }
 }
 
+unsafe fn route_menu(snapshot: &Snapshot, protocol: Protocol, active_url: Option<&str>) -> HMENU {
+    let menu = unsafe { CreatePopupMenu() };
+    let mut count = 0;
+    for (index, route) in snapshot.routes.iter().take(32).enumerate() {
+        if route.protocol != protocol { continue; }
+        count += 1;
+        let flags = MF_STRING | if active_url == Some(route.base_url.as_str()) { MF_CHECKED } else { 0 };
+        let text = format!("{}  ·  {}  ·  {} ms", route.name, route.state.label(), latency_text(route.latency_ms));
+        unsafe { AppendMenuW(menu, flags, ID_ROUTE_BASE + index, wide(&text).as_ptr()) };
+    }
+    if count == 0 {
+        unsafe { AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, wide("未发现可用上游").as_ptr()) };
+    }
+    menu
+}
+
 unsafe fn handle_command(hwnd: HWND, id: usize) {
     let Some(app) = APP.get() else { return };
     match id {
         ID_OPEN_STATUS => unsafe { show_status(hwnd) },
-        ID_CHECK => app.force_probe.store(true, Ordering::Relaxed),
+        ID_CHECK => { app.force_probe.store(true, Ordering::Relaxed); notify(hwnd,"正在检查上游","检查结果会自动更新到托盘状态"); }
         ID_SYNC => {
             if !app.begin_sync() { notify(hwnd, "正在同步", "请等待当前同步完成"); return; }
             notify(hwnd, "同步中", "正在读取 CC-Switch 并更新 Codex / Claude Code");
@@ -145,7 +172,11 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_DIAG => { let text=app.diagnostic_text(); if copy_clipboard(hwnd,&text).is_ok(){notify(hwnd,"诊断报告已复制","报告不包含 API Key")}; }
         ID_CONFIG => { let path=app.inner.lock().unwrap().config.state_dir.join("config.json"); let _=Command::new("notepad.exe").arg(path).spawn(); }
         ID_LOGS => { let path=app.inner.lock().unwrap().config.state_dir.clone(); let _=Command::new("explorer.exe").arg(path).spawn(); }
-        ID_RESTORE => { *app.maintenance_action.lock().unwrap()=Some("restore".into()); unsafe { DestroyWindow(hwnd); } }
+        ID_RESTORE => {
+            if unsafe { MessageBoxW(hwnd,wide("将恢复 HeadroomRoute 接管前的 Codex / Claude 配置并退出程序，是否继续？").as_ptr(),wide("恢复原始配置").as_ptr(),MB_YESNO|MB_ICONWARNING) } == IDYES {
+                *app.maintenance_action.lock().unwrap()=Some("restore".into()); unsafe { DestroyWindow(hwnd); }
+            }
+        }
         ID_REPAIR_RUNTIME => {
             if unsafe { MessageBoxW(hwnd,wide("修复会停止 Headroom 并重新安装托管运行环境，是否继续？").as_ptr(),wide("修复 Headroom").as_ptr(),MB_YESNO|MB_ICONWARNING) } == IDYES {
                 *app.maintenance_action.lock().unwrap()=Some("repair".into()); unsafe { DestroyWindow(hwnd); }
@@ -164,7 +195,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
 
 unsafe fn show_status(hwnd: HWND) {
     let Some(app)=APP.get() else{return}; let s=app.snapshot();
-    let text=format!("Codex 上游：{}\r\nClaude 上游：{}\r\n路由状态：{}（Codex {} ms / Claude {} ms）\r\n同步状态：{}\r\n重启状态：{}\r\nHeadroom：{}\r\n路由策略：仅由 HeadroomRoute 选择\r\n路由数量：{}\r\n最近切换：{}\r\n最近错误：{}",s.active_name.as_deref().unwrap_or("未配置"),s.active_anthropic_name.as_deref().unwrap_or("未配置"),health_cn(s.state),s.latency_ms.map(|v|v.to_string()).unwrap_or_else(||"--".into()),s.anthropic_latency_ms.map(|v|v.to_string()).unwrap_or_else(||"--".into()),s.sync_status,s.restart_status,s.headroom_state,s.routes.len(),s.last_switch_reason.as_deref().unwrap_or("无"),s.last_error.as_deref().unwrap_or("无"));
+    let text=format!("【当前路由】\r\nCodex：{}  ·  {} ms\r\nClaude：{}  ·  {} ms\r\n\r\n【服务状态】\r\n路由：{}\r\nHeadroom：{}\r\n配置同步：{}\r\n重启任务：{}\r\n\r\n【最近活动】\r\n可用路由：{}\r\n最近切换：{}\r\n最近错误：{}",s.active_name.as_deref().unwrap_or("未配置"),latency_text(s.latency_ms),s.active_anthropic_name.as_deref().unwrap_or("未配置"),latency_text(s.anthropic_latency_ms),health_cn(s.state),headroom_cn(&s.headroom_state),s.sync_status,s.restart_status,s.routes.len(),s.last_switch_reason.as_deref().unwrap_or("无"),s.last_error.as_deref().unwrap_or("无"));
     unsafe { MessageBoxW(hwnd,wide(&text).as_ptr(),wide("Headroom Route 状态").as_ptr(),MB_OK|MB_ICONINFORMATION) };
 }
 
@@ -239,4 +270,6 @@ fn notify(hwnd:HWND,title:&str,message:&str){let mut data=notify_data(hwnd);data
 fn set_startup(enabled:bool)->anyhow::Result<()> { unsafe { let mut key=ptr::null_mut();let sub=wide(r"Software\Microsoft\Windows\CurrentVersion\Run");if RegCreateKeyExW(HKEY_CURRENT_USER,sub.as_ptr(),0,ptr::null_mut(),0,KEY_SET_VALUE,ptr::null(),&mut key,ptr::null_mut())!=0{anyhow::bail!("无法打开启动项注册表")};let name=wide("HeadroomRoute");let result=if enabled{let exe=std::env::current_exe()?;let value=wide(&format!("\"{}\"",exe.display()));RegSetValueExW(key,name.as_ptr(),0,REG_SZ,value.as_ptr() as *const u8,(value.len()*2)as u32)}else{RegDeleteValueW(key,name.as_ptr())};RegCloseKey(key);if result!=0&&enabled{anyhow::bail!("注册表写入失败: {result}")};Ok(()) } }
 fn copy_clipboard(hwnd:HWND,text:&str)->anyhow::Result<()> { unsafe { if OpenClipboard(hwnd)==0{anyhow::bail!("无法打开剪贴板")};EmptyClipboard();let value=wide(text);let bytes=value.len()*2;let memory=windows_sys::Win32::System::Memory::GlobalAlloc(windows_sys::Win32::System::Memory::GMEM_MOVEABLE,bytes);if memory.is_null(){CloseClipboard();anyhow::bail!("内存分配失败")};let target=windows_sys::Win32::System::Memory::GlobalLock(memory) as *mut u16;ptr::copy_nonoverlapping(value.as_ptr(),target,value.len());windows_sys::Win32::System::Memory::GlobalUnlock(memory);SetClipboardData(CF_UNICODETEXT.into(),memory as _);CloseClipboard();Ok(()) } }
 fn health_cn(state:&str)->&'static str{match state{"healthy"=>"健康","degraded"=>"降级","unavailable"=>"不可用",_=>"检测中"}}
+fn headroom_cn(state:&str)->&str{match state{"healthy"=>"运行正常","external"=>"外部实例","starting"=>"正在启动","restarting"=>"正在重启","unavailable"|"runtime-unavailable"=>"不可用",_=>state}}
+fn latency_text(value:Option<u64>)->String{value.map(|v|v.to_string()).unwrap_or_else(||"--".into())}
 fn wide(value:&str)->Vec<u16>{value.encode_utf16().chain(Some(0)).collect()}
