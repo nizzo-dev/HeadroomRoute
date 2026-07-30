@@ -27,10 +27,12 @@ pub struct ProgressWindow {
 }
 
 impl ProgressWindow {
-    pub fn open() -> Result<Self> {
+    pub fn open(title: &str, initial: &str) -> Result<Self> {
         let (sender, receiver) = mpsc::channel();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
-        let thread = thread::spawn(move || progress_thread(receiver, ready_sender));
+        let title = title.to_owned();
+        let initial = initial.to_owned();
+        let thread = thread::spawn(move || progress_thread(receiver, ready_sender, title, initial));
         match ready_receiver.recv() {
             Ok(Ok(())) => Ok(Self {
                 sender,
@@ -72,6 +74,8 @@ impl Drop for ProgressWindow {
 fn progress_thread(
     receiver: Receiver<ProgressMessage>,
     ready: mpsc::SyncSender<Result<(), String>>,
+    title: String,
+    initial: String,
 ) {
     unsafe {
         let instance = GetModuleHandleW(ptr::null());
@@ -95,7 +99,7 @@ fn progress_thread(
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             class_name.as_ptr(),
-            wide("修复 Headroom 运行环境").as_ptr(),
+            wide(&title).as_ptr(),
             WS_CAPTION | WS_POPUP | WS_SYSMENU,
             x,
             y,
@@ -114,7 +118,7 @@ fn progress_thread(
         let label = CreateWindowExW(
             0,
             wide("STATIC").as_ptr(),
-            wide("正在准备修复...").as_ptr(),
+            wide(&initial).as_ptr(),
             WS_CHILD | WS_VISIBLE | STATIC_CENTERED,
             20,
             15,
@@ -137,13 +141,18 @@ fn progress_thread(
             DestroyWindow(hwnd);
             return;
         }
-        run_message_loop(hwnd, label, receiver);
+        run_message_loop(hwnd, label, receiver, initial);
     }
 }
 
-unsafe fn run_message_loop(hwnd: HWND, label: HWND, receiver: Receiver<ProgressMessage>) {
+unsafe fn run_message_loop(
+    hwnd: HWND,
+    label: HWND,
+    receiver: Receiver<ProgressMessage>,
+    initial: String,
+) {
     let mut message: MSG = unsafe { std::mem::zeroed() };
-    let mut status = "正在准备修复".to_owned();
+    let mut status = initial;
     let mut animation = Instant::now();
     let mut dots = 0;
     loop {
