@@ -18,6 +18,8 @@
 
 发布包解压后可直接运行版本化 EXE，或执行 `Install.ps1 -StartNow` 安装到 `%LOCALAPPDATA%\HeadroomRoute`。首次启动会自动发现组件、备份并配置 Codex 与 Claude Code，然后驻留通知区域。
 
+再次运行 `Install.ps1` 可原位升级：脚本会先暂存并校验新 EXE，再停止安装目录中的运行实例、保留 `HeadroomRoute.previous.exe`、替换并自动重启；新版本无法启动时会恢复旧版本。
+
 - 双击图标：查看状态。
 - 右键图标：切换上游或打开管理菜单。
 - `HeadroomRoute.exe --doctor`：输出脱敏诊断报告。
