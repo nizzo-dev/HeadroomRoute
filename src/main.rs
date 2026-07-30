@@ -201,7 +201,14 @@ fn show_info(message: &str) {
 
 fn repair_runtime_with_progress(config: &model::AppConfig) -> Result<PathBuf> {
     let progress = progress::ProgressWindow::open("修复 Headroom 运行环境", "正在准备修复")?;
-    let result = runtime::repair_runtime(config, |status| progress.set_status(status));
+    let result = runtime::repair_runtime(config, |status, percent| {
+        progress.set_status(status);
+        if let Some(percent) = percent {
+            progress.set_progress(percent);
+        } else {
+            progress.set_indeterminate();
+        }
+    });
     progress.close();
     result
 }

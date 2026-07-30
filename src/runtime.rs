@@ -55,7 +55,10 @@ pub fn validate_python(path: &Path) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-pub fn ensure_runtime(config: &AppConfig, mut progress: impl FnMut(&str)) -> Result<PathBuf> {
+pub fn ensure_runtime(
+    config: &AppConfig,
+    mut progress: impl FnMut(&str, Option<u32>),
+) -> Result<PathBuf> {
     if let Some(path) = find_valid_python(config) {
         return Ok(path);
     }
@@ -73,13 +76,37 @@ pub fn ensure_runtime(config: &AppConfig, mut progress: impl FnMut(&str)) -> Res
         "https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/uv-x86_64-pc-windows-msvc.zip"
     );
     if !file_has_sha256(&uv_zip, UV_SHA256) {
-        progress("正在下载运行环境安装器");
-        download(config, &uv_url, &uv_zip)?;
+        progress("正在下载运行环境安装器", Some(5));
+        download(config, &uv_url, &uv_zip, |downloaded, total| {
+            if total > 0 {
+                let percent = downloaded
+                    .saturating_mul(100)
+                    .checked_div(total)
+                    .unwrap_or(0)
+                    .min(100);
+                progress(
+                    &format!(
+                        "正在下载运行环境安装器：{percent}%（{} / {}）",
+                        format_bytes(downloaded),
+                        format_bytes(total)
+                    ),
+                    Some(5 + percent as u32 * 15 / 100),
+                );
+            } else {
+                progress(
+                    &format!(
+                        "正在下载运行环境安装器：已下载 {}",
+                        format_bytes(downloaded)
+                    ),
+                    None,
+                );
+            }
+        })?;
         if !file_has_sha256(&uv_zip, UV_SHA256) {
             return Err(anyhow!("uv 下载文件校验失败"));
         }
     }
-    progress("正在解压运行环境安装器");
+    progress("正在解压运行环境安装器", Some(22));
     extract_zip(&uv_zip, &staging.join("uv"))?;
     let uv = staging.join("uv/uv.exe");
     if !uv.exists() {
@@ -90,14 +117,14 @@ pub fn ensure_runtime(config: &AppConfig, mut progress: impl FnMut(&str)) -> Res
         .create(true)
         .append(true)
         .open(&log_path)?;
-    progress("正在下载独立 Python 3.12");
+    progress("正在下载独立 Python 3.12", Some(30));
     run_uv(
         config,
         &uv,
         &["python", "install", PYTHON_VERSION],
         &mut log,
     )?;
-    progress("正在创建 Headroom 环境");
+    progress("正在创建 Headroom 环境", Some(52));
     let venv = staging.join("venv");
     run_uv(
         config,
@@ -111,7 +138,7 @@ pub fn ensure_runtime(config: &AppConfig, mut progress: impl FnMut(&str)) -> Res
         &mut log,
     )?;
     let python = venv.join("Scripts/python.exe");
-    progress("正在安装 Headroom，首次安装可能需要数分钟");
+    progress("正在安装 Headroom，首次安装可能需要数分钟", Some(62));
     run_uv(
         config,
         &uv,
@@ -124,7 +151,7 @@ pub fn ensure_runtime(config: &AppConfig, mut progress: impl FnMut(&str)) -> Res
         ],
         &mut log,
     )?;
-    progress("正在验证 Headroom 环境");
+    progress("正在验证 Headroom 环境", Some(92));
     if !validate_python(&python) {
         return Err(anyhow!(
             "Headroom 环境验证失败，请查看 {}",
@@ -146,6 +173,7 @@ pub fn ensure_runtime(config: &AppConfig, mut progress: impl FnMut(&str)) -> Res
     if !validate_python(&final_python) {
         return Err(anyhow!("安装完成后的 Headroom 环境无法运行"));
     }
+    progress("运行环境准备完成", Some(100));
     Ok(final_python)
 }
 
@@ -170,7 +198,10 @@ pub fn remove_managed_runtime(config: &AppConfig) -> Result<()> {
     safe_remove_dir(&runtime, &config.state_dir)
 }
 
-pub fn repair_runtime(config: &AppConfig, progress: impl FnMut(&str)) -> Result<PathBuf> {
+pub fn repair_runtime(
+    config: &AppConfig,
+    progress: impl FnMut(&str, Option<u32>),
+) -> Result<PathBuf> {
     remove_managed_runtime(config)?;
     let staging = config.state_dir.join("runtime.installing");
     if staging.exists() {
@@ -259,7 +290,12 @@ fn schedule_self_delete() -> Result<()> {
     Ok(())
 }
 
-fn download(config: &AppConfig, url: &str, path: &Path) -> Result<()> {
+fn download(
+    config: &AppConfig,
+    url: &str,
+    path: &Path,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<()> {
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(20))
         .timeout(None)
@@ -268,14 +304,41 @@ fn download(config: &AppConfig, url: &str, path: &Path) -> Result<()> {
         builder = builder.proxy(proxy);
     }
     let mut response = builder.build()?.get(url).send()?.error_for_status()?;
+    let total = response.content_length().unwrap_or(0);
     let temp = path.with_extension("download");
-    let mut file = fs::File::create(&temp)?;
-    std::io::copy(&mut response, &mut file)?;
+    let result = (|| {
+        let mut file = fs::File::create(&temp)?;
+        let mut buffer = [0u8; 64 * 1024];
+        let mut downloaded = 0u64;
+        loop {
+            let count = response.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            file.write_all(&buffer[..count])?;
+            downloaded += count as u64;
+            progress(downloaded, total);
+        }
+        file.sync_all()?;
+        Result::<()>::Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
     if path.exists() {
         fs::remove_file(path)?;
     }
     fs::rename(temp, path)?;
     Ok(())
+}
+
+fn format_bytes(value: u64) -> String {
+    if value >= 1024 * 1024 {
+        format!("{:.1} MB", value as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} KB", value as f64 / 1024.0)
+    }
 }
 
 fn extract_zip(path: &Path, target: &Path) -> Result<()> {

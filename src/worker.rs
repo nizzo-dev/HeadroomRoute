@@ -106,7 +106,13 @@ fn headroom_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
         let initial_config = app.inner.lock().unwrap().config.clone();
         let first_install = runtime::find_valid_python(&initial_config).is_none();
         let progress = first_install
-            .then(|| ProgressWindow::open("首次设置 Headroom Route", "正在检查运行环境"))
+            .then(|| {
+                ProgressWindow::open_with_hint(
+                    "首次设置 Headroom Route",
+                    "正在检查运行环境",
+                    "首次准备通常需要几分钟，请保持网络连接；完成后会自动继续。",
+                )
+            })
             .transpose();
         let progress = match progress {
             Ok(value) => value,
@@ -116,10 +122,15 @@ fn headroom_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
                 None
             }
         };
-        match runtime::ensure_runtime(&initial_config, |status| {
+        match runtime::ensure_runtime(&initial_config, |status, percent| {
             app.inner.lock().unwrap().headroom_state = status.into();
             if let Some(progress) = &progress {
                 progress.set_status(status);
+                if let Some(percent) = percent {
+                    progress.set_progress(percent);
+                } else {
+                    progress.set_indeterminate();
+                }
             }
         }) {
             Ok(python) => {

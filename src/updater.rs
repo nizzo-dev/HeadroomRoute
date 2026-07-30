@@ -82,7 +82,11 @@ pub fn start_interactive(owner: usize, state_dir: PathBuf) -> bool {
 }
 
 fn run_interactive(owner: HWND, state_dir: &Path) -> Result<()> {
-    let progress = ProgressWindow::open("检查软件更新", "正在连接 GitHub Releases")?;
+    let progress = ProgressWindow::open_with_hint(
+        "检查软件更新",
+        "正在连接 GitHub Releases",
+        "正在安全检查最新正式版，通常只需几秒钟。",
+    )?;
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -117,7 +121,11 @@ fn run_interactive(owner: HWND, state_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let progress = ProgressWindow::open_cancelable("下载软件更新", "正在准备下载")?;
+    let progress = ProgressWindow::open_cancelable_with_hint(
+        "下载软件更新",
+        "正在准备下载",
+        "可随时取消；取消不会影响当前版本和已有设置。",
+    )?;
     let prepared = download_update(&client, state_dir, &update, &progress);
     progress.close();
     let Some(prepared) = prepared? else {
@@ -248,7 +256,11 @@ fn download_update(
         }
     }
 
+    progress.set_indeterminate();
     progress.set_status("正在下载并核对 SHA-256 校验清单");
+    if progress.is_cancelled() {
+        return Ok(None);
+    }
     let checksum_text = client
         .get(&update.checksums.browser_download_url)
         .header(
@@ -261,6 +273,9 @@ fn download_update(
         .context("SHA-256 校验清单下载失败")?
         .text()
         .context("无法读取 SHA-256 校验清单")?;
+    if progress.is_cancelled() {
+        return Ok(None);
+    }
     let expected = checksum_for(&checksum_text, &update.archive.name)?;
     let actual = sha256_file(&partial_path)?;
     if !actual.eq_ignore_ascii_case(&expected) {
@@ -275,6 +290,9 @@ fn download_update(
     fs::rename(&partial_path, &archive_path).context("无法完成更新包下载")?;
 
     progress.set_status("校验通过，正在解压更新程序");
+    if progress.is_cancelled() {
+        return Ok(None);
+    }
     let installer = package_dir.join("Install.ps1");
     let executable = package_dir.join(format!("HeadroomRoute-{}.exe", update.version));
     extract_files(
@@ -287,6 +305,9 @@ fn download_update(
             ),
         ],
     )?;
+    if progress.is_cancelled() {
+        return Ok(None);
+    }
     Ok(Some(PreparedUpdate {
         package_dir,
         installer,
@@ -317,6 +338,7 @@ fn download_file(
         || progress.is_cancelled(),
         |done, total| {
             let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0);
+            progress.set_progress(percent as u32);
             progress.set_status(&format!(
                 "正在下载：{percent}%（{} / {}）",
                 format_bytes(done),
