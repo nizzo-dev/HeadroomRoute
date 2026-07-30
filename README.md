@@ -17,7 +17,7 @@
 
 ---
 
-HeadroomRoute 是一个轻量、原生的 Windows 托盘路由器，面向同时使用 **Codex CLI、Claude Code、Headroom 或 CC-Switch** 的用户。核心、托盘和本地代理运行在同一个 Rust 进程中；没有 Electron，也不要求预装 Python 或常驻桌面运行时。
+HeadroomRoute 是一个轻量、原生的 Windows 托盘路由器，面向同时使用 **Codex CLI、Claude Code、Headroom 或 CC-Switch** 的用户。核心、托盘和本地代理运行在同一个 Rust 进程中；没有 Electron，也不会在首次启动时自动下载 Python 或 Headroom 依赖。
 
 ## 为什么使用 HeadroomRoute
 
@@ -26,7 +26,7 @@ HeadroomRoute 是一个轻量、原生的 Windows 托盘路由器，面向同时
 | 双协议路由 | 同时代理 OpenAI Responses API 与 Anthropic Messages API |
 | 独立 Provider | Codex 与 Claude 可分别选择上游，互不干扰 |
 | 自动故障切换 | 当前路由连续失败 3 次后，只切换到同协议且已验证健康的 Provider |
-| 托管 Headroom | 首次运行自动准备隔离的 Python 3.12 / Headroom 环境 |
+| 外部 Headroom | 使用用户预先准备的 Python 3.12+ / Headroom 环境，不自动下载依赖 |
 | 安全接管配置 | 修改 Codex、Claude 配置前创建备份，不在自身配置中保存 API Key |
 | 可诊断 | 分别显示 Codex、Claude 的健康、延迟、HTTP 状态与恢复建议 |
 | 可回滚更新 | 下载校验、设置备份、外部替换；新版本启动失败时恢复旧版本 |
@@ -45,7 +45,44 @@ HeadroomRoute 是一个轻量、原生的 Windows 托盘路由器，面向同时
 .\Install.ps1 -StartNow
 ```
 
-程序会安装到 `%LOCALAPPDATA%\HeadroomRoute` 并驻留通知区域。首次启动时，它会自动发现 Codex、Claude Code 与 CC-Switch 配置，并准备独立的 Headroom 运行环境。
+程序会安装到 `%LOCALAPPDATA%\HeadroomRoute` 并驻留通知区域。首次启动时，它会自动发现 Codex、Claude Code 与 CC-Switch 配置，并检查本机 Headroom 运行环境。
+
+### 运行环境（需提前准备）
+
+HeadroomRoute **不会自动下载** uv、Python、Headroom 或任何 Python 依赖。启动前需要准备：
+
+- Windows x64；
+- Python 3.12 或更高版本（x64）；
+- `headroom-ai[code] == 0.32.1`。
+
+推荐使用 HeadroomRoute 能自动发现的独立虚拟环境。在 PowerShell 中依次运行：
+
+```powershell
+py -3.12 -m venv "$env:USERPROFILE\.headroom\venv"
+& "$env:USERPROFILE\.headroom\venv\Scripts\python.exe" -m pip install --upgrade pip
+& "$env:USERPROFILE\.headroom\venv\Scripts\python.exe" -m pip install "headroom-ai[code]==0.32.1"
+& "$env:USERPROFILE\.headroom\venv\Scripts\python.exe" -c "import headroom.cli; print('Headroom ready')"
+```
+
+如果 `py -3.12` 不可用，请先从 [python.org](https://www.python.org/downloads/windows/) 安装 Windows x64 Python 3.12，并在安装器中启用 Python Launcher。
+
+启动时按以下顺序查找环境：
+
+1. `%LOCALAPPDATA%\HeadroomRoute\config.json` 中的 `headroom_python`；
+2. `%USERPROFILE%\.headroom\venv\Scripts\python.exe`；
+3. PATH 中可用的 `python.exe`。
+
+使用其他虚拟环境时，在 `config.json` 中指定完整路径，例如：
+
+```json
+{
+  "headroom_python": "D:\\PythonEnvs\\headroom\\Scripts\\python.exe"
+}
+```
+
+HeadroomRoute 会验证 Python 能否导入 `headroom.cli`，以及 `headroom-ai` 是否为 `0.32.1`。验证失败时不会修改或下载环境；请修复环境后重启程序，或运行 `HeadroomRoute.exe --repair-runtime` 重新检查。
+
+从旧版本升级时，历史自动安装内容可能仍位于 `%LOCALAPPDATA%\HeadroomRoute\runtime`、`downloads` 和 `cache\uv`。确认新的外部环境工作正常后可以手动删除这些旧目录；删除前请勿让 `headroom_python` 指向其中的 Python。
 
 > Windows SmartScreen 可能提示未知发布者：当前 Release 尚未进行代码签名。请从本仓库 Release 下载，并使用同版本的 `SHA256SUMS.txt` 核验文件。
 
@@ -121,7 +158,7 @@ HeadroomRoute 把 Codex 与 Claude 的客户端地址指向本机 Headroom；Hea
 - **立即检查上游**：触发健康探测。
 - **自动故障切换**：开启或关闭保守切换策略。
 - **同步 Codex + Claude / CC-Switch**：重新发现并写入路由配置。
-- **修复 Headroom 运行环境**：重新安装托管环境。
+- **检查 Headroom 运行环境**：重新发现并校验 Python 与 Headroom。
 - **恢复原始配置**：恢复 HeadroomRoute 接管前的 CLI 配置。
 - **完全卸载并还原**：还原配置并移除托管环境与启动项。
 
@@ -132,7 +169,7 @@ HeadroomRoute.exe --doctor             输出脱敏诊断报告
 HeadroomRoute.exe --configure          同步 Codex 与 Claude Code 路由配置
 HeadroomRoute.exe --configure-claude   仅配置 Claude Code
 HeadroomRoute.exe --restore            恢复原始 CLI 路由配置
-HeadroomRoute.exe --repair-runtime     重装托管 Headroom 运行环境
+HeadroomRoute.exe --repair-runtime     重新检查 Headroom 运行环境
 HeadroomRoute.exe --uninstall          还原配置并卸载
 ```
 

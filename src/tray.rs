@@ -542,8 +542,8 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             if unsafe {
                 MessageBoxW(
                     hwnd,
-                    wide("修复会停止 Headroom 并重新安装托管运行环境，是否继续？").as_ptr(),
-                    wide("修复 Headroom").as_ptr(),
+                    wide("将重新检查 Python 与 Headroom 环境，是否继续？").as_ptr(),
+                    wide("检查 Headroom 环境").as_ptr(),
                     MB_YESNO | MB_ICONWARNING,
                 )
             } == IDYES

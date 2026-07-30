@@ -82,7 +82,8 @@ pub fn start_interactive(owner: usize, state_dir: PathBuf) -> bool {
 }
 
 fn run_interactive(owner: HWND, state_dir: &Path) -> Result<()> {
-    let progress = ProgressWindow::open("检查软件更新", "正在连接 GitHub Releases")?;
+    let progress =
+        ProgressWindow::open_owned(owner as usize, "检查软件更新", "正在连接 GitHub Releases")?;
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -117,7 +118,8 @@ fn run_interactive(owner: HWND, state_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let progress = ProgressWindow::open_cancelable("下载软件更新", "正在准备下载")?;
+    let progress =
+        ProgressWindow::open_cancelable_owned(owner as usize, "下载软件更新", "正在准备下载")?;
     let prepared = download_update(&client, state_dir, &update, &progress);
     progress.close();
     let Some(prepared) = prepared? else {
@@ -322,6 +324,7 @@ fn download_file(
                 format_bytes(done),
                 format_bytes(total)
             ));
+            progress.set_progress(percent as u32);
         },
     )
 }

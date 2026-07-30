@@ -87,7 +87,7 @@ fn run() -> Result<()> {
         let python = repair_runtime_with_progress(&cfg)?;
         cfg.headroom_python = Some(python);
         config::save(&config_path, &cfg)?;
-        show_info("Headroom 运行环境修复完成");
+        show_info("Headroom 运行环境检查完成");
         unsafe {
             CloseHandle(mutex);
         }
@@ -170,7 +170,7 @@ fn run() -> Result<()> {
                 let python = repair_runtime_with_progress(&cfg)?;
                 cfg.headroom_python = Some(python);
                 config::save(&config_path, &cfg)?;
-                show_info("Headroom 运行环境修复完成，请重新启动程序");
+                show_info("Headroom 运行环境检查完成，请重新启动程序");
             }
             "uninstall" => {
                 runtime::uninstall(&cfg)?;
@@ -200,7 +200,7 @@ fn show_info(message: &str) {
 }
 
 fn repair_runtime_with_progress(config: &model::AppConfig) -> Result<PathBuf> {
-    let progress = progress::ProgressWindow::open("修复 Headroom 运行环境", "正在准备修复")?;
+    let progress = progress::ProgressWindow::open("检查 Headroom 运行环境", "正在检查环境")?;
     let result = runtime::repair_runtime(config, |status| progress.set_status(status));
     progress.close();
     result

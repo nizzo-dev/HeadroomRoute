@@ -106,7 +106,7 @@ fn headroom_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
         let initial_config = app.inner.lock().unwrap().config.clone();
         let first_install = runtime::find_valid_python(&initial_config).is_none();
         let progress = first_install
-            .then(|| ProgressWindow::open("首次设置 Headroom Route", "正在检查运行环境"))
+            .then(|| ProgressWindow::open("首次设置 HeadroomRoute", "正在检查运行环境"))
             .transpose();
         let progress = match progress {
             Ok(value) => value,
@@ -141,7 +141,9 @@ fn headroom_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
                     Ok(result) if first_install => {
                         *app.runtime_result.lock().unwrap() = Some((
                             true,
-                            format!("运行环境已安装，原配置已备份并完成路由设置：{result}"),
+                            format!(
+                                "已发现 Headroom 运行环境，原配置已备份并完成路由设置：{result}"
+                            ),
                         ))
                     }
                     Ok(_) => {}
@@ -158,7 +160,7 @@ fn headroom_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
             }
             Err(error) => {
                 let message = format!(
-                    "Headroom 运行环境准备失败：{error}。请从托盘选择“修复 Headroom 运行环境”"
+                    "未找到可用的 Headroom 运行环境：{error}。请按 README 的“运行环境”说明安装后重启程序"
                 );
                 let mut state = app.inner.lock().unwrap();
                 state.headroom_state = "runtime-unavailable".into();

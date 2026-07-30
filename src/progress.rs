@@ -12,17 +12,28 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM},
-    Graphics::Gdi::{COLOR_WINDOW, GetSysColorBrush, UpdateWindow},
+    Foundation::{ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Graphics::Gdi::{
+        CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, CreateFontW, DEFAULT_CHARSET,
+        DEFAULT_PITCH, DeleteObject, FW_NORMAL, GetSysColorBrush, OUT_DEFAULT_PRECIS, UpdateWindow,
+    },
     System::LibraryLoader::GetModuleHandleW,
-    UI::WindowsAndMessaging::*,
+    UI::{
+        Controls::{
+            ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX, InitCommonControlsEx, PBM_SETMARQUEE,
+            PBM_SETPOS, PBM_SETRANGE32, PBS_MARQUEE, PROGRESS_CLASSW,
+        },
+        HiDpi::GetDpiForSystem,
+        WindowsAndMessaging::*,
+    },
 };
 
-const STATIC_CENTERED: u32 = 0x0001 | 0x0200;
+const STATIC_LEFT: u32 = 0x0000;
 const ID_CANCEL: usize = 1;
 
 enum ProgressMessage {
     Status(String),
+    Progress(u32),
     Close,
 }
 
@@ -34,14 +45,23 @@ pub struct ProgressWindow {
 
 impl ProgressWindow {
     pub fn open(title: &str, initial: &str) -> Result<Self> {
-        Self::open_inner(title, initial, false)
+        Self::open_inner(None, title, initial, false)
     }
 
-    pub fn open_cancelable(title: &str, initial: &str) -> Result<Self> {
-        Self::open_inner(title, initial, true)
+    pub fn open_owned(owner: usize, title: &str, initial: &str) -> Result<Self> {
+        Self::open_inner(Some(owner), title, initial, false)
     }
 
-    fn open_inner(title: &str, initial: &str, cancelable: bool) -> Result<Self> {
+    pub fn open_cancelable_owned(owner: usize, title: &str, initial: &str) -> Result<Self> {
+        Self::open_inner(Some(owner), title, initial, true)
+    }
+
+    fn open_inner(
+        owner: Option<usize>,
+        title: &str,
+        initial: &str,
+        cancelable: bool,
+    ) -> Result<Self> {
         let (sender, receiver) = mpsc::channel();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let title = title.to_owned();
@@ -52,6 +72,7 @@ impl ProgressWindow {
             progress_thread(
                 receiver,
                 ready_sender,
+                owner,
                 title,
                 initial,
                 cancelable,
@@ -79,6 +100,12 @@ impl ProgressWindow {
         let _ = self.sender.send(ProgressMessage::Status(status.to_owned()));
     }
 
+    pub fn set_progress(&self, percent: u32) {
+        let _ = self
+            .sender
+            .send(ProgressMessage::Progress(percent.min(100)));
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
@@ -104,6 +131,7 @@ impl Drop for ProgressWindow {
 fn progress_thread(
     receiver: Receiver<ProgressMessage>,
     ready: mpsc::SyncSender<Result<(), String>>,
+    owner: Option<usize>,
     title: String,
     initial: String,
     cancelable: bool,
@@ -111,11 +139,19 @@ fn progress_thread(
 ) {
     unsafe {
         let instance = GetModuleHandleW(ptr::null());
+        let controls = INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_PROGRESS_CLASS,
+        };
+        if InitCommonControlsEx(&controls) == 0 {
+            let _ = ready.send(Err("无法初始化进度控件".into()));
+            return;
+        }
         let class_name = wide("HeadroomRouteProgressWindow");
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance,
-            hbrBackground: GetSysColorBrush(COLOR_WINDOW),
+            hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
             lpszClassName: class_name.as_ptr(),
             ..std::mem::zeroed()
         };
@@ -124,12 +160,21 @@ fn progress_thread(
             return;
         }
 
-        let width = 500;
-        let height = 170;
-        let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
-        let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
+        let dpi = GetDpiForSystem().max(96) as i32;
+        let scale = |value: i32| (value * dpi + 48) / 96;
+        let width = scale(460);
+        let height = scale(if cancelable { 190 } else { 155 });
+        let mut work_area: RECT = std::mem::zeroed();
+        if SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work_area as *mut RECT as *mut _, 0) == 0
+        {
+            work_area.right = GetSystemMetrics(SM_CXSCREEN);
+            work_area.bottom = GetSystemMetrics(SM_CYSCREEN);
+        }
+        let x = work_area.left + (work_area.right - work_area.left - width) / 2;
+        let y = work_area.top + (work_area.bottom - work_area.top - height) / 2;
+        let owner_hwnd = owner.map_or(ptr::null_mut(), |value| value as HWND);
         let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            WS_EX_DLGMODALFRAME | WS_EX_TOOLWINDOW,
             class_name.as_ptr(),
             wide(&title).as_ptr(),
             WS_CAPTION | WS_POPUP | WS_SYSMENU,
@@ -137,7 +182,7 @@ fn progress_thread(
             y,
             width,
             height,
-            ptr::null_mut(),
+            owner_hwnd,
             ptr::null_mut(),
             instance,
             ptr::null(),
@@ -147,15 +192,32 @@ fn progress_thread(
             return;
         }
 
+        let font = CreateFontW(
+            -((9 * dpi + 36) / 72),
+            0,
+            0,
+            0,
+            FW_NORMAL as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.into(),
+            OUT_DEFAULT_PRECIS.into(),
+            CLIP_DEFAULT_PRECIS.into(),
+            CLEARTYPE_QUALITY.into(),
+            DEFAULT_PITCH.into(),
+            wide("Segoe UI").as_ptr(),
+        );
+
         let label = CreateWindowExW(
             0,
             wide("STATIC").as_ptr(),
             wide(&initial).as_ptr(),
-            WS_CHILD | WS_VISIBLE | STATIC_CENTERED,
-            20,
-            15,
-            width - 40,
-            if cancelable { height - 85 } else { height - 55 },
+            WS_CHILD | WS_VISIBLE | STATIC_LEFT,
+            scale(24),
+            scale(22),
+            width - scale(48),
+            scale(24),
             hwnd,
             ptr::null_mut(),
             instance,
@@ -167,16 +229,67 @@ fn progress_thread(
             return;
         }
 
+        let progress = CreateWindowExW(
+            0,
+            PROGRESS_CLASSW,
+            ptr::null(),
+            WS_CHILD | WS_VISIBLE | PBS_MARQUEE,
+            scale(24),
+            scale(57),
+            width - scale(48),
+            scale(8),
+            hwnd,
+            ptr::null_mut(),
+            instance,
+            ptr::null(),
+        );
+        if progress.is_null() {
+            DestroyWindow(hwnd);
+            if !font.is_null() {
+                DeleteObject(font);
+            }
+            let _ = ready.send(Err("无法创建进度条".into()));
+            return;
+        }
+
+        let hint_text = if cancelable {
+            "下载期间可以安全取消，不会修改现有程序或设置。"
+        } else {
+            "请保持程序运行，完成后会自动提示。"
+        };
+        let hint = CreateWindowExW(
+            0,
+            wide("STATIC").as_ptr(),
+            wide(hint_text).as_ptr(),
+            WS_CHILD | WS_VISIBLE | STATIC_LEFT,
+            scale(24),
+            scale(79),
+            width - scale(48),
+            scale(24),
+            hwnd,
+            ptr::null_mut(),
+            instance,
+            ptr::null(),
+        );
+        if hint.is_null() {
+            DestroyWindow(hwnd);
+            if !font.is_null() {
+                DeleteObject(font);
+            }
+            let _ = ready.send(Err("无法创建进度说明".into()));
+            return;
+        }
+
         let cancel = if cancelable {
             CreateWindowExW(
                 0,
                 wide("BUTTON").as_ptr(),
                 wide("取消下载").as_ptr(),
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
-                width / 2 - 55,
-                height - 70,
-                110,
-                30,
+                width - scale(124),
+                height - scale(68),
+                scale(100),
+                scale(30),
                 hwnd,
                 ID_CANCEL as _,
                 instance,
@@ -187,31 +300,49 @@ fn progress_thread(
         };
         if cancelable && cancel.is_null() {
             DestroyWindow(hwnd);
+            if !font.is_null() {
+                DeleteObject(font);
+            }
             let _ = ready.send(Err("无法创建取消按钮".into()));
             return;
         }
 
+        if !font.is_null() {
+            SendMessageW(label, WM_SETFONT, font as usize, 1);
+            SendMessageW(hint, WM_SETFONT, font as usize, 1);
+            if !cancel.is_null() {
+                SendMessageW(cancel, WM_SETFONT, font as usize, 1);
+            }
+        }
+        SendMessageW(progress, PBM_SETMARQUEE, 1, 35);
+
         ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
         UpdateWindow(hwnd);
         if ready.send(Ok(())).is_err() {
             DestroyWindow(hwnd);
+            if !font.is_null() {
+                DeleteObject(font);
+            }
             return;
         }
-        run_message_loop(
-            hwnd, label, cancel, receiver, initial, cancelable, cancelled,
-        );
+        run_message_loop(hwnd, label, progress, cancel, receiver, initial, cancelled);
+        if !font.is_null() {
+            DeleteObject(font);
+        }
     }
 }
 
 unsafe fn run_message_loop(
     hwnd: HWND,
     label: HWND,
+    progress: HWND,
     cancel: HWND,
     receiver: Receiver<ProgressMessage>,
     initial: String,
-    cancelable: bool,
     cancelled: Arc<AtomicBool>,
 ) {
+    let cancelable = !cancel.is_null();
     let mut message: MSG = unsafe { std::mem::zeroed() };
     let mut status = initial;
     let mut animation = Instant::now();
@@ -243,8 +374,18 @@ unsafe fn run_message_loop(
                 status = next.trim_end_matches(['.', '。']).to_owned();
                 dots = 0;
                 animation = Instant::now();
-                unsafe { update_label(label, &status, dots, cancelable) };
+                unsafe { update_label(label, &status, dots) };
             }
+            Ok(ProgressMessage::Progress(percent)) => unsafe {
+                SendMessageW(progress, PBM_SETMARQUEE, 0, 0);
+                SetWindowLongW(
+                    progress,
+                    GWL_STYLE,
+                    (GetWindowLongW(progress, GWL_STYLE) as u32 & !PBS_MARQUEE) as i32,
+                );
+                SendMessageW(progress, PBM_SETRANGE32, 0, 100);
+                SendMessageW(progress, PBM_SETPOS, percent as usize, 0);
+            },
             Ok(ProgressMessage::Close) | Err(TryRecvError::Disconnected) => {
                 unsafe { DestroyWindow(hwnd) };
                 return;
@@ -254,20 +395,15 @@ unsafe fn run_message_loop(
 
         if animation.elapsed() >= Duration::from_millis(500) {
             dots = (dots + 1) % 4;
-            unsafe { update_label(label, &status, dots, cancelable) };
+            unsafe { update_label(label, &status, dots) };
             animation = Instant::now();
         }
         thread::sleep(Duration::from_millis(30));
     }
 }
 
-unsafe fn update_label(label: HWND, status: &str, dots: usize, cancelable: bool) {
-    let hint = if cancelable {
-        "可点击取消下载。"
-    } else {
-        "请勿关闭程序，完成后将自动提示。"
-    };
-    let text = format!("{status}{}\r\n\r\n{hint}", ".".repeat(dots),);
+unsafe fn update_label(label: HWND, status: &str, dots: usize) {
+    let text = format!("{status}{}", ".".repeat(dots));
     unsafe { SetWindowTextW(label, wide(&text).as_ptr()) };
 }
 
