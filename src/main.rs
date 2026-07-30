@@ -8,6 +8,7 @@ mod runtime;
 mod sqlite;
 mod state;
 mod tray;
+mod updater;
 mod worker;
 
 use anyhow::{Context, Result};
