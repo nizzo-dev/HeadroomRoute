@@ -3,6 +3,7 @@ use crate::{
     config,
     model::{Protocol, Route, Snapshot},
     state::AppState,
+    updater,
 };
 use std::{
     cell::Cell,
@@ -48,6 +49,7 @@ const ID_EXIT: usize = 109;
 const ID_RESTORE: usize = 110;
 const ID_REPAIR_RUNTIME: usize = 111;
 const ID_UNINSTALL: usize = 112;
+const ID_UPDATE: usize = 113;
 const ID_ROUTE_BASE: usize = 1000;
 static APP: OnceLock<Arc<AppState>> = OnceLock::new();
 thread_local! { static URL_POPUP: Cell<HWND> = const { Cell::new(ptr::null_mut()) }; }
@@ -312,6 +314,23 @@ unsafe fn show_menu(hwnd: HWND) {
             ID_DIAG,
             wide("复制脱敏诊断报告").as_ptr(),
         );
+        AppendMenuW(settings_menu, MF_SEPARATOR, 0, ptr::null());
+        AppendMenuW(
+            settings_menu,
+            MF_STRING
+                | if updater::is_running() {
+                    MF_DISABLED | MF_GRAYED
+                } else {
+                    0
+                },
+            ID_UPDATE,
+            wide(if updater::is_running() {
+                "正在检查软件更新..."
+            } else {
+                "检查软件更新..."
+            })
+            .as_ptr(),
+        );
         let maintenance_menu = CreatePopupMenu();
         AppendMenuW(
             maintenance_menu,
@@ -495,6 +514,12 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_LOGS => {
             let path = app.inner.lock().unwrap().config.state_dir.clone();
             let _ = Command::new("explorer.exe").arg(path).spawn();
+        }
+        ID_UPDATE => {
+            let state_dir = app.inner.lock().unwrap().config.state_dir.clone();
+            if !updater::start_interactive(hwnd as usize, state_dir) {
+                notify(hwnd, "正在检查软件更新", "请等待当前更新操作完成");
+            }
         }
         ID_RESTORE => {
             if unsafe {

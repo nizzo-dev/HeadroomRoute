@@ -15,6 +15,9 @@ New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 $target = Join-Path $InstallDir 'HeadroomRoute.exe'
 $staged = Join-Path $InstallDir 'HeadroomRoute.new.exe'
 $backup = Join-Path $InstallDir 'HeadroomRoute.previous.exe'
+$settingsBackup = Join-Path $InstallDir 'update-settings-backup'
+$settingNames = @('config.json', 'status.json')
+$settingsPresent = @{}
 $sourcePath = (Resolve-Path $source).Path
 $targetPath = [System.IO.Path]::GetFullPath($target)
 if ($sourcePath -eq $targetPath) { throw '安装源不能是当前运行文件' }
@@ -30,6 +33,8 @@ if ($header.Length -lt 2 -or $header[0] -ne 0x4d -or $header[1] -ne 0x5a) {
 $running = @(Get-Process -Name 'HeadroomRoute' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $targetPath })
 $restart = $StartNow -or $running.Count -gt 0
 $hadTarget = Test-Path $target
+$targetMoved = $false
+$newInstalled = $false
 try {
     if ($running.Count) {
         $running | Stop-Process -Force
@@ -37,9 +42,21 @@ try {
             if (!$process.WaitForExit(10000)) { throw '旧版本未能在 10 秒内退出' }
         }
     }
+    if (Test-Path $settingsBackup) { Remove-Item $settingsBackup -Recurse -Force }
+    foreach ($name in $settingNames) {
+        $settingsPresent[$name] = Test-Path (Join-Path $InstallDir $name)
+        if ($settingsPresent[$name]) {
+            New-Item -ItemType Directory -Path $settingsBackup -Force | Out-Null
+            Copy-Item (Join-Path $InstallDir $name) (Join-Path $settingsBackup $name) -Force
+        }
+    }
     if (Test-Path $backup) { Remove-Item $backup -Force }
-    if ($hadTarget) { Move-Item $target $backup -Force }
+    if ($hadTarget) {
+        Move-Item $target $backup -Force
+        $targetMoved = $true
+    }
     Move-Item $staged $target -Force
+    $newInstalled = $true
     if ($restart) {
         $started = Start-Process $target -WindowStyle Hidden -PassThru
         Start-Sleep -Seconds 1
@@ -49,16 +66,26 @@ try {
 } catch {
     $failure = $_
     if (Test-Path $staged) { Remove-Item $staged -Force }
-    if (Test-Path $backup) {
+    if ($targetMoved -and (Test-Path $backup)) {
         if (Test-Path $target) { Remove-Item $target -Force }
         Move-Item $backup $target -Force
-        if ($restart) { Start-Process $target -WindowStyle Hidden | Out-Null }
-    } elseif (!$hadTarget -and (Test-Path $target)) {
+    } elseif (!$hadTarget -and $newInstalled -and (Test-Path $target)) {
         Remove-Item $target -Force
     }
+    foreach ($name in $settingNames) {
+        $saved = Join-Path $settingsBackup $name
+        $current = Join-Path $InstallDir $name
+        if ($settingsPresent[$name] -and (Test-Path $saved)) {
+            Copy-Item $saved $current -Force
+        } elseif ($settingsPresent.ContainsKey($name) -and !$settingsPresent[$name] -and (Test-Path $current)) {
+            Remove-Item $current -Force
+        }
+    }
+    if ($restart -and (Test-Path $target)) { Start-Process $target -WindowStyle Hidden | Out-Null }
     throw "升级失败，已恢复旧版本：$failure"
 }
 
 Write-Host "已安装到 $InstallDir"
 if ($hadTarget) { Write-Host "旧版本备份：$backup" }
+if (Test-Path $settingsBackup) { Write-Host "设置备份：$settingsBackup" }
 Write-Host '首次启动前，请从 TrafficMonitor 菜单退出旧 RouteAgent，或结束旧 Headroom RouteAgent 进程。'

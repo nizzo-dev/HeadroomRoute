@@ -13,12 +13,15 @@
 - Codex 与 Claude Code 修改前创建带时间戳备份。工具自身配置不保存 API Key。
 - 首次运行自动准备独立 Python 3.12 / Headroom 0.32.1 环境，不依赖系统 Python。
 - 支持恢复 CLI 配置、修复托管运行环境和完全卸载。
+- 可从托盘手动检查 GitHub 正式版，查看更新明细、带进度下载并校验 SHA-256 后重启升级。
 
 ## 使用
 
 发布包解压后可直接运行版本化 EXE，或执行 `Install.ps1 -StartNow` 安装到 `%LOCALAPPDATA%\HeadroomRoute`。首次启动会自动发现组件、备份并配置 Codex 与 Claude Code，然后驻留通知区域。
 
 再次运行 `Install.ps1` 可原位升级：脚本会先暂存并校验新 EXE，再停止安装目录中的运行实例、保留 `HeadroomRoute.previous.exe`、替换并自动重启；新版本无法启动时会恢复旧版本。
+
+正式安装版可在“设置与诊断 → 检查软件更新...”中完成相同流程。程序只检查正式版，不会自动安装；下载完成后仍需确认“重启并更新”。更新前会将 `config.json` 和 `status.json` 备份到 `update-settings-backup`，安装与回滚都不会覆盖其他用户数据。便携版只下载并打开更新目录。
 
 - 双击图标：查看状态。
 - 右键图标：切换上游或打开管理菜单。
