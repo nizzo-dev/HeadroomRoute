@@ -22,8 +22,8 @@ fn probe_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
                 if should_stop(&app) { break; }
                 let started = Instant::now();
                 match client.head(&route.base_url).header("User-Agent", "HeadroomRoute/0.1 health-probe").send() {
-                Ok(response) => app.record_route_result(route.protocol, &route.base_url, true, started.elapsed().as_millis() as u64, Some(response.status().as_u16()), None, false),
-                Err(error) => app.record_route_result(route.protocol, &route.base_url, false, started.elapsed().as_millis() as u64, None, Some(error.to_string()), false),
+                Ok(response) => app.record_route_result(route.protocol, &route.provider, true, started.elapsed().as_millis() as u64, Some(response.status().as_u16()), None, false),
+                Err(error) => app.record_route_result(route.protocol, &route.provider, false, started.elapsed().as_millis() as u64, None, Some(error.to_string()), false),
                 }
             }
             wait_for_next_probe(&app);

@@ -175,11 +175,11 @@ fn handle(mut stream: TcpStream, app: &Arc<AppState>, token: &str, client: &Clie
     let response = match builder.body(request.body).send() {
         Ok(value) => {
             let status = value.status().as_u16();
-            app.record_route_result(route.protocol, &route.base_url, status < 400, started.elapsed().as_millis() as u64, Some(status), (status >= 400).then(|| format!("HTTP {status}")), true);
+            app.record_route_result(route.protocol, &route.provider, status < 400, started.elapsed().as_millis() as u64, Some(status), (status >= 400).then(|| format!("HTTP {status}")), true);
             value
         }
         Err(error) => {
-            app.record_route_result(route.protocol, &route.base_url, false, started.elapsed().as_millis() as u64, None, Some(error.to_string()), true);
+            app.record_route_result(route.protocol, &route.provider, false, started.elapsed().as_millis() as u64, None, Some(error.to_string()), true);
             write_json(&mut stream, 502, serde_json::json!({"error":"上游连接失败","route":route.host()}))?;
             return Ok(());
         }

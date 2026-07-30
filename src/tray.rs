@@ -1,5 +1,5 @@
 #![cfg(windows)]
-use crate::{config, model::{Protocol, Snapshot}, state::AppState};
+use crate::{config, model::{Protocol, Route, Snapshot}, state::AppState};
 use std::{cell::Cell, ffi::c_void, mem::size_of, process::Command, ptr, sync::{Arc, OnceLock, atomic::Ordering}, thread};
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
@@ -74,8 +74,8 @@ unsafe fn show_menu(hwnd: HWND) {
     let Some(app) = APP.get() else { return };
     let snapshot = app.snapshot();
     let menu = unsafe { CreatePopupMenu() };
-    let codex_menu = unsafe { route_menu(&snapshot, Protocol::OpenAi, snapshot.active_url.as_deref()) };
-    let claude_menu = unsafe { route_menu(&snapshot, Protocol::Anthropic, snapshot.active_anthropic_url.as_deref()) };
+    let codex_menu = unsafe { route_menu(&snapshot, Protocol::OpenAi, snapshot.active_provider.as_deref()) };
+    let claude_menu = unsafe { route_menu(&snapshot, Protocol::Anthropic, snapshot.active_anthropic_provider.as_deref()) };
     let service = format!("Headroom：{}  ·  路由{}", headroom_cn(&snapshot.headroom_state), health_cn(snapshot.state));
     let codex = format!("Codex：{}  ·  {} ms", snapshot.active_name.as_deref().unwrap_or("未配置"), latency_text(snapshot.latency_ms));
     let claude = format!("Claude：{}  ·  {} ms", snapshot.active_anthropic_name.as_deref().unwrap_or("未配置"), latency_text(snapshot.anthropic_latency_ms));
@@ -132,13 +132,13 @@ unsafe fn show_menu(hwnd: HWND) {
     }
 }
 
-unsafe fn route_menu(snapshot: &Snapshot, protocol: Protocol, active_url: Option<&str>) -> HMENU {
+unsafe fn route_menu(snapshot: &Snapshot, protocol: Protocol, active_provider: Option<&str>) -> HMENU {
     let menu = unsafe { CreatePopupMenu() };
     let mut count = 0;
     for (index, route) in snapshot.routes.iter().take(32).enumerate() {
         if route.protocol != protocol { continue; }
         count += 1;
-        let flags = MF_STRING | if active_url == Some(route.base_url.as_str()) { MF_CHECKED } else { 0 };
+        let flags = MF_STRING | if route_is_selected(route, active_provider) { MF_CHECKED } else { 0 };
         let text = format!("{}  ·  {}  ·  {} ms", route.name, route.state.label(), latency_text(route.latency_ms));
         unsafe { AppendMenuW(menu, flags, ID_ROUTE_BASE + index, wide(&text).as_ptr()) };
     }
@@ -146,6 +146,10 @@ unsafe fn route_menu(snapshot: &Snapshot, protocol: Protocol, active_url: Option
         unsafe { AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, wide("未发现可用上游").as_ptr()) };
     }
     menu
+}
+
+fn route_is_selected(route: &Route, active_provider: Option<&str>) -> bool {
+    active_provider == Some(route.provider.as_str())
 }
 
 unsafe fn handle_command(hwnd: HWND, id: usize) {
@@ -276,3 +280,17 @@ fn health_cn(state:&str)->&'static str{match state{"healthy"=>"健康","degraded
 fn headroom_cn(state:&str)->&str{match state{"healthy"=>"运行正常","external"=>"外部实例","starting"=>"正在启动","restarting"=>"正在重启","unavailable"|"runtime-unavailable"=>"不可用",_=>state}}
 fn latency_text(value:Option<u64>)->String{value.map(|v|v.to_string()).unwrap_or_else(||"--".into())}
 fn wide(value:&str)->Vec<u16>{value.encode_utf16().chain(Some(0)).collect()}
+
+#[cfg(test)]
+mod tests {
+    use super::route_is_selected;
+    use crate::model::{AuthStyle, Protocol, Route};
+
+    #[test]
+    fn duplicate_urls_select_only_the_active_provider() {
+        let first = Route::new(Protocol::OpenAi, "first".into(), "First".into(), "https://same.example.com/v1".into(), Some("key-a".into()), AuthStyle::Bearer, "test");
+        let second = Route::new(Protocol::OpenAi, "second".into(), "Second".into(), "https://same.example.com/v1".into(), Some("key-b".into()), AuthStyle::Bearer, "test");
+        assert!(!route_is_selected(&first, Some("second")));
+        assert!(route_is_selected(&second, Some("second")));
+    }
+}

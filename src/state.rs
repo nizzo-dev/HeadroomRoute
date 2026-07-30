@@ -150,11 +150,11 @@ impl AppState {
         match config::discover_routes(&config) {
             Ok(found) => {
                 let mut state = self.inner.lock().unwrap();
-                let old_openai = state.active.and_then(|i| state.routes.get(i)).map(|r| (r.provider.clone(), r.base_url.clone()));
-                let old_anthropic = state.active_anthropic.and_then(|i| state.routes.get(i)).map(|r| (r.provider.clone(), r.base_url.clone()));
+                let old_openai = state.active.and_then(|i| state.routes.get(i)).map(|r| r.provider.clone());
+                let old_anthropic = state.active_anthropic.and_then(|i| state.routes.get(i)).map(|r| r.provider.clone());
                 let mut routes = found.routes;
                 for route in &mut routes {
-                    if let Some(old) = state.routes.iter().find(|old| old.protocol == route.protocol && old.base_url == route.base_url) {
+                    if let Some(old) = state.routes.iter().find(|old| old.protocol == route.protocol && old.provider == route.provider) {
                         route.state = old.state; route.score = old.score; route.latency_ms = old.latency_ms; route.consecutive_successes = old.consecutive_successes; route.consecutive_failures = old.consecutive_failures; route.verified_by_request = old.verified_by_request; route.last_error = old.last_error.clone(); route.last_status_code = old.last_status_code; route.last_success_at = old.last_success_at;
                     }
                 }
@@ -175,9 +175,9 @@ impl AppState {
         }
     }
 
-    pub fn record_route_result(&self, protocol: Protocol, base_url: &str, ok: bool, latency: u64, status: Option<u16>, error: Option<String>, request: bool) {
+    pub fn record_route_result(&self, protocol: Protocol, provider: &str, ok: bool, latency: u64, status: Option<u16>, error: Option<String>, request: bool) {
         let mut state = self.inner.lock().unwrap();
-        if let Some(route) = state.routes.iter_mut().find(|r| r.protocol == protocol && r.base_url == base_url) { route.record(ok, latency, status, error, request); }
+        if let Some(route) = state.routes.iter_mut().find(|r| r.protocol == protocol && r.provider == provider) { route.record(ok, latency, status, error, request); }
     }
 
     pub fn write_status(&self) -> Result<()> {
@@ -214,7 +214,7 @@ fn previous_provider(config: &AppConfig, key: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(&fs::read(config.state_dir.join("status.json")).ok()?).ok()?;
     value.get(key).and_then(serde_json::Value::as_str).map(str::to_owned)
 }
-fn preserve_index(routes: &[Route], protocol: Protocol, old: Option<(String, String)>, selected: Option<&str>) -> Option<usize> { old.and_then(|(provider, url)| routes.iter().position(|r| r.protocol == protocol && (r.provider == provider || r.base_url == url))).or_else(|| select_index(routes, protocol, selected)) }
+fn preserve_index(routes: &[Route], protocol: Protocol, old: Option<String>, selected: Option<&str>) -> Option<usize> { old.as_deref().and_then(|provider| routes.iter().position(|r| r.protocol == protocol && r.provider == provider)).or_else(|| select_index(routes, protocol, selected)) }
 fn combined_health(a: Option<RouteHealth>, b: Option<RouteHealth>) -> RouteHealth { let values = [a, b]; if values.iter().flatten().any(|v| *v == RouteHealth::Healthy) { RouteHealth::Healthy } else if values.iter().flatten().any(|v| *v == RouteHealth::Degraded) { RouteHealth::Degraded } else if values.iter().flatten().any(|v| *v == RouteHealth::Unknown) { RouteHealth::Unknown } else { RouteHealth::Unavailable } }
 fn protocol_for_path(path: &str) -> Protocol { if path == "/api/oauth/usage" || path.starts_with("/v1/messages") { Protocol::Anthropic } else { Protocol::OpenAi } }
 fn yes(value: bool) -> &'static str { if value { "是" } else { "否" } }
@@ -223,8 +223,8 @@ pub fn should_stop(app: &AppState) -> bool { app.stop.load(Ordering::Relaxed) }
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, RuntimeState, protocol_for_path};
-    use crate::model::{AppConfig, AuthStyle, Protocol, Route};
+    use super::{AppState, RuntimeState, preserve_index, protocol_for_path};
+    use crate::model::{AppConfig, AuthStyle, Protocol, Route, RouteHealth};
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
     #[test]
@@ -233,6 +233,23 @@ mod tests {
         assert_eq!(protocol_for_path("/v1/messages"), Protocol::Anthropic);
         assert_eq!(protocol_for_path("/v1/messages/count_tokens"), Protocol::Anthropic);
         assert_eq!(protocol_for_path("/api/oauth/usage"), Protocol::Anthropic);
+    }
+
+    #[test]
+    fn duplicate_urls_preserve_provider_identity_and_health() {
+        let routes = vec![
+            Route::new(Protocol::OpenAi, "first".into(), "First".into(), "https://same.example.com/v1".into(), Some("key-a".into()), AuthStyle::Bearer, "test"),
+            Route::new(Protocol::OpenAi, "second".into(), "Second".into(), "https://same.example.com/v1".into(), Some("key-b".into()), AuthStyle::Bearer, "test"),
+        ];
+        assert_eq!(preserve_index(&routes, Protocol::OpenAi, Some("second".into()), None), Some(1));
+        let app = Arc::new(AppState {
+            inner: Mutex::new(RuntimeState { config: AppConfig::default(), routes, active: Some(1), active_anthropic: None, selected_provider: Some("second".into()), selected_anthropic_provider: None, headroom_state: "test".into(), headroom_pid: None, last_switch_reason: None, last_error: None }),
+            stop: AtomicBool::new(false), restart_headroom: AtomicBool::new(false), force_probe: AtomicBool::new(false), sync_in_progress: AtomicBool::new(false), sync_status: Mutex::new("未同步".into()), sync_result: Mutex::new(None), restart_in_progress: AtomicBool::new(false), restart_status: Mutex::new("未重启".into()), restart_result: Mutex::new(None), model_change_notice: Mutex::new(None), maintenance_action: Mutex::new(None),
+        });
+        app.record_route_result(Protocol::OpenAi, "second", true, 25, Some(200), None, true);
+        let snapshot = app.snapshot();
+        assert_eq!(snapshot.routes[0].state, RouteHealth::Unknown);
+        assert_eq!(snapshot.routes[1].state, RouteHealth::Healthy);
     }
 
     #[test]
