@@ -30,9 +30,15 @@ pub struct AppConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        let home = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| home.join("AppData/Local"));
-        let state_dir = std::env::var_os("HEADROOM_ROUTE_STATE_DIR").map(PathBuf::from).unwrap_or_else(|| local.join("HeadroomRoute"));
+        let home = std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let local = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData/Local"));
+        let state_dir = std::env::var_os("HEADROOM_ROUTE_STATE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| local.join("HeadroomRoute"));
         Self {
             codex_config: home.join(".codex/config.toml"),
             claude_settings: home.join(".claude/settings.json"),
@@ -58,15 +64,27 @@ impl Default for AppConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Protocol { OpenAi, Anthropic }
+pub enum Protocol {
+    OpenAi,
+    Anthropic,
+}
 
 impl Protocol {
-    pub fn label(self) -> &'static str { match self { Self::OpenAi => "Codex", Self::Anthropic => "Claude" } }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenAi => "Codex",
+            Self::Anthropic => "Claude",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AuthStyle { Bearer, XApiKey, PassThrough }
+pub enum AuthStyle {
+    Bearer,
+    XApiKey,
+    PassThrough,
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Route {
@@ -90,21 +108,82 @@ pub struct Route {
 }
 
 impl Route {
-    pub fn new(protocol: Protocol, provider: String, name: String, base_url: String, api_key: Option<String>, auth_style: AuthStyle, source: &str) -> Self {
-        Self { protocol, provider, name, base_url, api_key, auth_style, source: source.to_owned(), state: RouteHealth::Unknown, score: 0, latency_ms: None, consecutive_successes: 0, consecutive_failures: 0, verified_by_request: false, last_error: None, last_status_code: None, last_success_at: None }
+    pub fn new(
+        protocol: Protocol,
+        provider: String,
+        name: String,
+        base_url: String,
+        api_key: Option<String>,
+        auth_style: AuthStyle,
+        source: &str,
+    ) -> Self {
+        Self {
+            protocol,
+            provider,
+            name,
+            base_url,
+            api_key,
+            auth_style,
+            source: source.to_owned(),
+            state: RouteHealth::Unknown,
+            score: 0,
+            latency_ms: None,
+            consecutive_successes: 0,
+            consecutive_failures: 0,
+            verified_by_request: false,
+            last_error: None,
+            last_status_code: None,
+            last_success_at: None,
+        }
     }
-    pub fn host(&self) -> String { url::Url::parse(&self.base_url).ok().and_then(|url| url.host_str().map(str::to_owned)).unwrap_or_else(|| self.base_url.clone()) }
-    pub fn record(&mut self, ok: bool, latency_ms: u64, status: Option<u16>, error: Option<String>, request: bool) {
-        self.latency_ms = Some(latency_ms); self.last_status_code = status;
+    pub fn host(&self) -> String {
+        url::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .unwrap_or_else(|| self.base_url.clone())
+    }
+    pub fn record(
+        &mut self,
+        ok: bool,
+        latency_ms: u64,
+        status: Option<u16>,
+        error: Option<String>,
+        request: bool,
+    ) {
+        self.latency_ms = Some(latency_ms);
+        self.last_status_code = status;
         if ok {
-            self.consecutive_successes += 1; self.consecutive_failures = 0; self.last_error = None; self.last_success_at = Some(Utc::now());
-            if request { self.verified_by_request = true; }
+            self.consecutive_successes += 1;
+            self.consecutive_failures = 0;
+            self.last_error = None;
+            self.last_success_at = Some(Utc::now());
+            if request {
+                self.verified_by_request = true;
+            }
             let authenticated = request || status.is_some_and(|value| value < 400);
-            self.state = if authenticated { RouteHealth::Healthy } else { RouteHealth::Unknown };
-            self.score = (if authenticated { 65 } else { 35 }) + if self.verified_by_request { 20 } else { 0 } + if latency_ms < 300 { 15 } else if latency_ms < 1000 { 10 } else { 0 };
+            self.state = if authenticated {
+                RouteHealth::Healthy
+            } else {
+                RouteHealth::Unknown
+            };
+            self.score = (if authenticated { 65 } else { 35 })
+                + if self.verified_by_request { 20 } else { 0 }
+                + if latency_ms < 300 {
+                    15
+                } else if latency_ms < 1000 {
+                    10
+                } else {
+                    0
+                };
         } else {
-            self.consecutive_failures += 1; self.consecutive_successes = 0; self.last_error = error.map(|value| value.chars().take(300).collect());
-            self.state = if self.consecutive_failures >= 3 { RouteHealth::Unavailable } else { RouteHealth::Degraded };
+            self.consecutive_failures += 1;
+            self.consecutive_successes = 0;
+            self.last_error = error.map(|value| value.chars().take(300).collect());
+            self.state = if self.consecutive_failures >= 3 {
+                RouteHealth::Unavailable
+            } else {
+                RouteHealth::Degraded
+            };
             self.score = (40 - self.consecutive_failures as i32 * 15).max(0);
         }
     }
@@ -112,10 +191,22 @@ impl Route {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum RouteHealth { Unknown, Healthy, Degraded, Unavailable }
+pub enum RouteHealth {
+    Unknown,
+    Healthy,
+    Degraded,
+    Unavailable,
+}
 
 impl RouteHealth {
-    pub fn label(self) -> &'static str { match self { Self::Unknown => "未知", Self::Healthy => "健康", Self::Degraded => "降级", Self::Unavailable => "不可用" } }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "未知",
+            Self::Healthy => "健康",
+            Self::Degraded => "降级",
+            Self::Unavailable => "不可用",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
