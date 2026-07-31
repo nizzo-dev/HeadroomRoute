@@ -51,12 +51,16 @@ try {
     $statusHash = File-Hash (Join-Path $install 'status.json')
 
     $oldProcess = Start-Process $target -WindowStyle Hidden -PassThru
+    $portableProcess = Start-Process $source -WindowStyle Hidden -PassThru
     Wait-ForFile (Join-Path $install 'old.started')
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $package 'Install.ps1') -InstallDir $install
+    Wait-ForFile (Join-Path $package 'new.started')
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $package 'Install.ps1') -InstallDir $install -ProcessId $portableProcess.Id
     if ($LASTEXITCODE -ne 0) { throw 'Running upgrade failed' }
     Wait-ForFile (Join-Path $install 'new.started')
     $oldProcess.Refresh()
+    $portableProcess.Refresh()
     if (!$oldProcess.HasExited) { throw 'Old process was not stopped' }
+    if (!$portableProcess.HasExited) { throw 'Portable process was not stopped' }
     if ((File-Hash $target) -ne $newHash) { throw 'New executable was not installed' }
     if ((File-Hash (Join-Path $install 'HeadroomRoute.previous.exe')) -ne $oldHash) { throw 'Previous executable was not preserved' }
     if ((File-Hash (Join-Path $install 'config.json')) -ne $configHash) { throw 'Successful upgrade changed config.json' }

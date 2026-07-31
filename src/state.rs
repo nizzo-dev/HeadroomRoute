@@ -618,7 +618,7 @@ fn recovery_hint(
     last_error: Option<&str>,
 ) -> &'static str {
     if matches!(headroom, "unavailable" | "runtime-unavailable") {
-        return "从托盘重启 Headroom；仍失败时修复运行环境";
+        return "从托盘重启 Headroom；仍失败时按 README 检查外部运行环境";
     }
     let routes = [openai, anthropic];
     if routes

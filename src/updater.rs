@@ -52,7 +52,6 @@ struct UpdateInfo {
 }
 
 struct PreparedUpdate {
-    package_dir: PathBuf,
     installer: PathBuf,
 }
 
@@ -138,19 +137,6 @@ fn run_interactive(owner: HWND, state_dir: &Path) -> Result<()> {
         return Ok(());
     };
 
-    if !is_installed_copy(state_dir) {
-        let _ = Command::new("explorer.exe")
-            .arg(&prepared.package_dir)
-            .spawn();
-        show_message(
-            owner,
-            "更新已下载",
-            "当前运行的是便携版。已打开更新目录，请退出程序后运行 Install.ps1。",
-            MB_OK | MB_ICONINFORMATION,
-        );
-        return Ok(());
-    }
-
     if show_message(
         owner,
         "更新已准备完成",
@@ -174,6 +160,8 @@ fn run_interactive(owner: HWND, state_dir: &Path) -> Result<()> {
         .arg("-StartNow")
         .arg("-InstallDir")
         .arg(state_dir)
+        .arg("-ProcessId")
+        .arg(std::process::id().to_string())
         .spawn()
         .context("无法启动外部升级程序")?;
     Ok(())
@@ -308,10 +296,7 @@ fn download_update(
     if progress.is_cancelled() {
         return Ok(None);
     }
-    Ok(Some(PreparedUpdate {
-        package_dir,
-        installer,
-    }))
+    Ok(Some(PreparedUpdate { installer }))
 }
 
 fn download_file(
@@ -445,16 +430,6 @@ fn sha256_file(path: &Path) -> Result<String> {
         hasher.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn is_installed_copy(state_dir: &Path) -> bool {
-    let Ok(current) = std::env::current_exe() else {
-        return false;
-    };
-    let target = state_dir.join("HeadroomRoute.exe");
-    current
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&target.to_string_lossy())
 }
 
 fn format_bytes(value: u64) -> String {

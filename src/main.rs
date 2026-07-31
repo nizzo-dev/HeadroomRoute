@@ -82,12 +82,15 @@ fn run() -> Result<()> {
         }
         return Ok(());
     }
-    if args.iter().any(|arg| arg == "--repair-runtime") {
+    if args
+        .iter()
+        .any(|arg| arg == "--check-runtime" || arg == "--repair-runtime")
+    {
         let mut cfg = app.inner.lock().unwrap().config.clone();
-        let python = repair_runtime_with_progress(&cfg)?;
+        let python = require_runtime(&cfg)?;
         cfg.headroom_python = Some(python);
         config::save(&config_path, &cfg)?;
-        show_info("Headroom 运行环境修复完成");
+        show_info("Headroom 环境检测通过");
         unsafe {
             CloseHandle(mutex);
         }
@@ -96,7 +99,7 @@ fn run() -> Result<()> {
     if args.iter().any(|arg| arg == "--uninstall") {
         let cfg = app.inner.lock().unwrap().config.clone();
         runtime::uninstall(&cfg)?;
-        show_info("配置已恢复，托管运行环境已删除；程序文件将在 Windows 重启后清理");
+        show_info("配置已恢复，程序数据已删除；程序文件将在 Windows 重启后清理");
         unsafe {
             CloseHandle(mutex);
         }
@@ -132,7 +135,7 @@ fn run() -> Result<()> {
             app.inner.lock().unwrap().last_error = Some(format!("首次路由同步失败: {error}"));
         }
     } else {
-        app.inner.lock().unwrap().headroom_state = "准备运行环境".into();
+        app.inner.lock().unwrap().headroom_state = "runtime-unavailable".into();
     }
 
     let (state_dir, legacy_dir) = {
@@ -166,15 +169,15 @@ fn run() -> Result<()> {
                 config::restore_clients(&cfg)?;
                 show_info("Codex 与 Claude Code 配置已恢复");
             }
-            "repair" => {
-                let python = repair_runtime_with_progress(&cfg)?;
+            "check-runtime" => {
+                let python = require_runtime(&cfg)?;
                 cfg.headroom_python = Some(python);
                 config::save(&config_path, &cfg)?;
-                show_info("Headroom 运行环境修复完成，请重新启动程序");
+                show_info("Headroom 环境检测通过，请重新启动程序");
             }
             "uninstall" => {
                 runtime::uninstall(&cfg)?;
-                show_info("已恢复配置并删除托管环境；程序文件将在 Windows 重启后清理");
+                show_info("已恢复配置并删除程序数据；程序文件将在 Windows 重启后清理");
             }
             _ => {}
         }
@@ -199,18 +202,10 @@ fn show_info(message: &str) {
     }
 }
 
-fn repair_runtime_with_progress(config: &model::AppConfig) -> Result<PathBuf> {
-    let progress = progress::ProgressWindow::open("修复 Headroom 运行环境", "正在准备修复")?;
-    let result = runtime::repair_runtime(config, |status, percent| {
-        progress.set_status(status);
-        if let Some(percent) = percent {
-            progress.set_progress(percent);
-        } else {
-            progress.set_indeterminate();
-        }
-    });
-    progress.close();
-    result
+fn require_runtime(config: &model::AppConfig) -> Result<PathBuf> {
+    runtime::find_valid_python(config).context(
+        "未找到可用的 Headroom 环境；请按 README 安装 Python 与 Headroom，并配置 headroom_python",
+    )
 }
 
 #[allow(dead_code)]

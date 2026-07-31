@@ -1,7 +1,5 @@
 use crate::{
-    config,
-    progress::ProgressWindow,
-    runtime,
+    config, runtime,
     state::{AppState, should_stop},
 };
 use reqwest::blocking::Client;
@@ -84,8 +82,12 @@ fn wait_for_next_probe(app: &AppState) {
 
 fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
+        let runtime_available = {
+            let config = app.inner.lock().unwrap().config.clone();
+            runtime::find_valid_python(&config).is_some()
+        };
         while !should_stop(&app) {
-            if !app.sync_in_progress.load(Ordering::Acquire) {
+            if runtime_available && !app.sync_in_progress.load(Ordering::Acquire) {
                 let cfg = app.inner.lock().unwrap().config.clone();
                 if config::routing_drifted(&cfg) {
                     let preferred = app.active_url();
@@ -104,85 +106,33 @@ fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
 fn headroom_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let initial_config = app.inner.lock().unwrap().config.clone();
-        let first_install = runtime::find_valid_python(&initial_config).is_none();
-        let progress = first_install
-            .then(|| {
-                ProgressWindow::open_with_hint(
-                    "首次设置 Headroom Route",
-                    "正在检查运行环境",
-                    "首次准备通常需要几分钟，请保持网络连接；完成后会自动继续。",
-                )
-            })
-            .transpose();
-        let progress = match progress {
-            Ok(value) => value,
-            Err(error) => {
-                app.inner.lock().unwrap().last_error =
-                    Some(format!("无法显示首次设置进度: {error}"));
-                None
-            }
+        let Some(python) = runtime::find_valid_python(&initial_config) else {
+            let configured = initial_config
+                .headroom_python
+                .as_deref()
+                .map_or_else(|| "未配置".into(), |path| path.display().to_string());
+            let message = format!(
+                "未找到可用的 Headroom 环境（Python：{configured}）。HeadroomRoute 不会自动安装 Python 或 Headroom；请按 README 准备环境后重新启动。"
+            );
+            let mut state = app.inner.lock().unwrap();
+            state.headroom_state = "runtime-unavailable".into();
+            state.last_error = Some(message.clone());
+            drop(state);
+            *app.runtime_result.lock().unwrap() = Some((false, message));
+            return;
         };
-        match runtime::ensure_runtime(&initial_config, |status, percent| {
-            app.inner.lock().unwrap().headroom_state = status.into();
-            if let Some(progress) = &progress {
-                progress.set_status(status);
-                if let Some(percent) = percent {
-                    progress.set_progress(percent);
-                } else {
-                    progress.set_indeterminate();
-                }
-            }
-        }) {
-            Ok(python) => {
-                let (saved, path) = {
-                    let mut state = app.inner.lock().unwrap();
-                    state.config.headroom_python = Some(python);
-                    state.headroom_state = "运行环境就绪".into();
-                    (
-                        state.config.clone(),
-                        state.config.state_dir.join("config.json"),
-                    )
-                };
-                if let Err(error) = config::save(&path, &saved) {
-                    app.inner.lock().unwrap().last_error =
-                        Some(format!("保存运行环境配置失败: {error}"));
-                }
-                let preferred = app.active_url();
-                match config::sync_all(&saved, preferred.as_deref()) {
-                    Ok(result) if first_install => {
-                        *app.runtime_result.lock().unwrap() = Some((
-                            true,
-                            format!("运行环境已安装，原配置已备份并完成路由设置：{result}"),
-                        ))
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        let message = format!(
-                            "运行环境已就绪，但配置同步失败：{error}。请从托盘打开日志目录或复制诊断报告"
-                        );
-                        app.inner.lock().unwrap().last_error = Some(message.clone());
-                        if first_install {
-                            *app.runtime_result.lock().unwrap() = Some((false, message));
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                let message = format!(
-                    "Headroom 运行环境准备失败：{error}。请从托盘选择“修复 Headroom 运行环境”"
-                );
-                let mut state = app.inner.lock().unwrap();
-                state.headroom_state = "runtime-unavailable".into();
-                state.last_error = Some(message.clone());
-                drop(state);
-                if first_install {
-                    *app.runtime_result.lock().unwrap() = Some((false, message));
-                }
-                drop(progress);
-                return;
-            }
+        let (saved, path) = {
+            let mut state = app.inner.lock().unwrap();
+            state.config.headroom_python = Some(python);
+            state.headroom_state = "运行环境就绪".into();
+            (
+                state.config.clone(),
+                state.config.state_dir.join("config.json"),
+            )
+        };
+        if let Err(error) = config::save(&path, &saved) {
+            app.inner.lock().unwrap().last_error = Some(format!("保存运行环境配置失败: {error}"));
         }
-        drop(progress);
         let client = Client::builder()
             .timeout(Duration::from_secs(2))
             .build()

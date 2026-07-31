@@ -31,7 +31,6 @@ use windows_sys::Win32::{
 
 const STATIC_LEFT_CENTERED: u32 = 0x0200;
 const ID_CANCEL: usize = 1;
-const DEFAULT_HINT: &str = "此过程将在后台安全完成，完成后会自动继续。";
 
 enum ProgressMessage {
     Status(String),
@@ -54,10 +53,6 @@ pub struct ProgressWindow {
 }
 
 impl ProgressWindow {
-    pub fn open(title: &str, initial: &str) -> Result<Self> {
-        Self::open_with_hint(title, initial, DEFAULT_HINT)
-    }
-
     pub fn open_with_hint(title: &str, initial: &str, hint: &str) -> Result<Self> {
         Self::open_inner(title, initial, hint, false)
     }

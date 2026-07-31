@@ -144,9 +144,9 @@ unsafe extern "system" fn window_proc(
                     notify(
                         hwnd,
                         if ok {
-                            "首次设置完成"
+                            "Headroom 环境就绪"
                         } else {
-                            "首次设置失败"
+                            "Headroom 环境不可用"
                         },
                         &message,
                     );
@@ -336,7 +336,7 @@ unsafe fn show_menu(hwnd: HWND) {
             maintenance_menu,
             MF_STRING,
             ID_REPAIR_RUNTIME,
-            wide("修复 Headroom 运行环境...").as_ptr(),
+            wide("重新检测 Headroom 环境...").as_ptr(),
         );
         AppendMenuW(
             maintenance_menu,
@@ -542,13 +542,14 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             if unsafe {
                 MessageBoxW(
                     hwnd,
-                    wide("修复会停止 Headroom 并重新安装托管运行环境，是否继续？").as_ptr(),
-                    wide("修复 Headroom").as_ptr(),
+                    wide("将退出程序并重新检测 config.json 中配置的 Headroom 环境，是否继续？")
+                        .as_ptr(),
+                    wide("检测 Headroom 环境").as_ptr(),
                     MB_YESNO | MB_ICONWARNING,
                 )
             } == IDYES
             {
-                *app.maintenance_action.lock().unwrap() = Some("repair".into());
+                *app.maintenance_action.lock().unwrap() = Some("check-runtime".into());
                 unsafe {
                     DestroyWindow(hwnd);
                 }
@@ -559,7 +560,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
                 MessageBoxW(
                     hwnd,
                     wide(
-                        "将恢复 Codex/Claude 配置、删除托管运行环境并取消开机启动。是否完全卸载？",
+                        "将恢复 Codex/Claude 配置、删除 HeadroomRoute 数据并取消开机启动。外部 Python/Headroom 环境不会被删除。是否完全卸载？",
                     )
                     .as_ptr(),
                     wide("完全卸载 HeadroomRoute").as_ptr(),

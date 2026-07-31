@@ -1,5 +1,6 @@
 ﻿param(
     [switch]$StartNow,
+    [int]$ProcessId = 0,
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'HeadroomRoute')
 )
 $ErrorActionPreference = 'Stop'
@@ -31,6 +32,10 @@ if ($header.Length -lt 2 -or $header[0] -ne 0x4d -or $header[1] -ne 0x5a) {
 }
 
 $running = @(Get-Process -Name 'HeadroomRoute' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $targetPath })
+if ($ProcessId) {
+    $current = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($current -and $running.Id -notcontains $current.Id) { $running += $current }
+}
 $restart = $StartNow -or $running.Count -gt 0
 $hadTarget = Test-Path $target
 $targetMoved = $false
