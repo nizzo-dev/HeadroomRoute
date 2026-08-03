@@ -122,8 +122,7 @@ pub fn discover_routes(config: &AppConfig) -> Result<DiscoveredRoutes> {
                 let Some(base) = env.get("ANTHROPIC_BASE_URL").and_then(Value::as_str) else {
                     continue;
                 };
-                let Some(base_url) =
-                    effective_claude_base_url(base, &row.website_url, config.headroom_port)
+                let Some(base_url) = effective_claude_base_url(base, &row.website_url, config)
                 else {
                     continue;
                 };
@@ -164,7 +163,7 @@ pub fn discover_routes(config: &AppConfig) -> Result<DiscoveredRoutes> {
         && let Some(env) = settings.get("env").and_then(Value::as_object)
         && let Some(base) = env.get("ANTHROPIC_BASE_URL").and_then(Value::as_str)
         && let Ok(base_url) = normalize_url(base)
-        && !is_local_headroom(&base_url, config.headroom_port)
+        && !is_local_service(&base_url, config)
     {
         let (key, style) = claude_auth(env);
         let id = "claude-settings".to_owned();
@@ -258,13 +257,13 @@ fn push_fallback(routes: &mut Vec<Route>, route: Route) {
     routes.push(route);
 }
 
-fn effective_claude_base_url(base: &str, website_url: &str, headroom_port: u16) -> Option<String> {
+fn effective_claude_base_url(base: &str, website_url: &str, config: &AppConfig) -> Option<String> {
     let base_url = normalize_url(base).ok()?;
-    if !is_local_headroom(&base_url, headroom_port) {
+    if !is_local_service(&base_url, config) {
         return Some(base_url);
     }
     let recovered = normalize_url(website_url).ok()?;
-    (!is_local_headroom(&recovered, headroom_port)).then_some(recovered)
+    (!is_local_service(&recovered, config)).then_some(recovered)
 }
 
 pub fn normalize_url(value: &str) -> Result<String> {
@@ -285,6 +284,18 @@ fn is_local_headroom(value: &str, port: u16) -> bool {
         matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
             && url.port_or_known_default() == Some(port)
     })
+}
+
+fn is_local_service(value: &str, config: &AppConfig) -> bool {
+    is_local_headroom(value, config.headroom_port) || is_local_headroom(value, config.agent_port)
+}
+
+fn client_port(config: &AppConfig) -> u16 {
+    if config.bypass_headroom {
+        config.agent_port
+    } else {
+        config.headroom_port
+    }
 }
 
 pub fn sync_codex(config: &AppConfig, preferred: Option<&str>) -> Result<String> {
@@ -337,7 +348,7 @@ pub fn sync_codex(config: &AppConfig, preferred: Option<&str>) -> Result<String>
     headroom.insert("name", value("Headroom Route"));
     headroom.insert(
         "base_url",
-        value(format!("http://127.0.0.1:{}/v1", config.headroom_port)),
+        value(format!("http://127.0.0.1:{}/v1", client_port(config))),
     );
     if let Some(item) = source.get("requires_openai_auth") {
         headroom.insert("requires_openai_auth", item.clone());
@@ -387,7 +398,7 @@ pub fn sync_claude(config: &AppConfig) -> Result<String> {
         .get_mut("env")
         .and_then(Value::as_object_mut)
         .unwrap();
-    let local = format!("http://127.0.0.1:{}", config.headroom_port);
+    let local = format!("http://127.0.0.1:{}", client_port(config));
     let already = env.get("ANTHROPIC_BASE_URL").and_then(Value::as_str) == Some(local.as_str());
     env.insert("ANTHROPIC_BASE_URL".into(), Value::String(local));
     if !already {
@@ -607,7 +618,7 @@ fn restore_codex(config: &AppConfig, baseline_path: Option<&str>) -> Result<()> 
     if current
         .get("openai_base_url")
         .and_then(Item::as_str)
-        .is_some_and(|url| is_local_headroom(url, config.headroom_port))
+        .is_some_and(|url| is_local_service(url, config))
     {
         if let Some(item) = baseline
             .as_ref()
@@ -656,7 +667,7 @@ fn restore_claude(config: &AppConfig, baseline_path: Option<&str>) -> Result<()>
     let local = current
         .pointer("/env/ANTHROPIC_BASE_URL")
         .and_then(Value::as_str)
-        .is_some_and(|url| is_local_headroom(url, config.headroom_port));
+        .is_some_and(|url| is_local_service(url, config));
     if local {
         let env = current
             .as_object_mut()
@@ -693,19 +704,24 @@ fn restore_claude(config: &AppConfig, baseline_path: Option<&str>) -> Result<()>
 }
 
 pub fn routing_drifted(config: &AppConfig) -> bool {
+    let codex_local = format!("http://127.0.0.1:{}/v1", client_port(config));
     let codex_drifted = config.enable_codex
         && config.codex_config.exists()
         && fs::read_to_string(&config.codex_config)
             .ok()
             .and_then(|text| text.parse::<DocumentMut>().ok())
-            .and_then(|doc| {
-                doc.get("model_provider")
-                    .and_then(Item::as_str)
-                    .map(str::to_owned)
-            })
-            .as_deref()
-            != Some("headroom");
-    let local = format!("http://127.0.0.1:{}", config.headroom_port);
+            .is_none_or(|doc| {
+                doc.get("model_provider").and_then(Item::as_str) != Some("headroom")
+                    || doc
+                        .get("model_providers")
+                        .and_then(Item::as_table)
+                        .and_then(|providers| providers.get("headroom"))
+                        .and_then(Item::as_table)
+                        .and_then(|provider| provider.get("base_url"))
+                        .and_then(Item::as_str)
+                        != Some(codex_local.as_str())
+            });
+    let local = format!("http://127.0.0.1:{}", client_port(config));
     let claude_drifted = config.enable_claude
         && fs::read_to_string(&config.claude_settings)
             .ok()
@@ -992,7 +1008,7 @@ mod tests {
     #![allow(clippy::field_reassign_with_default)]
     use super::{
         effective_claude_base_url, parse_proxy_server, push_fallback, push_unique, routing_drifted,
-        sync_claude,
+        sync_all, sync_claude,
     };
     use crate::model::{AppConfig, AuthStyle, Protocol, Route};
     use serde_json::Value;
@@ -1043,8 +1059,9 @@ mod tests {
 
     #[test]
     fn recovers_cc_switch_provider_url_from_website_metadata() {
+        let config = AppConfig::default();
         assert_eq!(
-            effective_claude_base_url("http://127.0.0.1:8787", "https://api.example.com", 8787)
+            effective_claude_base_url("http://127.0.0.1:8787", "https://api.example.com", &config)
                 .as_deref(),
             Some("https://api.example.com")
         );
@@ -1052,15 +1069,51 @@ mod tests {
             effective_claude_base_url(
                 "https://direct.example.com",
                 "https://ignored.example.com",
-                8787
+                &config
             )
             .as_deref(),
             Some("https://direct.example.com")
         );
         assert_eq!(
-            effective_claude_base_url("http://127.0.0.1:8787", "", 8787),
+            effective_claude_base_url("http://127.0.0.1:8787", "", &config),
             None
         );
+    }
+
+    #[test]
+    fn bypass_routes_clients_to_agent() {
+        let dir =
+            std::env::temp_dir().join(format!("headroom-route-bypass-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::default();
+        config.codex_config = dir.join("config.toml");
+        config.claude_settings = dir.join("settings.json");
+        config.bypass_headroom = true;
+        fs::write(
+            &config.codex_config,
+            "model_provider = \"upstream\"\n[model_providers.upstream]\nname = \"Upstream\"\nbase_url = \"https://api.example.com/v1\"\n",
+        )
+        .unwrap();
+        sync_all(&config, None).unwrap();
+        let codex = fs::read_to_string(&config.codex_config).unwrap();
+        let claude: Value =
+            serde_json::from_str(&fs::read_to_string(&config.claude_settings).unwrap()).unwrap();
+        assert!(codex.contains("http://127.0.0.1:8790/v1"));
+        assert_eq!(
+            claude
+                .pointer("/env/ANTHROPIC_BASE_URL")
+                .and_then(Value::as_str),
+            Some("http://127.0.0.1:8790")
+        );
+        assert!(!routing_drifted(&config));
+        fs::write(
+            &config.codex_config,
+            codex.replace("http://127.0.0.1:8790/v1", "http://127.0.0.1:8787/v1"),
+        )
+        .unwrap();
+        assert!(routing_drifted(&config));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 use crate::{
     config,
     model::{Protocol, Route, Snapshot},
+    runtime,
     state::AppState,
     updater,
 };
@@ -50,6 +51,10 @@ const ID_RESTORE: usize = 110;
 const ID_REPAIR_RUNTIME: usize = 111;
 const ID_UNINSTALL: usize = 112;
 const ID_UPDATE: usize = 113;
+const ID_BYPASS: usize = 114;
+const ID_SELECT_RUNTIME: usize = 115;
+const ID_RESET_METRICS: usize = 117;
+const ID_AUTO_UPDATE: usize = 118;
 const ID_ROUTE_BASE: usize = 1000;
 static APP: OnceLock<Arc<AppState>> = OnceLock::new();
 thread_local! { static URL_POPUP: Cell<HWND> = const { Cell::new(ptr::null_mut()) }; }
@@ -151,6 +156,23 @@ unsafe extern "system" fn window_proc(
                         &message,
                     );
                 }
+                if let Some(message) = app.take_config_change_notice() {
+                    notify(hwnd, "CC-Switch 配置已变化", &message);
+                }
+                if let Some((ok, message)) = app.take_routing_notice() {
+                    notify(
+                        hwnd,
+                        if ok {
+                            "配置接管已恢复"
+                        } else {
+                            "配置接管恢复失败"
+                        },
+                        &message,
+                    );
+                }
+                if let Some(message) = app.take_update_notice() {
+                    notify(hwnd, "发现软件更新", &message);
+                }
                 if let Some((ok, message)) = app.take_restart_result() {
                     if ok {
                         notify(hwnd, "Headroom 重启完成", &message);
@@ -191,23 +213,46 @@ unsafe fn show_menu(hwnd: HWND) {
             snapshot.active_anthropic_provider.as_deref(),
         )
     };
-    let service = format!(
-        "Headroom：{}  ·  路由{}",
-        headroom_cn(&snapshot.headroom_state),
-        health_cn(snapshot.state)
-    );
+    let service = if snapshot.bypass_headroom {
+        format!("旁路 Headroom  ·  路由{}", health_cn(snapshot.state))
+    } else {
+        format!(
+            "Headroom：{}  ·  路由{}",
+            headroom_cn(&snapshot.headroom_state),
+            health_cn(snapshot.state)
+        )
+    };
     let codex = format!(
-        "Codex：{}  ·  {} ms",
+        "Codex：{}  ·  {}  ·  {} ms",
+        snapshot.codex_availability,
         snapshot.active_name.as_deref().unwrap_or("未配置"),
         latency_text(snapshot.latency_ms)
     );
     let claude = format!(
-        "Claude：{}  ·  {} ms",
+        "Claude：{}  ·  {}  ·  {} ms",
+        snapshot.claude_availability,
         snapshot
             .active_anthropic_name
             .as_deref()
             .unwrap_or("未配置"),
         latency_text(snapshot.anthropic_latency_ms)
+    );
+    let compression = format!(
+        "压缩：{} → {} Token · 节省 {}（{:.1}%）",
+        snapshot.headroom_metrics.input_tokens_original,
+        snapshot.headroom_metrics.input_tokens_optimized,
+        snapshot.headroom_metrics.tokens_saved,
+        snapshot.headroom_metrics.compression_percent()
+    );
+    let requests = format!(
+        "请求：{} 完成 · {} 失败（{:.1}%）",
+        snapshot.headroom_metrics.completed_requests,
+        snapshot.headroom_metrics.failed_requests,
+        snapshot.headroom_metrics.failure_percent()
+    );
+    let metrics_scope = snapshot.headroom_metrics_since.map_or_else(
+        || "统计：当前日志文件累计".into(),
+        |since| format!("统计：自 {} UTC", since.format("%Y-%m-%d %H:%M:%S")),
     );
     unsafe {
         AppendMenuW(
@@ -230,10 +275,37 @@ unsafe fn show_menu(hwnd: HWND) {
         );
         AppendMenuW(
             menu,
+            MF_STRING | MF_DISABLED | MF_GRAYED,
+            0,
+            wide(&metrics_scope).as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING | MF_DISABLED | MF_GRAYED,
+            0,
+            wide(&compression).as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING | MF_DISABLED | MF_GRAYED,
+            0,
+            wide(&requests).as_ptr(),
+        );
+        AppendMenuW(
+            menu,
             MF_STRING,
             ID_OPEN_STATUS,
             wide("查看完整状态...").as_ptr(),
         );
+        if let Some((command, label)) = recommended_action(
+            snapshot.bypass_headroom,
+            &snapshot.headroom_state,
+            snapshot.codex_availability,
+            snapshot.claude_availability,
+            snapshot.last_error.as_deref(),
+        ) {
+            AppendMenuW(menu, MF_STRING, command, wide(label).as_ptr());
+        }
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         let codex_label = format!(
             "切换 Codex 上游（{}）",
@@ -268,6 +340,17 @@ unsafe fn show_menu(hwnd: HWND) {
             ID_AUTO,
             wide("自动故障切换").as_ptr(),
         );
+        AppendMenuW(
+            menu,
+            MF_STRING
+                | if snapshot.bypass_headroom {
+                    MF_CHECKED
+                } else {
+                    0
+                },
+            ID_BYPASS,
+            wide("旁路 Headroom（保留路由）").as_ptr(),
+        );
         let (sync_flags, sync_text) = if app.sync_in_progress.load(Ordering::Acquire) {
             (
                 MF_STRING | MF_DISABLED | MF_GRAYED,
@@ -295,6 +378,17 @@ unsafe fn show_menu(hwnd: HWND) {
             ID_STARTUP,
             wide("随 Windows 启动").as_ptr(),
         );
+        AppendMenuW(
+            settings_menu,
+            MF_STRING
+                | if snapshot.auto_update_check {
+                    MF_CHECKED
+                } else {
+                    0
+                },
+            ID_AUTO_UPDATE,
+            wide("每日检查软件更新").as_ptr(),
+        );
         AppendMenuW(settings_menu, MF_SEPARATOR, 0, ptr::null());
         AppendMenuW(
             settings_menu,
@@ -313,6 +407,12 @@ unsafe fn show_menu(hwnd: HWND) {
             MF_STRING,
             ID_DIAG,
             wide("复制脱敏诊断报告").as_ptr(),
+        );
+        AppendMenuW(
+            settings_menu,
+            MF_STRING,
+            ID_RESET_METRICS,
+            wide("清零 Headroom 统计...").as_ptr(),
         );
         AppendMenuW(settings_menu, MF_SEPARATOR, 0, ptr::null());
         AppendMenuW(
@@ -337,6 +437,12 @@ unsafe fn show_menu(hwnd: HWND) {
             MF_STRING,
             ID_REPAIR_RUNTIME,
             wide("重新检测 Headroom 环境...").as_ptr(),
+        );
+        AppendMenuW(
+            maintenance_menu,
+            MF_STRING,
+            ID_SELECT_RUNTIME,
+            wide("选择 Headroom Python...").as_ptr(),
         );
         AppendMenuW(
             maintenance_menu,
@@ -387,6 +493,38 @@ unsafe fn show_menu(hwnd: HWND) {
     }
 }
 
+fn recommended_action(
+    bypass_headroom: bool,
+    headroom_state: &str,
+    codex: &str,
+    claude: &str,
+    error: Option<&str>,
+) -> Option<(usize, &'static str)> {
+    if !bypass_headroom && headroom_state == "runtime-unavailable" {
+        return Some((ID_SELECT_RUNTIME, "建议操作：选择 Headroom Python..."));
+    }
+    if matches!(
+        headroom_state,
+        "检测中" | "运行环境就绪" | "starting" | "restarting"
+    ) {
+        return None;
+    }
+    if !bypass_headroom && !matches!(headroom_state, "healthy" | "external") {
+        return Some((ID_RESTART, "建议操作：重启 Headroom"));
+    }
+    let error = error.unwrap_or_default().to_ascii_lowercase();
+    if ["同步", "配置", "routing", "route guard"]
+        .iter()
+        .any(|word| error.contains(word))
+    {
+        return Some((ID_SYNC, "建议操作：重新同步配置"));
+    }
+    if matches!(codex, "降级" | "不可用") || matches!(claude, "降级" | "不可用") {
+        return Some((ID_CHECK, "建议操作：立即检查上游"));
+    }
+    (!error.is_empty()).then_some((ID_DIAG, "建议操作：复制脱敏诊断报告"))
+}
+
 unsafe fn route_menu(
     snapshot: &Snapshot,
     protocol: Protocol,
@@ -408,7 +546,7 @@ unsafe fn route_menu(
         let text = format!(
             "{}  ·  {}  ·  {} ms",
             route.name,
-            route.state.label(),
+            route.evidence_label(),
             latency_text(route.latency_ms)
         );
         unsafe { AppendMenuW(menu, flags, ID_ROUTE_BASE + index, wide(&text).as_ptr()) };
@@ -446,6 +584,19 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             ),
             Ok(false) => notify(hwnd, "自动切换已关闭", "上游故障时将保留当前路由"),
             Err(error) => notify(hwnd, "自动切换设置失败", &error.to_string()),
+        },
+        ID_BYPASS => match app.toggle_headroom_bypass() {
+            Ok(true) => notify(
+                hwnd,
+                "已旁路 Headroom",
+                "Codex 与 Claude 仍经过 HeadroomRoute，但不再压缩上下文",
+            ),
+            Ok(false) => notify(
+                hwnd,
+                "已恢复 Headroom",
+                "Codex 与 Claude 已重新经过 Headroom 压缩层",
+            ),
+            Err(error) => notify(hwnd, "切换 Headroom 模式失败", &error.to_string()),
         },
         ID_SYNC => {
             if !app.begin_sync() {
@@ -495,11 +646,33 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
                 notify(hwnd, "开机启动设置失败", &e.to_string())
             }
         }
+        ID_AUTO_UPDATE => match app.toggle_auto_update_check() {
+            Ok(true) => notify(hwnd, "自动更新提醒已启用", "每天最多检查一次，只提醒不安装"),
+            Ok(false) => notify(hwnd, "自动更新提醒已关闭", "仍可随时手动检查更新"),
+            Err(error) => notify(hwnd, "自动更新提醒设置失败", &error.to_string()),
+        },
         ID_DIAG => {
             let text = app.diagnostic_text();
             if copy_clipboard(hwnd, &text).is_ok() {
                 notify(hwnd, "诊断报告已复制", "报告不包含 API Key")
             };
+        }
+        ID_RESET_METRICS => {
+            if unsafe {
+                MessageBoxW(
+                    hwnd,
+                    wide("只清零 HeadroomRoute 显示的累计统计，不删除原始日志。是否继续？")
+                        .as_ptr(),
+                    wide("清零 Headroom 统计").as_ptr(),
+                    MB_YESNO | MB_ICONWARNING,
+                )
+            } == IDYES
+            {
+                match app.reset_headroom_metrics() {
+                    Ok(()) => notify(hwnd, "Headroom 统计已清零", "新的统计起点已保存"),
+                    Err(error) => notify(hwnd, "清零 Headroom 统计失败", &error.to_string()),
+                }
+            }
         }
         ID_CONFIG => {
             let path = app
@@ -516,8 +689,8 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             let _ = Command::new("explorer.exe").arg(path).spawn();
         }
         ID_UPDATE => {
-            let state_dir = app.inner.lock().unwrap().config.state_dir.clone();
-            if !updater::start_interactive(hwnd as usize, state_dir) {
+            let config = app.inner.lock().unwrap().config.clone();
+            if !updater::start_interactive(hwnd as usize, config) {
                 notify(hwnd, "正在检查软件更新", "请等待当前更新操作完成");
             }
         }
@@ -555,6 +728,32 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
                 }
             }
         }
+        ID_SELECT_RUNTIME => match runtime::select_python() {
+            Ok(Some(path)) => {
+                let current = app.inner.lock().unwrap().config.clone();
+                match runtime::config_with_python(&current, path) {
+                    Ok(updated) => {
+                        let config_path = updated.state_dir.join("config.json");
+                        match config::save(&config_path, &updated) {
+                            Ok(()) => {
+                                app.inner.lock().unwrap().config = updated;
+                                notify(
+                                    hwnd,
+                                    "Headroom 环境已保存",
+                                    "验证通过；请退出并重新启动 HeadroomRoute 以使用新环境",
+                                );
+                            }
+                            Err(error) => {
+                                notify(hwnd, "保存 Headroom 环境失败", &error.to_string())
+                            }
+                        }
+                    }
+                    Err(error) => notify(hwnd, "Headroom 环境不可用", &error.to_string()),
+                }
+            }
+            Ok(None) => {}
+            Err(error) => notify(hwnd, "选择 Headroom 环境失败", &error.to_string()),
+        },
         ID_UNINSTALL => {
             if unsafe {
                 MessageBoxW(
@@ -591,8 +790,15 @@ unsafe fn show_status(hwnd: HWND) {
     let Some(app) = APP.get() else { return };
     let s = app.snapshot();
     let text = format!(
-        "【当前路由】\r\nCodex：{}\r\nClaude：{}\r\n\r\n【服务状态】\r\n整体路由：{}\r\n自动切换：{}\r\nHeadroom：{}\r\n配置同步：{}\r\n重启任务：{}\r\n\r\n【最近活动】\r\n可用路由：{}\r\n最近切换：{}\r\n最近错误：{}\r\n\r\n【恢复建议】\r\n{}",
+        "【当前路由】\r\n模式：{}\r\nCodex：{} · {}\r\nClaude：{} · {}\r\n\r\n【服务状态】\r\n整体路由：{}\r\n自动切换：{}\r\nHeadroom：{}\r\n配置同步：{}\r\n重启任务：{}\r\n\r\n【Headroom 指标】\r\n统计范围：{}\r\n压缩 Token：{} → {}\r\n节省 Token：{}（{:.1}%）\r\n完成请求：{}\r\n失败请求：{}（{:.1}%）\r\n\r\n【最近活动】\r\n可用路由：{}\r\n最近切换：{}\r\n最近错误：{}\r\n\r\n【恢复建议】\r\n{}",
+        if s.bypass_headroom {
+            "旁路 Headroom"
+        } else {
+            "经过 Headroom"
+        },
+        s.codex_availability,
         app.route_summary(Protocol::OpenAi),
+        s.claude_availability,
         app.route_summary(Protocol::Anthropic),
         health_cn(s.state),
         if s.auto_enabled {
@@ -603,6 +809,17 @@ unsafe fn show_status(hwnd: HWND) {
         headroom_cn(&s.headroom_state),
         s.sync_status,
         s.restart_status,
+        s.headroom_metrics_since.map_or_else(
+            || "当前日志文件累计".into(),
+            |since| format!("自 {} UTC", since.format("%Y-%m-%d %H:%M:%S")),
+        ),
+        s.headroom_metrics.input_tokens_original,
+        s.headroom_metrics.input_tokens_optimized,
+        s.headroom_metrics.tokens_saved,
+        s.headroom_metrics.compression_percent(),
+        s.headroom_metrics.completed_requests,
+        s.headroom_metrics.failed_requests,
+        s.headroom_metrics.failure_percent(),
         s.routes.len(),
         s.last_switch_reason.as_deref().unwrap_or("无"),
         s.last_error.as_deref().unwrap_or("无"),
@@ -949,7 +1166,7 @@ fn wide(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::route_is_selected;
+    use super::{ID_RESTART, ID_SELECT_RUNTIME, recommended_action, route_is_selected};
     use crate::model::{AuthStyle, Protocol, Route};
 
     #[test]
@@ -974,5 +1191,19 @@ mod tests {
         );
         assert!(!route_is_selected(&first, Some("second")));
         assert!(route_is_selected(&second, Some("second")));
+    }
+
+    #[test]
+    fn recommends_the_action_closest_to_the_fault() {
+        assert_eq!(
+            recommended_action(false, "runtime-unavailable", "不可用", "不可用", None)
+                .map(|action| action.0),
+            Some(ID_SELECT_RUNTIME)
+        );
+        assert_eq!(
+            recommended_action(false, "unavailable", "不可用", "不可用", None)
+                .map(|action| action.0),
+            Some(ID_RESTART)
+        );
     }
 }

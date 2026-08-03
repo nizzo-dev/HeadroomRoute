@@ -1,6 +1,6 @@
 use crate::{
     config,
-    model::{AppConfig, Protocol, Route, RouteHealth, Snapshot},
+    model::{AppConfig, HeadroomMetrics, Protocol, Route, RouteHealth, Snapshot},
 };
 use anyhow::Result;
 use serde_json::json;
@@ -22,6 +22,7 @@ pub struct RuntimeState {
     pub selected_anthropic_provider: Option<String>,
     pub headroom_state: String,
     pub headroom_pid: Option<u32>,
+    pub headroom_metrics: HeadroomMetrics,
     pub last_switch_reason: Option<String>,
     pub last_error: Option<String>,
 }
@@ -31,6 +32,7 @@ pub struct AppState {
     pub stop: AtomicBool,
     pub restart_headroom: AtomicBool,
     pub force_probe: AtomicBool,
+    pub reset_metrics: AtomicBool,
     pub sync_in_progress: AtomicBool,
     pub sync_status: Mutex<String>,
     pub sync_result: Mutex<Option<(bool, String)>>,
@@ -40,6 +42,9 @@ pub struct AppState {
     pub model_change_notice: Mutex<Option<String>>,
     pub auto_switch_notice: Mutex<Option<String>>,
     pub runtime_result: Mutex<Option<(bool, String)>>,
+    pub config_change_notice: Mutex<Option<String>>,
+    pub routing_notice: Mutex<Option<(bool, String)>>,
+    pub update_notice: Mutex<Option<String>>,
     pub maintenance_action: Mutex<Option<String>>,
 }
 
@@ -97,12 +102,14 @@ impl AppState {
                 selected_anthropic_provider: actual_anthropic,
                 headroom_state: "检测中".into(),
                 headroom_pid: None,
+                headroom_metrics: HeadroomMetrics::default(),
                 last_switch_reason: None,
                 last_error: error,
             }),
             stop: AtomicBool::new(false),
             restart_headroom: AtomicBool::new(false),
             force_probe: AtomicBool::new(false),
+            reset_metrics: AtomicBool::new(false),
             sync_in_progress: AtomicBool::new(false),
             sync_status: Mutex::new("未同步".into()),
             sync_result: Mutex::new(None),
@@ -112,6 +119,9 @@ impl AppState {
             model_change_notice: Mutex::new(None),
             auto_switch_notice: Mutex::new(None),
             runtime_result: Mutex::new(None),
+            config_change_notice: Mutex::new(None),
+            routing_notice: Mutex::new(None),
+            update_notice: Mutex::new(None),
             maintenance_action: Mutex::new(None),
         })
     }
@@ -179,6 +189,18 @@ impl AppState {
         self.runtime_result.lock().unwrap().take()
     }
 
+    pub fn take_config_change_notice(&self) -> Option<String> {
+        self.config_change_notice.lock().unwrap().take()
+    }
+
+    pub fn take_routing_notice(&self) -> Option<(bool, String)> {
+        self.routing_notice.lock().unwrap().take()
+    }
+
+    pub fn take_update_notice(&self) -> Option<String> {
+        self.update_notice.lock().unwrap().take()
+    }
+
     pub fn toggle_auto_failover(&self) -> Result<bool> {
         let (enabled, path, saved) = {
             let mut state = self.inner.lock().unwrap();
@@ -196,6 +218,92 @@ impl AppState {
             return Err(error);
         }
         Ok(enabled)
+    }
+
+    pub fn toggle_headroom_bypass(&self) -> Result<bool> {
+        let (current, mut updated, path, preferred) = {
+            let state = self.inner.lock().unwrap();
+            (
+                state.config.clone(),
+                state.config.clone(),
+                state.config.state_dir.join("config.json"),
+                active_route(&state, Protocol::OpenAi).map(|route| route.base_url.clone()),
+            )
+        };
+        updated.bypass_headroom = !updated.bypass_headroom;
+        if let Err(error) = config::sync_all(&updated, preferred.as_deref())
+            .and_then(|_| config::save(&path, &updated))
+        {
+            let _ = config::sync_all(&current, preferred.as_deref());
+            self.inner.lock().unwrap().last_error =
+                Some(format!("切换 Headroom 模式失败: {error}"));
+            return Err(error);
+        }
+        let enabled = updated.bypass_headroom;
+        self.inner.lock().unwrap().config = updated;
+        Ok(enabled)
+    }
+
+    pub fn reset_headroom_metrics(&self) -> Result<()> {
+        let (mut updated, path, log_file) = {
+            let state = self.inner.lock().unwrap();
+            (
+                state.config.clone(),
+                state.config.state_dir.join("config.json"),
+                state.config.state_dir.join("headroom-proxy.jsonl"),
+            )
+        };
+        updated.metrics_log_offset = fs::metadata(log_file)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        updated.metrics_since = Some(chrono::Utc::now());
+        config::save(&path, &updated)?;
+        let mut state = self.inner.lock().unwrap();
+        state.config = updated;
+        state.headroom_metrics = HeadroomMetrics::default();
+        drop(state);
+        self.reset_metrics.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn toggle_auto_update_check(&self) -> Result<bool> {
+        let (enabled, path, saved) = {
+            let mut state = self.inner.lock().unwrap();
+            state.config.auto_check_updates = !state.config.auto_check_updates;
+            (
+                state.config.auto_check_updates,
+                state.config.state_dir.join("config.json"),
+                state.config.clone(),
+            )
+        };
+        if let Err(error) = config::save(&path, &saved) {
+            self.inner.lock().unwrap().config.auto_check_updates = !enabled;
+            return Err(error);
+        }
+        Ok(enabled)
+    }
+
+    pub fn begin_daily_update_check(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<AppConfig>> {
+        let (path, saved) = {
+            let mut state = self.inner.lock().unwrap();
+            if !update_check_due(
+                state.config.auto_check_updates,
+                state.config.last_update_check,
+                now,
+            ) {
+                return Ok(None);
+            }
+            state.config.last_update_check = Some(now);
+            (
+                state.config.state_dir.join("config.json"),
+                state.config.clone(),
+            )
+        };
+        config::save(&path, &saved)?;
+        Ok(Some(saved))
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -326,6 +434,7 @@ impl AppState {
                         route.last_error = old.last_error.clone();
                         route.last_status_code = old.last_status_code;
                         route.last_success_at = old.last_success_at;
+                        route.failover_blocked_until = old.failover_blocked_until;
                     }
                 }
                 let active = preserve_index(
@@ -403,17 +512,24 @@ impl AppState {
                 failover_candidate(&state.routes, protocol, failed).map(|next| {
                     (
                         next,
+                        failed,
                         state.routes[failed].name.clone(),
                         state.routes[next].name.clone(),
                     )
                 })
             }
         };
-        if let Some((next, failed, replacement)) = failover
+        if let Some((next, failed_index, failed, replacement)) = failover
             && self.switch_index(next, "自动故障切换（连续 3 次失败）")
         {
-            *self.auto_switch_notice.lock().unwrap() =
-                Some(format!("{} 已不可用，已切换到 {}", failed, replacement));
+            self.inner.lock().unwrap().routes[failed_index].failover_blocked_until =
+                Some(chrono::Utc::now() + chrono::Duration::minutes(5));
+            *self.auto_switch_notice.lock().unwrap() = Some(format!(
+                "{}：{} 连续 3 次失败，已切换到 {}；故障线路将冷却 5 分钟",
+                protocol.label(),
+                failed,
+                replacement
+            ));
         }
     }
 
@@ -466,12 +582,17 @@ impl AppState {
         let openai = active_route(&state, Protocol::OpenAi);
         let anthropic = active_route(&state, Protocol::Anthropic);
         format!(
-            "Headroom Route {}\r\nCodex: {} [{}]\r\nClaude: {} [{}]\r\nCC-Switch: {} [{}]\r\nAgent: 127.0.0.1:{}\r\nHeadroom: 127.0.0.1:{} ({}, PID={})\r\nCodex 上游: {}\r\nClaude 上游: {}\r\n路由数: {}\r\n自动切换: {}\r\n最近错误: {}\r\n恢复建议: {}",
+            "Headroom Route {}\r\n模式: {}\r\nCodex: {} [{}]\r\nClaude: {} [{}]\r\nCC-Switch: {} [{}]\r\nAgent: 127.0.0.1:{}\r\nHeadroom: 127.0.0.1:{} ({}, PID={})\r\n统计范围: {}\r\n压缩 Token: {} -> {}，节省 {} ({:.1}%)\r\n完成请求: {}，失败 {} ({:.1}%)\r\nCodex 上游: {}\r\nClaude 上游: {}\r\n路由数: {}\r\n自动切换: {}\r\n最近错误: {}\r\n恢复建议: {}",
             env!("CARGO_PKG_VERSION"),
+            if state.config.bypass_headroom {
+                "旁路 Headroom"
+            } else {
+                "经过 Headroom"
+            },
             state.config.codex_config.display(),
-            yes(state.config.codex_config.exists()),
+            availability(openai, transport_ready(&state)),
             state.config.claude_settings.display(),
-            yes(state.config.claude_settings.exists()),
+            availability(anthropic, transport_ready(&state)),
             state.config.cc_switch_db.display(),
             yes(state.config.cc_switch_db.exists()),
             state.config.agent_port,
@@ -481,6 +602,14 @@ impl AppState {
                 .headroom_pid
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "--".into()),
+            metrics_scope(state.config.metrics_since),
+            state.headroom_metrics.input_tokens_original,
+            state.headroom_metrics.input_tokens_optimized,
+            state.headroom_metrics.tokens_saved,
+            state.headroom_metrics.compression_percent(),
+            state.headroom_metrics.completed_requests,
+            state.headroom_metrics.failed_requests,
+            state.headroom_metrics.failure_percent(),
             route_summary(openai),
             route_summary(anthropic),
             state.routes.len(),
@@ -514,15 +643,21 @@ impl AppState {
             active_host: openai.map(Route::host),
             active_score: openai.map(|r| r.score).unwrap_or(0),
             latency_ms: openai.and_then(|r| r.latency_ms),
+            codex_availability: availability(openai, transport_ready(state)),
             active_anthropic_provider: anthropic.map(|r| r.provider.clone()),
             active_anthropic_name: anthropic.map(|r| r.name.clone()),
             active_anthropic_url: anthropic.map(|r| r.base_url.clone()),
             active_anthropic_host: anthropic.map(Route::host),
             active_anthropic_score: anthropic.map(|r| r.score).unwrap_or(0),
             anthropic_latency_ms: anthropic.and_then(|r| r.latency_ms),
+            claude_availability: availability(anthropic, transport_ready(state)),
             auto_enabled: state.config.auto_failover,
+            bypass_headroom: state.config.bypass_headroom,
             headroom_state: state.headroom_state.clone(),
             headroom_pid: state.headroom_pid,
+            headroom_metrics: state.headroom_metrics,
+            headroom_metrics_since: state.config.metrics_since,
+            auto_update_check: state.config.auto_check_updates,
             sync_status: self.sync_status.lock().unwrap().clone(),
             restart_status: self.restart_status.lock().unwrap().clone(),
             routes: state.routes.clone(),
@@ -530,6 +665,40 @@ impl AppState {
             last_error: state.last_error.clone(),
         }
     }
+}
+
+fn transport_ready(state: &RuntimeState) -> bool {
+    state.config.bypass_headroom || matches!(state.headroom_state.as_str(), "healthy" | "external")
+}
+
+fn availability(route: Option<&Route>, transport_ready: bool) -> &'static str {
+    let Some(route) = route else {
+        return "未配置";
+    };
+    if !transport_ready {
+        return "不可用";
+    }
+    match route.state {
+        RouteHealth::Healthy => "可用",
+        RouteHealth::Degraded => "降级",
+        RouteHealth::Unavailable => "不可用",
+        RouteHealth::Unknown => "待验证",
+    }
+}
+
+fn metrics_scope(since: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    since.map_or_else(
+        || "当前日志文件累计".into(),
+        |since| format!("自 {} UTC", since.format("%Y-%m-%d %H:%M:%S")),
+    )
+}
+
+fn update_check_due(
+    enabled: bool,
+    last: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    enabled && last.is_none_or(|last| now.signed_duration_since(last) >= chrono::Duration::days(1))
 }
 
 fn select_index(routes: &[Route], protocol: Protocol, selected: Option<&str>) -> Option<usize> {
@@ -578,7 +747,12 @@ fn failover_candidate(routes: &[Route], protocol: Protocol, failed: usize) -> Op
         .iter()
         .enumerate()
         .filter(|(index, route)| {
-            *index != failed && route.protocol == protocol && route.state == RouteHealth::Healthy
+            *index != failed
+                && route.protocol == protocol
+                && route.state == RouteHealth::Healthy
+                && route
+                    .failover_blocked_until
+                    .is_none_or(|until| until <= chrono::Utc::now())
         })
         .max_by_key(|(_, route)| route.score)
         .map(|(index, _)| index)
@@ -597,7 +771,7 @@ fn route_summary(route: Option<&Route>) -> String {
             format!(
                 "{} · {} · {} ms · HTTP {} · {}",
                 route.name,
-                route.state.label(),
+                route.evidence_label(),
                 route
                     .latency_ms
                     .map(|value| value.to_string())
@@ -696,9 +870,10 @@ pub fn should_stop(app: &AppState) -> bool {
 mod tests {
     #![allow(clippy::field_reassign_with_default)]
     use super::{
-        AppState, RuntimeState, preserve_index, protocol_for_path, recovery_hint, route_summary,
+        AppState, RuntimeState, availability, preserve_index, protocol_for_path, recovery_hint,
+        route_summary, update_check_due,
     };
-    use crate::model::{AppConfig, AuthStyle, Protocol, Route, RouteHealth};
+    use crate::model::{AppConfig, AuthStyle, HeadroomMetrics, Protocol, Route, RouteHealth};
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
     #[test]
@@ -710,6 +885,40 @@ mod tests {
             Protocol::Anthropic
         );
         assert_eq!(protocol_for_path("/api/oauth/usage"), Protocol::Anthropic);
+    }
+
+    #[test]
+    fn automatic_update_check_runs_at_most_daily() {
+        let now = chrono::Utc::now();
+        assert!(update_check_due(true, None, now));
+        assert!(!update_check_due(true, Some(now), now));
+        assert!(update_check_due(
+            true,
+            Some(now - chrono::Duration::days(1)),
+            now
+        ));
+        assert!(!update_check_due(false, None, now));
+    }
+
+    #[test]
+    fn availability_requires_transport_and_route_health() {
+        let mut route = Route::new(
+            Protocol::OpenAi,
+            "provider".into(),
+            "Provider".into(),
+            "https://api.example.com".into(),
+            None,
+            AuthStyle::Bearer,
+            "test",
+        );
+        assert_eq!(availability(Some(&route), false), "不可用");
+        assert_eq!(availability(Some(&route), true), "待验证");
+        assert_eq!(route.evidence_label(), "尚未验证");
+        route.record(true, 10, Some(200), None, true);
+        assert_eq!(availability(Some(&route), true), "可用");
+        assert_eq!(route.evidence_label(), "真实请求验证");
+        route.record(false, 10, Some(401), Some("unauthorized".into()), true);
+        assert_eq!(route.evidence_label(), "鉴权失败");
     }
 
     #[test]
@@ -748,12 +957,14 @@ mod tests {
                 selected_anthropic_provider: None,
                 headroom_state: "test".into(),
                 headroom_pid: None,
+                headroom_metrics: HeadroomMetrics::default(),
                 last_switch_reason: None,
                 last_error: None,
             }),
             stop: AtomicBool::new(false),
             restart_headroom: AtomicBool::new(false),
             force_probe: AtomicBool::new(false),
+            reset_metrics: AtomicBool::new(false),
             sync_in_progress: AtomicBool::new(false),
             sync_status: Mutex::new("未同步".into()),
             sync_result: Mutex::new(None),
@@ -763,6 +974,9 @@ mod tests {
             model_change_notice: Mutex::new(None),
             auto_switch_notice: Mutex::new(None),
             runtime_result: Mutex::new(None),
+            config_change_notice: Mutex::new(None),
+            routing_notice: Mutex::new(None),
+            update_notice: Mutex::new(None),
             maintenance_action: Mutex::new(None),
         });
         app.record_route_result(Protocol::OpenAi, "second", true, 25, Some(200), None, true);
@@ -833,12 +1047,14 @@ mod tests {
                 selected_anthropic_provider: None,
                 headroom_state: "test".into(),
                 headroom_pid: None,
+                headroom_metrics: HeadroomMetrics::default(),
                 last_switch_reason: None,
                 last_error: None,
             }),
             stop: AtomicBool::new(false),
             restart_headroom: AtomicBool::new(false),
             force_probe: AtomicBool::new(false),
+            reset_metrics: AtomicBool::new(false),
             sync_in_progress: AtomicBool::new(false),
             sync_status: Mutex::new("未同步".into()),
             sync_result: Mutex::new(None),
@@ -848,6 +1064,9 @@ mod tests {
             model_change_notice: Mutex::new(None),
             auto_switch_notice: Mutex::new(None),
             runtime_result: Mutex::new(None),
+            config_change_notice: Mutex::new(None),
+            routing_notice: Mutex::new(None),
+            update_notice: Mutex::new(None),
             maintenance_action: Mutex::new(None),
         });
         assert!(app.toggle_auto_failover().unwrap());
@@ -878,6 +1097,11 @@ mod tests {
         );
         assert_eq!(app.snapshot().active_provider.as_deref(), Some("backup"));
         assert!(app.take_auto_switch_notice().is_some());
+        assert!(
+            app.inner.lock().unwrap().routes[0]
+                .failover_blocked_until
+                .is_some()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -921,12 +1145,14 @@ mod tests {
                 selected_anthropic_provider: None,
                 headroom_state: "test".into(),
                 headroom_pid: None,
+                headroom_metrics: HeadroomMetrics::default(),
                 last_switch_reason: None,
                 last_error: None,
             }),
             stop: AtomicBool::new(false),
             restart_headroom: AtomicBool::new(false),
             force_probe: AtomicBool::new(false),
+            reset_metrics: AtomicBool::new(false),
             sync_in_progress: AtomicBool::new(false),
             sync_status: Mutex::new("未同步".into()),
             sync_result: Mutex::new(None),
@@ -936,6 +1162,9 @@ mod tests {
             model_change_notice: Mutex::new(None),
             auto_switch_notice: Mutex::new(None),
             runtime_result: Mutex::new(None),
+            config_change_notice: Mutex::new(None),
+            routing_notice: Mutex::new(None),
+            update_notice: Mutex::new(None),
             maintenance_action: Mutex::new(None),
         });
         assert!(app.switch_index(1, "test"));

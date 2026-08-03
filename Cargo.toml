@@ -1,6 +1,6 @@
 [package]
 name = "headroom-route"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 description = "Lightweight Windows tray route manager for Headroom, Codex and Claude Code"
 license = "MIT"

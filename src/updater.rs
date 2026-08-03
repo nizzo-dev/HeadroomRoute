@@ -1,8 +1,12 @@
 #![cfg(windows)]
 
-use crate::progress::ProgressWindow;
+use crate::{config, model::AppConfig, progress::ProgressWindow};
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::{blocking::Client, header::USER_AGENT};
+use reqwest::{
+    StatusCode,
+    blocking::{Client, RequestBuilder, Response},
+    header::{RANGE, USER_AGENT},
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -21,6 +25,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use zip::ZipArchive;
 
 const RELEASE_API: &str = "https://api.github.com/repos/nizzo-dev/HeadroomRoute/releases/latest";
+const RELEASE_PAGE: &str = "https://github.com/nizzo-dev/HeadroomRoute/releases/latest";
+const DOWNLOAD_ATTEMPTS: usize = 3;
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, Deserialize)]
@@ -59,7 +65,7 @@ pub fn is_running() -> bool {
     RUNNING.load(Ordering::Acquire)
 }
 
-pub fn start_interactive(owner: usize, state_dir: PathBuf) -> bool {
+pub fn start_interactive(owner: usize, config: AppConfig) -> bool {
     if RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
         .is_err()
@@ -67,7 +73,7 @@ pub fn start_interactive(owner: usize, state_dir: PathBuf) -> bool {
         return false;
     }
     thread::spawn(move || {
-        if let Err(error) = run_interactive(owner as HWND, &state_dir) {
+        if let Err(error) = run_interactive(owner as HWND, &config) {
             show_message(
                 owner as HWND,
                 "检查更新失败",
@@ -80,16 +86,52 @@ pub fn start_interactive(owner: usize, state_dir: PathBuf) -> bool {
     true
 }
 
-fn run_interactive(owner: HWND, state_dir: &Path) -> Result<()> {
+pub fn check_background(config: &AppConfig) -> Result<Option<String>> {
+    if RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let result = (|| {
+        let mut builder = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30));
+        if let Some(proxy) = config::reqwest_outbound_proxy(config)? {
+            builder = builder.proxy(proxy);
+        }
+        let client = builder.build().context("无法创建更新请求")?;
+        Ok(
+            check_for_update(&client, env!("CARGO_PKG_VERSION"))?.map(|update| {
+                format!(
+                    "发现 HeadroomRoute v{}（{}）；可从“设置与诊断”手动检查并安装",
+                    update.version, update.title
+                )
+            }),
+        )
+    })();
+    RUNNING.store(false, Ordering::Release);
+    result
+}
+
+fn run_interactive(owner: HWND, config: &AppConfig) -> Result<()> {
     let progress = ProgressWindow::open_with_hint(
         "检查软件更新",
         "正在连接 GitHub Releases",
         "正在安全检查最新正式版，通常只需几秒钟。",
     )?;
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
+    let mut client_builder = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30));
+    let mut download_client_builder = Client::builder().connect_timeout(Duration::from_secs(10));
+    if let Some(proxy) = config::reqwest_outbound_proxy(config)? {
+        client_builder = client_builder.proxy(proxy.clone());
+        download_client_builder = download_client_builder.proxy(proxy);
+    }
+    let client = client_builder.build().context("无法创建更新请求")?;
+    let download_client = download_client_builder
         .build()
-        .context("无法创建更新请求")?;
+        .context("无法创建更新下载请求")?;
     let update = check_for_update(&client, env!("CARGO_PKG_VERSION"));
     progress.close();
     let Some(update) = update? else {
@@ -125,9 +167,28 @@ fn run_interactive(owner: HWND, state_dir: &Path) -> Result<()> {
         "正在准备下载",
         "可随时取消；取消不会影响当前版本和已有设置。",
     )?;
-    let prepared = download_update(&client, state_dir, &update, &progress);
+    let prepared = download_update(
+        &client,
+        &download_client,
+        &config.state_dir,
+        &update,
+        &progress,
+    );
     progress.close();
-    let Some(prepared) = prepared? else {
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let detail = format!(
+                "{error:#}\r\n\r\n已保留未完成的下载，下次会自动续传。是否改用浏览器打开官方 Release 页面？"
+            );
+            if show_message(owner, "下载更新失败", &detail, MB_YESNO | MB_ICONERROR) == IDYES
+            {
+                let _ = Command::new("explorer.exe").arg(RELEASE_PAGE).spawn();
+            }
+            return Ok(());
+        }
+    };
+    let Some(prepared) = prepared else {
         show_message(
             owner,
             "下载已取消",
@@ -159,7 +220,7 @@ fn run_interactive(owner: HWND, state_dir: &Path) -> Result<()> {
         .arg(&prepared.installer)
         .arg("-StartNow")
         .arg("-InstallDir")
-        .arg(state_dir)
+        .arg(&config.state_dir)
         .arg("-ProcessId")
         .arg(std::process::id().to_string())
         .spawn()
@@ -168,15 +229,16 @@ fn run_interactive(owner: HWND, state_dir: &Path) -> Result<()> {
 }
 
 fn check_for_update(client: &Client, current: &str) -> Result<Option<UpdateInfo>> {
-    let release: GithubRelease = client
-        .get(RELEASE_API)
-        .header(USER_AGENT, format!("HeadroomRoute/{current}"))
-        .send()
-        .context("无法连接 GitHub")?
-        .error_for_status()
-        .context("GitHub Releases 返回错误")?
-        .json()
-        .context("无法解析 GitHub Release")?;
+    let release: GithubRelease = send_with_retry(
+        client
+            .get(RELEASE_API)
+            .header(USER_AGENT, format!("HeadroomRoute/{current}")),
+    )
+    .context("无法连接 GitHub")?
+    .error_for_status()
+    .context("GitHub Releases 返回错误")?
+    .json()
+    .context("无法解析 GitHub Release")?;
     select_update(release, current)
 }
 
@@ -221,6 +283,7 @@ fn select_update(release: GithubRelease, current: &str) -> Result<Option<UpdateI
 
 fn download_update(
     client: &Client,
+    download_client: &Client,
     state_dir: &Path,
     update: &UpdateInfo,
     progress: &ProgressWindow,
@@ -232,16 +295,13 @@ fn download_update(
     fs::create_dir_all(&package_dir).context("无法创建更新目录")?;
     let archive_path = update_dir.join(&update.archive.name);
     let partial_path = archive_path.with_extension("zip.part");
-    match download_file(client, &update.archive, &partial_path, progress) {
+    match download_file(download_client, &update.archive, &partial_path, progress) {
         Ok(true) => {}
         Ok(false) => {
             let _ = fs::remove_file(&partial_path);
             return Ok(None);
         }
-        Err(error) => {
-            let _ = fs::remove_file(&partial_path);
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     }
 
     progress.set_indeterminate();
@@ -249,18 +309,15 @@ fn download_update(
     if progress.is_cancelled() {
         return Ok(None);
     }
-    let checksum_text = client
-        .get(&update.checksums.browser_download_url)
-        .header(
-            USER_AGENT,
-            format!("HeadroomRoute/{}", env!("CARGO_PKG_VERSION")),
-        )
-        .send()
-        .context("无法下载 SHA-256 校验清单")?
-        .error_for_status()
-        .context("SHA-256 校验清单下载失败")?
-        .text()
-        .context("无法读取 SHA-256 校验清单")?;
+    let checksum_text = send_with_retry(client.get(&update.checksums.browser_download_url).header(
+        USER_AGENT,
+        format!("HeadroomRoute/{}", env!("CARGO_PKG_VERSION")),
+    ))
+    .context("无法下载 SHA-256 校验清单")?
+    .error_for_status()
+    .context("SHA-256 校验清单下载失败")?
+    .text()
+    .context("无法读取 SHA-256 校验清单")?;
     if progress.is_cancelled() {
         return Ok(None);
     }
@@ -305,37 +362,66 @@ fn download_file(
     destination: &Path,
     progress: &ProgressWindow,
 ) -> Result<bool> {
-    let response = client
-        .get(&asset.browser_download_url)
-        .header(
+    for attempt in 1..=DOWNLOAD_ATTEMPTS {
+        let mut offset = fs::metadata(destination)
+            .map(|value| value.len())
+            .unwrap_or(0);
+        if offset == asset.size {
+            progress.set_progress(100);
+            return Ok(true);
+        }
+        if offset > asset.size {
+            fs::write(destination, []).context("无法重置无效的更新临时文件")?;
+            offset = 0;
+        }
+        let mut request = client.get(&asset.browser_download_url).header(
             USER_AGENT,
             format!("HeadroomRoute/{}", env!("CARGO_PKG_VERSION")),
-        )
-        .send()
-        .context("无法下载更新包")?
-        .error_for_status()
-        .context("更新包下载失败")?;
-    let total = response.content_length().unwrap_or(asset.size);
-    write_download(
-        response,
-        destination,
-        total,
-        || progress.is_cancelled(),
-        |done, total| {
-            let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0);
-            progress.set_progress(percent as u32);
-            progress.set_status(&format!(
-                "正在下载：{percent}%（{} / {}）",
-                format_bytes(done),
-                format_bytes(total)
-            ));
-        },
-    )
+        );
+        if offset > 0 {
+            request = request.header(RANGE, format!("bytes={offset}-"));
+        }
+        let result = (|| {
+            let response = request.send()?.error_for_status()?;
+            let resumed = offset > 0 && response.status() == StatusCode::PARTIAL_CONTENT;
+            let start = if resumed { offset } else { 0 };
+            let total = response
+                .content_length()
+                .map(|remaining| start + remaining)
+                .unwrap_or(asset.size);
+            write_download(
+                response,
+                destination,
+                start,
+                total,
+                || progress.is_cancelled(),
+                |done, total| {
+                    let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0);
+                    progress.set_progress(percent as u32);
+                    progress.set_status(&format!(
+                        "正在下载：{percent}%（{} / {}）",
+                        format_bytes(done),
+                        format_bytes(total)
+                    ));
+                },
+            )
+        })();
+        match result {
+            Ok(done) => return Ok(done),
+            Err(_) if attempt < DOWNLOAD_ATTEMPTS => {
+                progress.set_status(&format!("连接中断，正在进行第 {} 次重试", attempt + 1));
+                thread::sleep(Duration::from_millis(500 * attempt as u64));
+            }
+            Err(error) => return Err(error).context("无法下载更新包"),
+        }
+    }
+    unreachable!()
 }
 
 fn write_download<R, C, P>(
     mut source: R,
     destination: &Path,
+    offset: u64,
     total: u64,
     cancelled: C,
     mut report: P,
@@ -346,9 +432,15 @@ where
     P: FnMut(u64, u64),
 {
     let result = (|| {
-        let mut file = File::create(destination).context("无法创建更新临时文件")?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(offset > 0)
+            .truncate(offset == 0)
+            .open(destination)
+            .context("无法创建更新临时文件")?;
         let mut buffer = [0u8; 64 * 1024];
-        let mut downloaded = 0u64;
+        let mut downloaded = offset;
         loop {
             if cancelled() {
                 return Ok(false);
@@ -361,13 +453,33 @@ where
             downloaded += count as u64;
             report(downloaded, total);
         }
+        if downloaded != total {
+            bail!("更新包下载不完整：{} / {} 字节", downloaded, total);
+        }
         file.sync_all().context("无法保存完整更新包")?;
         Ok(true)
     })();
-    if !matches!(result, Ok(true)) {
+    if matches!(result, Ok(false)) {
         let _ = fs::remove_file(destination);
     }
     result
+}
+
+fn send_with_retry(request: RequestBuilder) -> reqwest::Result<Response> {
+    for attempt in 1..=DOWNLOAD_ATTEMPTS {
+        match request
+            .try_clone()
+            .expect("update requests are cloneable")
+            .send()
+        {
+            Ok(response) => return Ok(response),
+            Err(_) if attempt < DOWNLOAD_ATTEMPTS => {
+                thread::sleep(Duration::from_millis(500 * attempt as u64));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
 }
 
 fn extract_files(archive_path: &Path, files: &[(&str, &Path)]) -> Result<()> {
@@ -451,7 +563,7 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::{GithubRelease, checksum_for, parse_version, select_update, write_download};
-    use std::{cell::Cell, io::Cursor};
+    use std::{cell::Cell, fs, io::Cursor};
 
     #[test]
     fn compares_three_part_versions() {
@@ -505,6 +617,7 @@ mod tests {
         let completed = write_download(
             Cursor::new(vec![1u8; 128 * 1024]),
             &path,
+            0,
             128 * 1024,
             || reports.get() > 0,
             |_, _| reports.set(reports.get() + 1),
@@ -512,5 +625,17 @@ mod tests {
         .unwrap();
         assert!(!completed);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn resumes_partial_download() {
+        let path = std::env::temp_dir().join(format!(
+            "headroom-route-resume-test-{}.part",
+            std::process::id()
+        ));
+        fs::write(&path, [1u8, 2]).unwrap();
+        assert!(write_download(Cursor::new([3u8, 4]), &path, 2, 4, || false, |_, _| {}).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), [1, 2, 3, 4]);
+        let _ = fs::remove_file(path);
     }
 }

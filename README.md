@@ -27,6 +27,7 @@ HeadroomRoute 是一个轻量、原生的 Windows 托盘路由器，面向同时
 | 独立 Provider | Codex 与 Claude 可分别选择上游，互不干扰 |
 | 复用 CC-Switch | 从其数据库只读导入 Provider、鉴权和模型配置，无需维护第二份账号 |
 | 自动故障切换 | 当前路由连续失败 3 次后，只切换到同协议且已验证健康的 Provider |
+| 一键旁路 | Headroom 故障时可让两套 CLI 直接经过本地路由，保留 Provider 切换能力 |
 | 外部 Headroom | 使用用户自行维护的 Python / Headroom 环境，不下载额外运行时 |
 | 安全接管配置 | 修改 Codex、Claude 配置前创建备份，不在自身配置中保存 API Key |
 | 可诊断 | 分别显示 Codex、Claude 的健康、延迟、HTTP 状态与恢复建议 |
@@ -45,7 +46,7 @@ python -m venv "$env:USERPROFILE\.headroom\venv"
 & "$env:USERPROFILE\.headroom\venv\Scripts\python.exe" -m pip install "headroom-ai[code]==0.32.1"
 ```
 
-如需使用其他虚拟环境，首次运行后在 `%LOCALAPPDATA%\HeadroomRoute\config.json` 中将 `headroom_python` 改为其 `python.exe` 绝对路径，然后重新启动 HeadroomRoute。程序只检测该环境，不会安装或升级其中的任何内容。
+如需使用其他虚拟环境，可从托盘选择 **维护与还原 → 选择 Headroom Python...**，验证通过后重新启动 HeadroomRoute。程序只检测该环境，不会安装或升级其中的任何内容。
 
 ### 推荐：正式安装
 
@@ -58,6 +59,8 @@ python -m venv "$env:USERPROFILE\.headroom\venv"
 ```
 
 程序会安装到 `%LOCALAPPDATA%\HeadroomRoute` 并驻留通知区域。首次启动时，它会检测 Headroom 环境，并从 `%USERPROFILE%\.cc-switch\cc-switch.db` 只读发现 Codex 与 Claude Provider；没有 CC-Switch 时仍可读取两套 CLI 的现有配置。
+
+首次检查发现 Headroom 或 Provider 缺失时，程序会直接显示对应的 PowerShell 安装命令或同步入口，不会自动安装运行时。
 
 > Windows SmartScreen 可能提示未知发布者：当前 Release 尚未进行代码签名。请从本仓库 Release 下载，并使用同版本的 `SHA256SUMS.txt` 核验文件。
 
@@ -73,6 +76,8 @@ python -m venv "$env:USERPROFILE\.headroom\venv"
 - 独立切换 OpenAI 与 Anthropic 上游。
 - 从 Codex、Claude Code 和 CC-Switch 自动发现可用 Provider。
 - 一键同步配置、立即检查上游或重启 Headroom。
+- Headroom 异常时可一键旁路压缩层；CLI 仍通过 HeadroomRoute 使用当前 Provider。
+- CC-Switch Provider 或 CLI 路由配置变化时主动提醒，不静默切换 Provider。
 
 ### CC-Switch 在 HeadroomRoute 中的作用
 
@@ -103,11 +108,17 @@ CC-Switch 是 Provider 配置来源，HeadroomRoute 是运行时路由层；两�
 2. 已通过真实请求验证为健康；
 3. 不是当前故障路由。
 
+自动切换成功后，故障 Provider 会冷却 5 分钟，避免短暂恢复造成线路来回切换；托盘通知会说明协议、失败线路和切换目标。
+
 只有明确影响当前路由的状态（`401`、`403`、`408`、`429`、`5xx`）会计入失败；普通请求错误（例如 `400`、`404`）不会触发切换。
 
 ### 清晰的诊断
 
 双击托盘图标可查看完整状态；“设置与诊断”菜单可以复制脱敏诊断报告。报告包含路由状态、延迟、HTTP 状态、最近错误和恢复建议，但不包含 API Key。
+
+托盘状态和诊断报告还会从 Headroom 的本地 JSONL 日志累计展示原始与压缩后 Token、节省量、压缩率和已完成请求失败率；不会保存请求正文。
+
+统计会注明是当前日志累计还是自最近一次清零起；清零只移动统计起点，不删除原始日志。当前 Headroom 日志没有可靠的协议字段，因此不会伪造 Codex / Claude 拆分数据。
 
 ## 工作原理
 
@@ -144,7 +155,11 @@ HeadroomRoute 从 CC-Switch 或现有 CLI 配置发现 Provider，把 Codex 与 
 4. 校验 ZIP 的 SHA-256；
 5. 确认后重启并更新。
 
+更新请求沿用 HeadroomRoute 的系统代理设置；连接中断时最多重试 3 次并保留临时分片供下次续传。仍然失败时可直接打开官方 Release 页面手动下载。
+
 更新不会静默安装，也不会检查草稿或预发布版本。替换 EXE 前，安装脚本会备份 `config.json`、`status.json` 和旧程序；启动失败时自动恢复。外部 Python / Headroom 环境不会被更改。
+
+默认启用每日更新提醒：启动后每天最多后台检查一次正式版本，只发送通知，不下载或安装；可在“设置与诊断”中关闭。
 
 也可以从新 Release 解压后再次运行 `Install.ps1`，完成相同的原位升级。
 
@@ -154,8 +169,11 @@ HeadroomRoute 从 CC-Switch 或现有 CLI 配置发现 Provider，把 Codex 与 
 - **切换 Codex / Claude 上游**：独立选择 Provider。
 - **立即检查上游**：触发健康探测。
 - **自动故障切换**：开启或关闭保守切换策略。
+- **旁路 Headroom（保留路由）**：临时跳过压缩层，直接使用本地路由代理。
 - **同步 Codex + Claude / CC-Switch**：重新发现并写入路由配置。
 - **重新检测 Headroom 环境**：验证 `headroom_python` 指向的外部环境。
+- **选择 Headroom Python**：选择并验证自定义 `python.exe`，无需手改 JSON。
+- **清零 Headroom 统计**：保存新的统计起点，不删除原始日志。
 - **恢复原始配置**：恢复 HeadroomRoute 接管前的 CLI 配置。
 - **完全卸载并还原**：还原配置并移除程序数据与启动项，不删除外部环境。
 

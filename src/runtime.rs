@@ -15,6 +15,16 @@ use windows_sys::Win32::{
 
 const HEADROOM_VERSION: &str = "0.32.1";
 
+pub fn setup_instructions(config: &AppConfig) -> String {
+    let configured = config
+        .headroom_python
+        .as_deref()
+        .map_or_else(|| "未配置".into(), |path| path.display().to_string());
+    format!(
+        "未找到可用的 Headroom 环境（当前 Python：{configured}）。\r\n\r\n请在 PowerShell 运行：\r\npython -m venv \"$env:USERPROFILE\\.headroom\\venv\"\r\n& \"$env:USERPROFILE\\.headroom\\venv\\Scripts\\python.exe\" -m pip install \"headroom-ai[code]=={HEADROOM_VERSION}\"\r\n\r\n完成后从托盘选择“重新检测 Headroom 环境”。"
+    )
+}
+
 fn managed_python(config: &AppConfig) -> PathBuf {
     config.state_dir.join("runtime/venv/Scripts/python.exe")
 }
@@ -46,6 +56,33 @@ pub fn validate_python(path: &Path) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+pub fn select_python() -> Result<Option<PathBuf>> {
+    let script = r#"Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.OpenFileDialog; $dialog.Filter = 'python.exe|python.exe'; $dialog.FileName = 'python.exe'; if ($dialog.ShowDialog() -eq 'OK') { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::Write($dialog.FileName) }"#;
+    let mut command = Command::new("powershell.exe");
+    let output = hidden(&mut command)
+        .args(["-NoProfile", "-STA", "-Command", script])
+        .output()
+        .context("无法打开 Python 文件选择窗口")?;
+    if !output.status.success() {
+        return Err(anyhow!("Python 文件选择窗口异常退出"));
+    }
+    let path = String::from_utf8(output.stdout)
+        .context("无法读取所选 Python 路径")?
+        .trim_start_matches('\u{feff}')
+        .trim()
+        .to_owned();
+    Ok((!path.is_empty()).then(|| PathBuf::from(path)))
+}
+
+pub fn config_with_python(config: &AppConfig, path: PathBuf) -> Result<AppConfig> {
+    if !validate_python(&path) {
+        return Err(anyhow!(setup_instructions(config)));
+    }
+    let mut updated = config.clone();
+    updated.headroom_python = Some(path);
+    Ok(updated)
 }
 
 pub fn remove_managed_runtime(config: &AppConfig) -> Result<()> {
@@ -163,4 +200,17 @@ fn hidden(command: &mut Command) -> &mut Command {
 #[cfg(windows)]
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_python_without_changing_config() {
+        let config = AppConfig::default();
+        let original = config.headroom_python.clone();
+        assert!(config_with_python(&config, PathBuf::from("missing-python.exe")).is_err());
+        assert_eq!(config.headroom_python, original);
+    }
 }

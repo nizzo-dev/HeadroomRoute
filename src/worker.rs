@@ -1,11 +1,16 @@
 use crate::{
-    config, runtime,
+    config,
+    model::HeadroomMetrics,
+    runtime,
     state::{AppState, should_stop},
+    updater,
 };
 use reqwest::blocking::Client;
 use serde_json::Value;
 use std::{
     fs::OpenOptions,
+    io::{self, Read, Seek, SeekFrom},
+    path::Path,
     process::{Child, Command, Stdio},
     sync::{Arc, atomic::Ordering},
     thread,
@@ -18,8 +23,23 @@ pub fn start(app: Arc<AppState>) -> Vec<thread::JoinHandle<()>> {
     vec![
         probe_loop(app.clone()),
         headroom_loop(app.clone()),
-        status_loop(app),
+        status_loop(app.clone()),
+        update_loop(app),
     ]
+}
+
+fn update_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        sleep_interruptible(&app, Duration::from_secs(10));
+        while !should_stop(&app) {
+            if let Ok(Some(config)) = app.begin_daily_update_check(chrono::Utc::now())
+                && let Ok(Some(message)) = updater::check_background(&config)
+            {
+                *app.update_notice.lock().unwrap() = Some(message);
+            }
+            sleep_interruptible(&app, Duration::from_secs(60 * 60));
+        }
+    })
 }
 
 fn probe_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
@@ -82,20 +102,73 @@ fn wait_for_next_probe(app: &AppState) {
 
 fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let runtime_available = {
+        let mut log_offset = app.inner.lock().unwrap().config.metrics_log_offset;
+        let mut pending_log = Vec::new();
+        let mut metrics = HeadroomMetrics::default();
+        let routing_available = {
             let config = app.inner.lock().unwrap().config.clone();
-            runtime::find_valid_python(&config).is_some()
+            config.bypass_headroom || runtime::find_valid_python(&config).is_some()
         };
+        let mut cc_switch_modified = app
+            .inner
+            .lock()
+            .unwrap()
+            .config
+            .cc_switch_db
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let mut routing_drift_active = false;
         while !should_stop(&app) {
-            if runtime_available && !app.sync_in_progress.load(Ordering::Acquire) {
+            if app.reset_metrics.swap(false, Ordering::Acquire) {
+                let state = app.inner.lock().unwrap();
+                log_offset = state.config.metrics_log_offset;
+                metrics = HeadroomMetrics::default();
+                pending_log.clear();
+            }
+            let log_file = app
+                .inner
+                .lock()
+                .unwrap()
+                .config
+                .state_dir
+                .join("headroom-proxy.jsonl");
+            if update_headroom_metrics(&log_file, &mut log_offset, &mut pending_log, &mut metrics)
+                .is_ok()
+            {
+                app.inner.lock().unwrap().headroom_metrics = metrics;
+            }
+            if routing_available && !app.sync_in_progress.load(Ordering::Acquire) {
                 let cfg = app.inner.lock().unwrap().config.clone();
-                if config::routing_drifted(&cfg) {
+                let drifted = config::routing_drifted(&cfg);
+                if should_repair_drift(&mut routing_drift_active, drifted) {
                     let preferred = app.active_url();
-                    if let Err(error) = config::sync_all(&cfg, preferred.as_deref()) {
-                        app.inner.lock().unwrap().last_error =
-                            Some(format!("CLI 路由守护失败: {error}"));
-                    }
+                    let result = config::sync_all(&cfg, preferred.as_deref());
+                    let (ok, message) = match result {
+                        Ok(_) => (
+                            true,
+                            "检测到 CLI 路由配置被外部修改；HeadroomRoute 接管配置已恢复".into(),
+                        ),
+                        Err(error) => {
+                            let message =
+                                format!("检测到 CLI 路由配置被外部修改，但恢复失败: {error}");
+                            app.inner.lock().unwrap().last_error = Some(message.clone());
+                            (false, message)
+                        }
+                    };
+                    *app.routing_notice.lock().unwrap() = Some((ok, message));
                 }
+            }
+            let cc_switch_db = app.inner.lock().unwrap().config.cc_switch_db.clone();
+            let current_modified = cc_switch_db
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            if database_changed(&mut cc_switch_modified, current_modified) {
+                *app.config_change_notice.lock().unwrap() = Some(
+                    "CC-Switch Provider 配置已变化；请从托盘执行“同步 Codex + Claude / CC-Switch”"
+                        .into(),
+                );
             }
             let _ = app.write_status();
             sleep_interruptible(&app, Duration::from_secs(2));
@@ -103,17 +176,87 @@ fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
     })
 }
 
+fn should_repair_drift(active: &mut bool, drifted: bool) -> bool {
+    if !drifted {
+        *active = false;
+        return false;
+    }
+    if *active {
+        return false;
+    }
+    *active = true;
+    true
+}
+
+fn database_changed(
+    previous: &mut Option<std::time::SystemTime>,
+    current: Option<std::time::SystemTime>,
+) -> bool {
+    let Some(current) = current else { return false };
+    let changed = previous.is_none_or(|previous| previous != current);
+    *previous = Some(current);
+    changed
+}
+
+fn update_headroom_metrics(
+    path: &Path,
+    offset: &mut u64,
+    pending: &mut Vec<u8>,
+    metrics: &mut HeadroomMetrics,
+) -> io::Result<()> {
+    let mut file = match OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if file.metadata()?.len() < *offset {
+        *offset = 0;
+        pending.clear();
+        *metrics = HeadroomMetrics::default();
+    }
+    file.seek(SeekFrom::Start(*offset))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    *offset += bytes.len() as u64;
+    pending.extend(bytes);
+    let Some(end) = pending.iter().rposition(|byte| *byte == b'\n') else {
+        return Ok(());
+    };
+    let incomplete = pending.split_off(end + 1);
+    let complete = std::mem::replace(pending, incomplete);
+    for line in complete.split(|byte| *byte == b'\n') {
+        aggregate_log_line(line, metrics);
+    }
+    Ok(())
+}
+
+fn aggregate_log_line(line: &[u8], metrics: &mut HeadroomMetrics) {
+    let Ok(serde_json::Value::Object(entry)) = serde_json::from_slice(line) else {
+        return;
+    };
+    let original = entry.get("input_tokens_original").and_then(|v| v.as_u64());
+    let optimized = entry.get("input_tokens_optimized").and_then(|v| v.as_u64());
+    if original.is_none() && !entry.contains_key("error") {
+        return;
+    }
+    metrics.completed_requests = metrics.completed_requests.saturating_add(1);
+    if entry.get("error").is_some_and(|error| !error.is_null()) {
+        metrics.failed_requests = metrics.failed_requests.saturating_add(1);
+    }
+    if let (Some(original), Some(optimized)) = (original, optimized) {
+        metrics.input_tokens_original = metrics.input_tokens_original.saturating_add(original);
+        metrics.input_tokens_optimized = metrics.input_tokens_optimized.saturating_add(optimized);
+        metrics.tokens_saved = metrics
+            .tokens_saved
+            .saturating_add(original.saturating_sub(optimized));
+    }
+}
+
 fn headroom_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let initial_config = app.inner.lock().unwrap().config.clone();
         let Some(python) = runtime::find_valid_python(&initial_config) else {
-            let configured = initial_config
-                .headroom_python
-                .as_deref()
-                .map_or_else(|| "未配置".into(), |path| path.display().to_string());
-            let message = format!(
-                "未找到可用的 Headroom 环境（Python：{configured}）。HeadroomRoute 不会自动安装 Python 或 Headroom；请按 README 准备环境后重新启动。"
-            );
+            let message = runtime::setup_instructions(&initial_config);
             let mut state = app.inner.lock().unwrap();
             state.headroom_state = "runtime-unavailable".into();
             state.last_error = Some(message.clone());
@@ -387,5 +530,65 @@ fn terminate_pid(pid: u32) -> std::io::Result<()> {
         Ok(())
     } else {
         Err(std::io::Error::other("taskkill failed"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregates_completed_headroom_requests() {
+        let mut metrics = HeadroomMetrics::default();
+        aggregate_log_line(
+            br#"{"input_tokens_original":100,"input_tokens_optimized":70,"error":null}"#,
+            &mut metrics,
+        );
+        aggregate_log_line(br#"{"error":"upstream failed"}"#, &mut metrics);
+        assert_eq!(metrics.completed_requests, 2);
+        assert_eq!(metrics.failed_requests, 1);
+        assert_eq!(metrics.tokens_saved, 30);
+        assert_eq!(metrics.compression_percent(), 30.0);
+        assert_eq!(metrics.failure_percent(), 50.0);
+    }
+
+    #[test]
+    fn persisted_offset_excludes_cleared_metrics() {
+        let path = std::env::temp_dir().join(format!(
+            "headroom-route-metrics-offset-{}.jsonl",
+            std::process::id()
+        ));
+        let old = b"{\"input_tokens_original\":100,\"input_tokens_optimized\":70,\"error\":null}\n";
+        let new = b"{\"input_tokens_original\":50,\"input_tokens_optimized\":30,\"error\":null}\n";
+        let mut contents = old.to_vec();
+        contents.extend(new);
+        std::fs::write(&path, contents).unwrap();
+        let mut offset = old.len() as u64;
+        let mut pending = Vec::new();
+        let mut metrics = HeadroomMetrics::default();
+        update_headroom_metrics(&path, &mut offset, &mut pending, &mut metrics).unwrap();
+        assert_eq!(metrics.completed_requests, 1);
+        assert_eq!(metrics.tokens_saved, 20);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reports_each_database_version_once() {
+        let first = std::time::SystemTime::UNIX_EPOCH;
+        let second = first + Duration::from_secs(1);
+        let mut previous = Some(first);
+        assert!(!database_changed(&mut previous, Some(first)));
+        assert!(database_changed(&mut previous, Some(second)));
+        assert!(!database_changed(&mut previous, Some(second)));
+        assert!(!database_changed(&mut previous, None));
+    }
+
+    #[test]
+    fn repairs_each_drift_episode_once() {
+        let mut active = false;
+        assert!(should_repair_drift(&mut active, true));
+        assert!(!should_repair_drift(&mut active, true));
+        assert!(!should_repair_drift(&mut active, false));
+        assert!(should_repair_drift(&mut active, true));
     }
 }

@@ -61,6 +61,7 @@ fn run() -> Result<()> {
 
     let defaults = model::AppConfig::default();
     let config_path = defaults.state_dir.join("config.json");
+    let first_run = !config_path.exists();
     let config = config::load_or_create(&config_path)?;
     std::fs::create_dir_all(&config.state_dir)?;
     let app = AppState::new(config);
@@ -129,7 +130,29 @@ fn run() -> Result<()> {
     }
 
     let startup_config = app.inner.lock().unwrap().config.clone();
-    if runtime::find_valid_python(&startup_config).is_some() {
+    if first_run
+        && !args
+            .iter()
+            .any(|arg| arg.starts_with("--headless-seconds="))
+    {
+        let mut issues = Vec::new();
+        if runtime::find_valid_python(&startup_config).is_none() {
+            issues.push(runtime::setup_instructions(&startup_config));
+        }
+        if app.inner.lock().unwrap().routes.is_empty() {
+            issues.push(
+                "未发现可用 Provider。请先在 CC-Switch 添加 Codex 或 Claude Provider，再从托盘选择“同步 Codex + Claude / CC-Switch”。"
+                    .into(),
+            );
+        }
+        if !issues.is_empty() {
+            show_info(&format!(
+                "首次运行检查发现以下待处理项：\r\n\r\n{}",
+                issues.join("\r\n\r\n")
+            ));
+        }
+    }
+    if startup_config.bypass_headroom || runtime::find_valid_python(&startup_config).is_some() {
         let startup_url = app.active_url();
         if let Err(error) = config::sync_all(&startup_config, startup_url.as_deref()) {
             app.inner.lock().unwrap().last_error = Some(format!("首次路由同步失败: {error}"));
@@ -203,9 +226,8 @@ fn show_info(message: &str) {
 }
 
 fn require_runtime(config: &model::AppConfig) -> Result<PathBuf> {
-    runtime::find_valid_python(config).context(
-        "未找到可用的 Headroom 环境；请按 README 安装 Python 与 Headroom，并配置 headroom_python",
-    )
+    runtime::find_valid_python(config)
+        .ok_or_else(|| anyhow::anyhow!(runtime::setup_instructions(config)))
 }
 
 #[allow(dead_code)]

@@ -25,6 +25,11 @@ pub struct AppConfig {
     pub start_with_windows: bool,
     pub no_subscription_tracking: bool,
     pub use_system_proxy: bool,
+    pub bypass_headroom: bool,
+    pub metrics_log_offset: u64,
+    pub metrics_since: Option<DateTime<Utc>>,
+    pub auto_check_updates: bool,
+    pub last_update_check: Option<DateTime<Utc>>,
     pub headroom_python: Option<PathBuf>,
 }
 
@@ -57,6 +62,11 @@ impl Default for AppConfig {
             start_with_windows: false,
             no_subscription_tracking: true,
             use_system_proxy: true,
+            bypass_headroom: false,
+            metrics_log_offset: 0,
+            metrics_since: None,
+            auto_check_updates: true,
+            last_update_check: None,
             headroom_python: Some(home.join(".headroom/venv/Scripts/python.exe")),
         }
     }
@@ -105,6 +115,8 @@ pub struct Route {
     pub last_error: Option<String>,
     pub last_status_code: Option<u16>,
     pub last_success_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing)]
+    pub failover_blocked_until: Option<DateTime<Utc>>,
 }
 
 impl Route {
@@ -134,6 +146,7 @@ impl Route {
             last_error: None,
             last_status_code: None,
             last_success_at: None,
+            failover_blocked_until: None,
         }
     }
     pub fn host(&self) -> String {
@@ -141,6 +154,19 @@ impl Route {
             .ok()
             .and_then(|url| url.host_str().map(str::to_owned))
             .unwrap_or_else(|| self.base_url.clone())
+    }
+    pub fn evidence_label(&self) -> &'static str {
+        if matches!(self.last_status_code, Some(401 | 403)) {
+            "鉴权失败"
+        } else if self.verified_by_request && self.state == RouteHealth::Healthy {
+            "真实请求验证"
+        } else if self.state == RouteHealth::Unknown && self.latency_ms.is_some() {
+            "探测可达"
+        } else if self.state == RouteHealth::Unknown {
+            "尚未验证"
+        } else {
+            self.state.label()
+        }
     }
     pub fn record(
         &mut self,
@@ -209,6 +235,32 @@ impl RouteHealth {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct HeadroomMetrics {
+    pub completed_requests: u64,
+    pub failed_requests: u64,
+    pub input_tokens_original: u64,
+    pub input_tokens_optimized: u64,
+    pub tokens_saved: u64,
+}
+
+impl HeadroomMetrics {
+    pub fn compression_percent(self) -> f64 {
+        percent(self.tokens_saved, self.input_tokens_original)
+    }
+    pub fn failure_percent(self) -> f64 {
+        percent(self.failed_requests, self.completed_requests)
+    }
+}
+
+fn percent(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        part as f64 * 100.0 / total as f64
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
     pub service: &'static str,
@@ -220,15 +272,21 @@ pub struct Snapshot {
     pub active_host: Option<String>,
     pub active_score: i32,
     pub latency_ms: Option<u64>,
+    pub codex_availability: &'static str,
     pub active_anthropic_provider: Option<String>,
     pub active_anthropic_name: Option<String>,
     pub active_anthropic_url: Option<String>,
     pub active_anthropic_host: Option<String>,
     pub active_anthropic_score: i32,
     pub anthropic_latency_ms: Option<u64>,
+    pub claude_availability: &'static str,
     pub auto_enabled: bool,
+    pub bypass_headroom: bool,
     pub headroom_state: String,
     pub headroom_pid: Option<u32>,
+    pub headroom_metrics: HeadroomMetrics,
+    pub headroom_metrics_since: Option<DateTime<Utc>>,
+    pub auto_update_check: bool,
     pub sync_status: String,
     pub restart_status: String,
     pub routes: Vec<Route>,
