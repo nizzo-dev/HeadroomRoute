@@ -1,7 +1,7 @@
 #![cfg(windows)]
 use crate::{
     config,
-    model::{Protocol, Route, Snapshot},
+    model::{FailoverPolicy, Protocol, Route, Snapshot},
     runtime,
     state::AppState,
     updater,
@@ -16,7 +16,12 @@ use std::{
     thread,
 };
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+    Graphics::Gdi::{
+        CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, CreateFontW, DEFAULT_CHARSET,
+        DEFAULT_GUI_FONT, DEFAULT_PITCH, DeleteObject, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD,
+        GetStockObject, GetSysColorBrush, OUT_DEFAULT_PRECIS, SetBkMode, TRANSPARENT,
+    },
     System::{
         DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
         LibraryLoader::GetModuleHandleW,
@@ -27,6 +32,8 @@ use windows_sys::Win32::{
         },
     },
     UI::{
+        Controls::{BST_CHECKED, BST_UNCHECKED},
+        Input::KeyboardAndMouse::EnableWindow,
         Shell::{
             NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
             Shell_NotifyIconW,
@@ -37,6 +44,7 @@ use windows_sys::Win32::{
 
 const WM_TRAY: u32 = WM_APP + 1;
 const SS_CENTERIMAGE_STYLE: u32 = 0x0000_0200;
+const SS_ETCHEDHORZ_STYLE: u32 = 0x0000_0010;
 const ID_OPEN_STATUS: usize = 100;
 const ID_SYNC: usize = 101;
 const ID_CHECK: usize = 102;
@@ -55,7 +63,24 @@ const ID_BYPASS: usize = 114;
 const ID_SELECT_RUNTIME: usize = 115;
 const ID_RESET_METRICS: usize = 117;
 const ID_AUTO_UPDATE: usize = 118;
+const ID_PROVIDER_IDS: usize = 119;
+const ID_RELOAD_FAILOVER: usize = 120;
+const ID_FAILOVER_EDITOR: usize = 121;
 const ID_ROUTE_BASE: usize = 1000;
+const ID_EDITOR_AUTO: usize = 200;
+const ID_EDITOR_PROTOCOL: usize = 201;
+const ID_EDITOR_SOURCE: usize = 202;
+const ID_EDITOR_CUSTOM: usize = 203;
+const ID_EDITOR_AVAILABLE: usize = 204;
+const ID_EDITOR_TARGETS: usize = 205;
+const ID_EDITOR_ADD: usize = 206;
+const ID_EDITOR_REMOVE: usize = 207;
+const ID_EDITOR_UP: usize = 208;
+const ID_EDITOR_DOWN: usize = 209;
+const ID_EDITOR_SAVE: usize = 210;
+const ID_EDITOR_CANCEL: usize = 211;
+const ID_EDITOR_STATUS: usize = 212;
+const ID_EDITOR_SOURCE_DETAIL: usize = 213;
 static APP: OnceLock<Arc<AppState>> = OnceLock::new();
 thread_local! { static URL_POPUP: Cell<HWND> = const { Cell::new(ptr::null_mut()) }; }
 
@@ -72,6 +97,18 @@ pub fn run(app: Arc<AppState>) -> anyhow::Result<()> {
         };
         if RegisterClassW(&class) == 0 {
             anyhow::bail!("无法注册托盘窗口");
+        }
+        let editor_class_name = wide("HeadroomRouteFailoverEditor");
+        let editor_class = WNDCLASSW {
+            lpfnWndProc: Some(failover_window_proc),
+            hInstance: instance,
+            lpszClassName: editor_class_name.as_ptr(),
+            hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
+            hbrBackground: (COLOR_WINDOW + 1) as _,
+            ..std::mem::zeroed()
+        };
+        if RegisterClassW(&editor_class) == 0 {
+            anyhow::bail!("无法注册故障转移配置窗口");
         }
         let hwnd = CreateWindowExW(
             0,
@@ -314,6 +351,12 @@ unsafe fn show_menu(hwnd: HWND) {
         );
         AppendMenuW(
             menu,
+            MF_STRING,
+            ID_FAILOVER_EDITOR,
+            wide("配置故障转移策略...").as_ptr(),
+        );
+        AppendMenuW(
+            menu,
             MF_STRING
                 | if snapshot.bypass_headroom {
                     MF_CHECKED
@@ -366,7 +409,19 @@ unsafe fn show_menu(hwnd: HWND) {
             settings_menu,
             MF_STRING,
             ID_CONFIG,
-            wide("打开 config.json").as_ptr(),
+            wide("打开 config.json（高级配置）").as_ptr(),
+        );
+        AppendMenuW(
+            settings_menu,
+            MF_STRING,
+            ID_PROVIDER_IDS,
+            wide("复制 Provider ID 清单").as_ptr(),
+        );
+        AppendMenuW(
+            settings_menu,
+            MF_STRING,
+            ID_RELOAD_FAILOVER,
+            wide("重新加载故障转移规则").as_ptr(),
         );
         AppendMenuW(
             settings_menu,
@@ -557,6 +612,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             Ok(false) => notify(hwnd, "自动切换已关闭", "上游故障时将保留当前路由"),
             Err(error) => notify(hwnd, "自动切换设置失败", &error.to_string()),
         },
+        ID_FAILOVER_EDITOR => unsafe { show_failover_editor(hwnd) },
         ID_BYPASS => match app.toggle_headroom_bypass() {
             Ok(true) => notify(
                 hwnd,
@@ -656,6 +712,41 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
                 .join("config.json");
             let _ = Command::new("notepad.exe").arg(path).spawn();
         }
+        ID_PROVIDER_IDS => {
+            let snapshot = app.snapshot();
+            let mut text = String::from("Codex Provider：\r\n");
+            for route in snapshot
+                .routes
+                .iter()
+                .filter(|route| route.protocol == Protocol::OpenAi)
+            {
+                text.push_str(&format!("{} = {}\r\n", route.name, route.provider));
+            }
+            text.push_str("\r\nClaude Provider：\r\n");
+            for route in snapshot
+                .routes
+                .iter()
+                .filter(|route| route.protocol == Protocol::Anthropic)
+            {
+                text.push_str(&format!("{} = {}\r\n", route.name, route.provider));
+            }
+            match copy_clipboard(hwnd, &text) {
+                Ok(()) => notify(
+                    hwnd,
+                    "Provider ID 已复制",
+                    "可用于 config.json 的故障转移规则",
+                ),
+                Err(error) => notify(hwnd, "复制 Provider ID 失败", &error.to_string()),
+            }
+        }
+        ID_RELOAD_FAILOVER => match app.reload_failover_policy() {
+            Ok((sources, targets)) => notify(
+                hwnd,
+                "故障转移规则已加载",
+                &format!("已配置 {sources} 个源 Provider、{targets} 个有序目标"),
+            ),
+            Err(error) => notify(hwnd, "故障转移规则加载失败", &error.to_string()),
+        },
         ID_LOGS => {
             let path = app.inner.lock().unwrap().config.state_dir.clone();
             let _ = Command::new("explorer.exe").arg(path).spawn();
@@ -756,6 +847,969 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         }
         _ => {}
     }
+}
+
+struct FailoverEditor {
+    parent: HWND,
+    app: Arc<AppState>,
+    routes: Vec<Route>,
+    policy: FailoverPolicy,
+    auto_failover: bool,
+    protocol: Protocol,
+    sources: Vec<String>,
+    source_provider: Option<String>,
+    available: Vec<String>,
+    dirty: bool,
+    body_font: usize,
+    title_font: usize,
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn show_failover_editor(parent: HWND) {
+    let Some(app) = APP.get().cloned() else {
+        return;
+    };
+    let snapshot = app.snapshot();
+    let (policy, auto_failover) = {
+        let state = app.inner.lock().unwrap();
+        (
+            state.config.failover_policy.clone(),
+            state.config.auto_failover,
+        )
+    };
+    let protocol = if snapshot
+        .routes
+        .iter()
+        .any(|route| route.protocol == Protocol::OpenAi)
+    {
+        Protocol::OpenAi
+    } else {
+        Protocol::Anthropic
+    };
+    let editor = Box::new(FailoverEditor {
+        parent,
+        app,
+        routes: snapshot.routes,
+        policy,
+        auto_failover,
+        protocol,
+        sources: Vec::new(),
+        source_provider: None,
+        available: Vec::new(),
+        dirty: false,
+        body_font: 0,
+        title_font: 0,
+    });
+    EnableWindow(parent, 0);
+    let raw = Box::into_raw(editor);
+    let instance = GetModuleHandleW(ptr::null());
+    let class_name = wide("HeadroomRouteFailoverEditor");
+    let title = wide("故障转移策略");
+    let ex_style = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT;
+    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
+    let mut bounds = RECT {
+        left: 0,
+        top: 0,
+        right: 800,
+        bottom: 640,
+    };
+    AdjustWindowRectEx(&mut bounds, style, 0, ex_style);
+    let width = bounds.right - bounds.left;
+    let height = bounds.bottom - bounds.top;
+    let window = CreateWindowExW(
+        ex_style,
+        class_name.as_ptr(),
+        title.as_ptr(),
+        style,
+        (GetSystemMetrics(SM_CXSCREEN) - width) / 2,
+        (GetSystemMetrics(SM_CYSCREEN) - height) / 2,
+        width,
+        height,
+        parent,
+        ptr::null_mut(),
+        instance,
+        raw.cast(),
+    );
+    if window.is_null() {
+        drop(Box::from_raw(raw));
+        EnableWindow(parent, 1);
+        return;
+    }
+    let mut message: MSG = std::mem::zeroed();
+    while IsWindow(window) != 0 && GetMessageW(&mut message, ptr::null_mut(), 0, 0) > 0 {
+        if IsDialogMessageW(window, &message) == 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
+// The editor Box is installed during WM_NCCREATE and released exactly once at WM_NCDESTROY.
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe extern "system" fn failover_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_NCCREATE {
+        let create = &*(lparam as *const CREATESTRUCTW);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+    }
+    let editor = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut FailoverEditor;
+    match message {
+        WM_CREATE => {
+            (*editor).create_controls(hwnd);
+            0
+        }
+        WM_CTLCOLORSTATIC => {
+            SetBkMode(wparam as _, TRANSPARENT as i32);
+            GetSysColorBrush(COLOR_WINDOW) as LRESULT
+        }
+        WM_COMMAND => {
+            let id = wparam & 0xffff;
+            let code = (wparam >> 16) & 0xffff;
+            if id == ID_EDITOR_PROTOCOL && code == CBN_SELCHANGE as usize {
+                (*editor).protocol = if SendMessageW(
+                    GetDlgItem(hwnd, ID_EDITOR_PROTOCOL as i32),
+                    CB_GETCURSEL,
+                    0,
+                    0,
+                ) == 0
+                {
+                    Protocol::OpenAi
+                } else {
+                    Protocol::Anthropic
+                };
+                (*editor).source_provider = None;
+                (*editor).refresh_sources(hwnd);
+            } else if id == ID_EDITOR_SOURCE && code == CBN_SELCHANGE as usize {
+                let index = SendMessageW(
+                    GetDlgItem(hwnd, ID_EDITOR_SOURCE as i32),
+                    CB_GETCURSEL,
+                    0,
+                    0,
+                );
+                let sources: &Vec<String> = &(*editor).sources;
+                (*editor).source_provider = sources.get(index.max(0) as usize).cloned();
+                (*editor).refresh_targets(hwnd);
+            } else if id == ID_EDITOR_CUSTOM && code == BN_CLICKED as usize {
+                if let Some(source) = (*editor).source_provider.clone() {
+                    let checked =
+                        SendMessageW(GetDlgItem(hwnd, ID_EDITOR_CUSTOM as i32), BM_GETCHECK, 0, 0)
+                            == BST_CHECKED as isize;
+                    if checked {
+                        (*editor)
+                            .policy
+                            .rules_mut((*editor).protocol)
+                            .entry(source)
+                            .or_default();
+                    } else {
+                        (*editor)
+                            .policy
+                            .rules_mut((*editor).protocol)
+                            .remove(&source);
+                    }
+                    (*editor).dirty = true;
+                    (*editor).refresh_targets(hwnd);
+                }
+            } else if id == ID_EDITOR_AUTO && code == BN_CLICKED as usize {
+                (*editor).dirty = true;
+            } else if code == LBN_SELCHANGE as usize
+                && matches!(id, ID_EDITOR_AVAILABLE | ID_EDITOR_TARGETS)
+            {
+                (*editor).update_action_buttons(hwnd);
+            } else if code == LBN_DBLCLK as usize && id == ID_EDITOR_AVAILABLE {
+                (*editor).add_selected(hwnd);
+            } else if code == LBN_DBLCLK as usize && id == ID_EDITOR_TARGETS {
+                (*editor).remove_selected(hwnd);
+            } else if id == ID_EDITOR_ADD && code == BN_CLICKED as usize {
+                (*editor).add_selected(hwnd);
+            } else if id == ID_EDITOR_REMOVE && code == BN_CLICKED as usize {
+                (*editor).remove_selected(hwnd);
+            } else if id == ID_EDITOR_UP && code == BN_CLICKED as usize {
+                (*editor).move_selected(hwnd, -1);
+            } else if id == ID_EDITOR_DOWN && code == BN_CLICKED as usize {
+                (*editor).move_selected(hwnd, 1);
+            } else if id == ID_EDITOR_SAVE && code == BN_CLICKED as usize {
+                let auto = SendMessageW(GetDlgItem(hwnd, ID_EDITOR_AUTO as i32), BM_GETCHECK, 0, 0)
+                    == BST_CHECKED as isize;
+                match (*editor)
+                    .app
+                    .save_failover_settings((*editor).policy.clone(), auto)
+                {
+                    Ok((sources, targets)) => {
+                        let parent = (*editor).parent;
+                        (*editor).dirty = false;
+                        DestroyWindow(hwnd);
+                        notify(
+                            parent,
+                            "故障转移配置已保存",
+                            &format!("已应用 {sources} 个源 Provider、{targets} 个有序目标"),
+                        );
+                    }
+                    Err(error) => {
+                        MessageBoxW(
+                            hwnd,
+                            wide(&format!("保存失败：{error}")).as_ptr(),
+                            wide("故障转移配置").as_ptr(),
+                            MB_OK | MB_ICONERROR,
+                        );
+                    }
+                }
+            } else if id == ID_EDITOR_CANCEL && code == BN_CLICKED as usize {
+                DestroyWindow(hwnd);
+            }
+            0
+        }
+        WM_CLOSE => {
+            if (*editor).dirty
+                && MessageBoxW(
+                    hwnd,
+                    wide("有未保存的故障转移修改，确定放弃吗？").as_ptr(),
+                    wide("故障转移配置").as_ptr(),
+                    MB_YESNO | MB_ICONWARNING,
+                ) != IDYES
+            {
+                return 0;
+            }
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            EnableWindow((*editor).parent, 1);
+            SetForegroundWindow((*editor).parent);
+            0
+        }
+        WM_NCDESTROY => {
+            if (*editor).body_font != 0 {
+                DeleteObject((*editor).body_font as _);
+            }
+            if (*editor).title_font != 0 {
+                DeleteObject((*editor).title_font as _);
+            }
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            drop(Box::from_raw(editor));
+            0
+        }
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+impl FailoverEditor {
+    unsafe fn create_controls(&mut self, hwnd: HWND) {
+        let stock_font = GetStockObject(DEFAULT_GUI_FONT) as usize;
+        let instance = GetModuleHandleW(ptr::null());
+        self.body_font = CreateFontW(
+            -15,
+            0,
+            0,
+            0,
+            FW_NORMAL as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            CLEARTYPE_QUALITY as u32,
+            (DEFAULT_PITCH | FF_DONTCARE) as u32,
+            wide("Segoe UI").as_ptr(),
+        ) as usize;
+        let font = if self.body_font == 0 {
+            stock_font
+        } else {
+            self.body_font
+        };
+        self.title_font = CreateFontW(
+            -22,
+            0,
+            0,
+            0,
+            FW_SEMIBOLD as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            CLEARTYPE_QUALITY as u32,
+            (DEFAULT_PITCH | FF_DONTCARE) as u32,
+            wide("Segoe UI").as_ptr(),
+        ) as usize;
+        let title_font = if self.title_font == 0 {
+            font
+        } else {
+            self.title_font
+        };
+        editor_control(
+            hwnd,
+            "STATIC",
+            "故障转移策略",
+            24,
+            16,
+            420,
+            30,
+            0,
+            WS_CHILD | WS_VISIBLE,
+            instance,
+            title_font,
+        );
+        editor_control(
+            hwnd,
+            "STATIC",
+            "为每个 Provider 指定允许转移的目标，并按优先级从上到下依次尝试。",
+            24,
+            48,
+            720,
+            20,
+            0,
+            WS_CHILD | WS_VISIBLE,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "BUTTON",
+            "启用自动故障切换",
+            590,
+            18,
+            185,
+            26,
+            ID_EDITOR_AUTO,
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "BUTTON",
+            "路由范围",
+            20,
+            82,
+            760,
+            108,
+            0,
+            WS_CHILD | WS_VISIBLE | BS_GROUPBOX as u32,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "STATIC",
+            "协议",
+            38,
+            110,
+            80,
+            20,
+            0,
+            WS_CHILD | WS_VISIBLE,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "COMBOBOX",
+            "",
+            38,
+            131,
+            160,
+            180,
+            ID_EDITOR_PROTOCOL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "STATIC",
+            "源 Provider",
+            218,
+            110,
+            120,
+            20,
+            0,
+            WS_CHILD | WS_VISIBLE,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "COMBOBOX",
+            "",
+            218,
+            131,
+            532,
+            220,
+            ID_EDITOR_SOURCE,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "STATIC",
+            "",
+            218,
+            161,
+            532,
+            18,
+            ID_EDITOR_SOURCE_DETAIL,
+            WS_CHILD | WS_VISIBLE,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "BUTTON",
+            "为此 Provider 使用自定义转移顺序",
+            24,
+            210,
+            390,
+            26,
+            ID_EDITOR_CUSTOM,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX as u32,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "BUTTON",
+            "目标与优先级",
+            20,
+            246,
+            760,
+            276,
+            0,
+            WS_CHILD | WS_VISIBLE | BS_GROUPBOX as u32,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "STATIC",
+            "可选 Provider",
+            36,
+            272,
+            300,
+            20,
+            0,
+            WS_CHILD | WS_VISIBLE,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "STATIC",
+            "故障转移优先级",
+            444,
+            272,
+            300,
+            20,
+            0,
+            WS_CHILD | WS_VISIBLE,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "LISTBOX",
+            "",
+            36,
+            294,
+            300,
+            204,
+            ID_EDITOR_AVAILABLE,
+            WS_CHILD
+                | WS_VISIBLE
+                | WS_TABSTOP
+                | WS_VSCROLL
+                | LBS_NOTIFY as u32
+                | LBS_NOINTEGRALHEIGHT as u32,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "LISTBOX",
+            "",
+            444,
+            294,
+            320,
+            204,
+            ID_EDITOR_TARGETS,
+            WS_CHILD
+                | WS_VISIBLE
+                | WS_TABSTOP
+                | WS_VSCROLL
+                | LBS_NOTIFY as u32
+                | LBS_NOINTEGRALHEIGHT as u32,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "BUTTON",
+            "添加  >",
+            354,
+            330,
+            72,
+            30,
+            ID_EDITOR_ADD,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "BUTTON",
+            "<  移除",
+            354,
+            368,
+            72,
+            30,
+            ID_EDITOR_REMOVE,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "BUTTON",
+            "上移",
+            354,
+            422,
+            72,
+            30,
+            ID_EDITOR_UP,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "BUTTON",
+            "下移",
+            354,
+            460,
+            72,
+            30,
+            ID_EDITOR_DOWN,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "STATIC",
+            "",
+            24,
+            534,
+            750,
+            22,
+            ID_EDITOR_STATUS,
+            WS_CHILD | WS_VISIBLE,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "STATIC",
+            "",
+            20,
+            562,
+            760,
+            2,
+            0,
+            WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ_STYLE,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "BUTTON",
+            "保存并应用",
+            552,
+            578,
+            120,
+            34,
+            ID_EDITOR_SAVE,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "BUTTON",
+            "取消",
+            684,
+            578,
+            90,
+            34,
+            ID_EDITOR_CANCEL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            instance,
+            font,
+        );
+        SendMessageW(
+            GetDlgItem(hwnd, ID_EDITOR_AUTO as i32),
+            BM_SETCHECK,
+            if self.auto_failover {
+                BST_CHECKED as usize
+            } else {
+                BST_UNCHECKED as usize
+            },
+            0,
+        );
+        SendMessageW(
+            GetDlgItem(hwnd, ID_EDITOR_PROTOCOL as i32),
+            CB_ADDSTRING,
+            0,
+            wide("Codex").as_ptr() as LPARAM,
+        );
+        SendMessageW(
+            GetDlgItem(hwnd, ID_EDITOR_PROTOCOL as i32),
+            CB_ADDSTRING,
+            0,
+            wide("Claude").as_ptr() as LPARAM,
+        );
+        SendMessageW(
+            GetDlgItem(hwnd, ID_EDITOR_PROTOCOL as i32),
+            CB_SETCURSEL,
+            if self.protocol == Protocol::OpenAi {
+                0
+            } else {
+                1
+            },
+            0,
+        );
+        self.refresh_sources(hwnd);
+    }
+
+    unsafe fn refresh_sources(&mut self, hwnd: HWND) {
+        self.sources = failover_sources(&self.routes, &self.policy, self.protocol);
+        let combo = GetDlgItem(hwnd, ID_EDITOR_SOURCE as i32);
+        SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+        for provider in &self.sources {
+            let text = self.route(provider).map_or_else(
+                || format!("{provider}（已失效）"),
+                |route| format!("{}  ·  {}", route.name, route.evidence_label()),
+            );
+            SendMessageW(combo, CB_ADDSTRING, 0, wide(&text).as_ptr() as LPARAM);
+        }
+        if self
+            .source_provider
+            .as_ref()
+            .is_none_or(|id| !self.sources.contains(id))
+        {
+            self.source_provider = self.sources.first().cloned();
+        }
+        if let Some(index) = self
+            .source_provider
+            .as_ref()
+            .and_then(|id| self.sources.iter().position(|value| value == id))
+        {
+            SendMessageW(combo, CB_SETCURSEL, index, 0);
+        }
+        self.refresh_targets(hwnd);
+    }
+
+    unsafe fn refresh_targets(&mut self, hwnd: HWND) {
+        EnableWindow(
+            GetDlgItem(hwnd, ID_EDITOR_CUSTOM as i32),
+            self.source_provider.is_some() as i32,
+        );
+        let custom = self
+            .source_provider
+            .as_ref()
+            .is_some_and(|source| self.policy.rules(self.protocol).contains_key(source));
+        SendMessageW(
+            GetDlgItem(hwnd, ID_EDITOR_CUSTOM as i32),
+            BM_SETCHECK,
+            if custom {
+                BST_CHECKED as usize
+            } else {
+                BST_UNCHECKED as usize
+            },
+            0,
+        );
+        let targets = self
+            .source_provider
+            .as_ref()
+            .and_then(|source| self.policy.targets(self.protocol, source))
+            .unwrap_or_default()
+            .to_vec();
+        let source_detail = self.source_provider.as_ref().map_or_else(
+            || "请选择一个源 Provider。".into(),
+            |provider| {
+                self.route(provider).map_or_else(
+                    || format!("Provider ID：{provider}  ·  当前已失效，可关闭自定义规则后清理"),
+                    |route| format!("Provider ID：{}  ·  上游：{}", route.provider, route.host()),
+                )
+            },
+        );
+        SetWindowTextW(
+            GetDlgItem(hwnd, ID_EDITOR_SOURCE_DETAIL as i32),
+            wide(&source_detail).as_ptr(),
+        );
+        self.available = self
+            .routes
+            .iter()
+            .filter(|route| {
+                route.protocol == self.protocol
+                    && self.source_provider.as_deref() != Some(route.provider.as_str())
+                    && !targets.contains(&route.provider)
+            })
+            .map(|route| route.provider.clone())
+            .collect();
+        let available = GetDlgItem(hwnd, ID_EDITOR_AVAILABLE as i32);
+        let target_list = GetDlgItem(hwnd, ID_EDITOR_TARGETS as i32);
+        SendMessageW(available, LB_RESETCONTENT, 0, 0);
+        for provider in &self.available {
+            SendMessageW(
+                available,
+                LB_ADDSTRING,
+                0,
+                wide(&self.display(provider, false)).as_ptr() as LPARAM,
+            );
+        }
+        SendMessageW(target_list, LB_RESETCONTENT, 0, 0);
+        for (index, provider) in targets.iter().enumerate() {
+            let text = format!("{}. {}", index + 1, self.display(provider, true));
+            SendMessageW(target_list, LB_ADDSTRING, 0, wide(&text).as_ptr() as LPARAM);
+        }
+        for id in [ID_EDITOR_AVAILABLE, ID_EDITOR_TARGETS] {
+            EnableWindow(GetDlgItem(hwnd, id as i32), custom as i32);
+        }
+        let status = if self.source_provider.is_none() {
+            "当前协议没有可配置的 Provider。".into()
+        } else if custom {
+            format!(
+                "已允许 {} 个目标，故障时将严格按列表顺序尝试。",
+                targets.len()
+            )
+        } else {
+            "未启用自定义顺序，将使用健康 Provider 中评分最高的线路。".into()
+        };
+        SetWindowTextW(
+            GetDlgItem(hwnd, ID_EDITOR_STATUS as i32),
+            wide(&status).as_ptr(),
+        );
+        self.update_action_buttons(hwnd);
+    }
+
+    unsafe fn add_selected(&mut self, hwnd: HWND) {
+        let Some(source) = self.source_provider.clone() else {
+            return;
+        };
+        if !self.policy.rules(self.protocol).contains_key(&source) {
+            return;
+        }
+        let index = SendMessageW(
+            GetDlgItem(hwnd, ID_EDITOR_AVAILABLE as i32),
+            LB_GETCURSEL,
+            0,
+            0,
+        );
+        if index < 0 {
+            return;
+        }
+        let Some(provider) = self.available.get(index as usize).cloned() else {
+            return;
+        };
+        let selected = {
+            let targets = self
+                .policy
+                .rules_mut(self.protocol)
+                .entry(source)
+                .or_default();
+            targets.push(provider);
+            targets.len() - 1
+        };
+        self.dirty = true;
+        self.refresh_targets(hwnd);
+        SendMessageW(
+            GetDlgItem(hwnd, ID_EDITOR_TARGETS as i32),
+            LB_SETCURSEL,
+            selected,
+            0,
+        );
+        self.update_action_buttons(hwnd);
+    }
+
+    unsafe fn remove_selected(&mut self, hwnd: HWND) {
+        let Some(source) = self.source_provider.clone() else {
+            return;
+        };
+        let index = SendMessageW(
+            GetDlgItem(hwnd, ID_EDITOR_TARGETS as i32),
+            LB_GETCURSEL,
+            0,
+            0,
+        );
+        if index < 0 {
+            return;
+        }
+        let next = self
+            .policy
+            .rules_mut(self.protocol)
+            .get_mut(&source)
+            .and_then(|targets| {
+                targets.remove(index as usize);
+                (!targets.is_empty()).then_some((index as usize).min(targets.len() - 1))
+            });
+        self.dirty = true;
+        self.refresh_targets(hwnd);
+        if let Some(next) = next {
+            SendMessageW(
+                GetDlgItem(hwnd, ID_EDITOR_TARGETS as i32),
+                LB_SETCURSEL,
+                next,
+                0,
+            );
+            self.update_action_buttons(hwnd);
+        }
+    }
+
+    unsafe fn move_selected(&mut self, hwnd: HWND, direction: isize) {
+        let Some(source) = self.source_provider.clone() else {
+            return;
+        };
+        let index = SendMessageW(
+            GetDlgItem(hwnd, ID_EDITOR_TARGETS as i32),
+            LB_GETCURSEL,
+            0,
+            0,
+        );
+        if index < 0 {
+            return;
+        }
+        let Some(targets) = self.policy.rules_mut(self.protocol).get_mut(&source) else {
+            return;
+        };
+        let Some(next) = move_target(targets, index as usize, direction) else {
+            return;
+        };
+        self.dirty = true;
+        self.refresh_targets(hwnd);
+        SendMessageW(
+            GetDlgItem(hwnd, ID_EDITOR_TARGETS as i32),
+            LB_SETCURSEL,
+            next,
+            0,
+        );
+        self.update_action_buttons(hwnd);
+    }
+
+    unsafe fn update_action_buttons(&self, hwnd: HWND) {
+        let custom = self
+            .source_provider
+            .as_ref()
+            .is_some_and(|source| self.policy.rules(self.protocol).contains_key(source));
+        let available = GetDlgItem(hwnd, ID_EDITOR_AVAILABLE as i32);
+        let targets = GetDlgItem(hwnd, ID_EDITOR_TARGETS as i32);
+        let available_selected = SendMessageW(available, LB_GETCURSEL, 0, 0);
+        let target_selected = SendMessageW(targets, LB_GETCURSEL, 0, 0);
+        let target_count = SendMessageW(targets, LB_GETCOUNT, 0, 0);
+        EnableWindow(
+            GetDlgItem(hwnd, ID_EDITOR_ADD as i32),
+            (custom && available_selected >= 0) as i32,
+        );
+        EnableWindow(
+            GetDlgItem(hwnd, ID_EDITOR_REMOVE as i32),
+            (custom && target_selected >= 0) as i32,
+        );
+        EnableWindow(
+            GetDlgItem(hwnd, ID_EDITOR_UP as i32),
+            (custom && target_selected > 0) as i32,
+        );
+        EnableWindow(
+            GetDlgItem(hwnd, ID_EDITOR_DOWN as i32),
+            (custom && target_selected >= 0 && target_selected + 1 < target_count) as i32,
+        );
+    }
+
+    fn route(&self, provider: &str) -> Option<&Route> {
+        self.routes
+            .iter()
+            .find(|route| route.provider == provider && route.protocol == self.protocol)
+    }
+
+    fn display(&self, provider: &str, ordered: bool) -> String {
+        let Some(route) = self.route(provider) else {
+            return provider.into();
+        };
+        if ordered {
+            format!("{}  ·  {}", route.name, route.evidence_label())
+        } else {
+            format!(
+                "{}  ·  {}  ·  {}",
+                route.name,
+                route.evidence_label(),
+                route.host()
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, unsafe_op_in_unsafe_fn)]
+unsafe fn editor_control(
+    parent: HWND,
+    class: &str,
+    text: &str,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    id: usize,
+    style: u32,
+    instance: windows_sys::Win32::Foundation::HINSTANCE,
+    font: usize,
+) -> HWND {
+    let control = CreateWindowExW(
+        if class == "LISTBOX" {
+            WS_EX_CLIENTEDGE
+        } else {
+            0
+        },
+        wide(class).as_ptr(),
+        wide(text).as_ptr(),
+        style,
+        x,
+        y,
+        width,
+        height,
+        parent,
+        id as _,
+        instance,
+        ptr::null(),
+    );
+    SendMessageW(control, WM_SETFONT, font, 1);
+    control
+}
+
+fn move_target(targets: &mut [String], selected: usize, direction: isize) -> Option<usize> {
+    let next = selected.checked_add_signed(direction)?;
+    if next >= targets.len() {
+        return None;
+    }
+    targets.swap(selected, next);
+    Some(next)
+}
+
+fn failover_sources(routes: &[Route], policy: &FailoverPolicy, protocol: Protocol) -> Vec<String> {
+    let mut sources: Vec<String> = routes
+        .iter()
+        .filter(|route| route.protocol == protocol)
+        .map(|route| route.provider.clone())
+        .collect();
+    for provider in policy.rules(protocol).keys() {
+        if !sources.contains(provider) {
+            sources.push(provider.clone());
+        }
+    }
+    sources
 }
 
 unsafe fn show_status(hwnd: HWND) {
@@ -1152,9 +2206,10 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ID_RESTART, ID_SELECT_RUNTIME, compact_number, recommended_action, route_is_selected,
+        ID_RESTART, ID_SELECT_RUNTIME, compact_number, failover_sources, move_target,
+        recommended_action, route_is_selected,
     };
-    use crate::model::{AuthStyle, Protocol, Route};
+    use crate::model::{AuthStyle, FailoverPolicy, Protocol, Route};
 
     #[test]
     fn duplicate_urls_select_only_the_active_provider() {
@@ -1199,6 +2254,34 @@ mod tests {
             recommended_action(false, "unavailable", "不可用", "不可用", None)
                 .map(|action| action.0),
             Some(ID_RESTART)
+        );
+    }
+
+    #[test]
+    fn moves_failover_targets_without_crossing_list_bounds() {
+        let mut targets = vec!["one".into(), "two".into(), "three".into()];
+        assert_eq!(move_target(&mut targets, 1, -1), Some(0));
+        assert_eq!(targets, ["two", "one", "three"]);
+        assert_eq!(move_target(&mut targets, 0, -1), None);
+        assert_eq!(move_target(&mut targets, 2, 1), None);
+    }
+
+    #[test]
+    fn editor_keeps_stale_configured_sources_visible() {
+        let route = Route::new(
+            Protocol::OpenAi,
+            "active".into(),
+            "Active".into(),
+            "https://active.example.com/v1".into(),
+            None,
+            AuthStyle::PassThrough,
+            "test",
+        );
+        let mut policy = FailoverPolicy::default();
+        policy.openai.insert("deleted".into(), Vec::new());
+        assert_eq!(
+            failover_sources(&[route], &policy, Protocol::OpenAi),
+            ["active", "deleted"]
         );
     }
 }

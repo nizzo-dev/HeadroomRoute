@@ -1,6 +1,6 @@
 use crate::{
     config,
-    model::{AppConfig, HeadroomMetrics, Protocol, Route, RouteHealth, Snapshot},
+    model::{AppConfig, FailoverPolicy, HeadroomMetrics, Protocol, Route, RouteHealth, Snapshot},
 };
 use anyhow::Result;
 use serde_json::json;
@@ -218,6 +218,42 @@ impl AppState {
             return Err(error);
         }
         Ok(enabled)
+    }
+
+    pub fn reload_failover_policy(&self) -> Result<(usize, usize)> {
+        let path = self
+            .inner
+            .lock()
+            .unwrap()
+            .config
+            .state_dir
+            .join("config.json");
+        let policy = config::load_or_create(&path)?.failover_policy;
+        let counts = policy.counts();
+        self.inner.lock().unwrap().config.failover_policy = policy;
+        Ok(counts)
+    }
+
+    pub fn save_failover_settings(
+        &self,
+        policy: FailoverPolicy,
+        auto_failover: bool,
+    ) -> Result<(usize, usize)> {
+        let (path, mut saved) = {
+            let state = self.inner.lock().unwrap();
+            (
+                state.config.state_dir.join("config.json"),
+                state.config.clone(),
+            )
+        };
+        saved.failover_policy = policy.clone();
+        saved.auto_failover = auto_failover;
+        config::save(&path, &saved)?;
+        let counts = policy.counts();
+        let mut state = self.inner.lock().unwrap();
+        state.config.failover_policy = policy;
+        state.config.auto_failover = auto_failover;
+        Ok(counts)
     }
 
     pub fn toggle_headroom_bypass(&self) -> Result<bool> {
@@ -509,7 +545,13 @@ impl AppState {
             {
                 None
             } else {
-                failover_candidate(&state.routes, protocol, failed).map(|next| {
+                failover_candidate(
+                    &state.routes,
+                    protocol,
+                    failed,
+                    &state.config.failover_policy,
+                )
+                .map(|next| {
                     (
                         next,
                         failed,
@@ -742,18 +784,31 @@ fn preserve_index(
         })
         .or_else(|| select_index(routes, protocol, selected))
 }
-fn failover_candidate(routes: &[Route], protocol: Protocol, failed: usize) -> Option<usize> {
+fn failover_candidate(
+    routes: &[Route],
+    protocol: Protocol,
+    failed: usize,
+    policy: &FailoverPolicy,
+) -> Option<usize> {
+    let eligible = |index: usize, route: &Route| {
+        index != failed
+            && route.protocol == protocol
+            && route.state == RouteHealth::Healthy
+            && route
+                .failover_blocked_until
+                .is_none_or(|until| until <= chrono::Utc::now())
+    };
+    if let Some(targets) = policy.targets(protocol, &routes[failed].provider) {
+        return targets.iter().find_map(|provider| {
+            routes.iter().enumerate().find_map(|(index, route)| {
+                (route.provider == *provider && eligible(index, route)).then_some(index)
+            })
+        });
+    }
     routes
         .iter()
         .enumerate()
-        .filter(|(index, route)| {
-            *index != failed
-                && route.protocol == protocol
-                && route.state == RouteHealth::Healthy
-                && route
-                    .failover_blocked_until
-                    .is_none_or(|until| until <= chrono::Utc::now())
-        })
+        .filter(|(index, route)| eligible(*index, route))
         .max_by_key(|(_, route)| route.score)
         .map(|(index, _)| index)
 }
@@ -870,10 +925,12 @@ pub fn should_stop(app: &AppState) -> bool {
 mod tests {
     #![allow(clippy::field_reassign_with_default)]
     use super::{
-        AppState, RuntimeState, availability, preserve_index, protocol_for_path, recovery_hint,
-        route_summary, update_check_due,
+        AppState, RuntimeState, availability, failover_candidate, preserve_index,
+        protocol_for_path, recovery_hint, route_summary, update_check_due,
     };
-    use crate::model::{AppConfig, AuthStyle, HeadroomMetrics, Protocol, Route, RouteHealth};
+    use crate::model::{
+        AppConfig, AuthStyle, FailoverPolicy, HeadroomMetrics, Protocol, Route, RouteHealth,
+    };
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
     #[test]
@@ -1103,6 +1160,62 @@ mod tests {
                 .is_some()
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn configured_failover_order_is_strict() {
+        let mut routes = vec![
+            Route::new(
+                Protocol::OpenAi,
+                "primary".into(),
+                "Primary".into(),
+                "https://primary.example.com/v1".into(),
+                None,
+                AuthStyle::PassThrough,
+                "test",
+            ),
+            Route::new(
+                Protocol::OpenAi,
+                "first".into(),
+                "First".into(),
+                "https://first.example.com/v1".into(),
+                None,
+                AuthStyle::PassThrough,
+                "test",
+            ),
+            Route::new(
+                Protocol::OpenAi,
+                "second".into(),
+                "Second".into(),
+                "https://second.example.com/v1".into(),
+                None,
+                AuthStyle::PassThrough,
+                "test",
+            ),
+        ];
+        routes[1].record(true, 900, Some(200), None, true);
+        routes[2].record(true, 10, Some(200), None, true);
+
+        let mut policy = FailoverPolicy::default();
+        policy
+            .openai
+            .insert("primary".into(), vec!["first".into(), "second".into()]);
+        assert_eq!(
+            failover_candidate(&routes, Protocol::OpenAi, 0, &policy),
+            Some(1)
+        );
+
+        policy
+            .openai
+            .insert("primary".into(), vec!["missing".into()]);
+        assert_eq!(
+            failover_candidate(&routes, Protocol::OpenAi, 0, &policy),
+            None
+        );
+        assert_eq!(
+            failover_candidate(&routes, Protocol::OpenAi, 0, &FailoverPolicy::default()),
+            Some(2)
+        );
     }
 
     #[test]

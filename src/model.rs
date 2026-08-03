@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 pub const DEFAULT_AGENT_PORT: u16 = 8790;
 pub const DEFAULT_HEADROOM_PORT: u16 = 8787;
@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub selected_anthropic_provider: Option<String>,
     pub claude_upstream_url: Option<String>,
     pub auto_failover: bool,
+    pub failover_policy: FailoverPolicy,
     pub manage_headroom: bool,
     pub start_with_windows: bool,
     pub no_subscription_tracking: bool,
@@ -58,6 +59,7 @@ impl Default for AppConfig {
             selected_anthropic_provider: None,
             claude_upstream_url: None,
             auto_failover: false,
+            failover_policy: FailoverPolicy::default(),
             manage_headroom: true,
             start_with_windows: false,
             no_subscription_tracking: true,
@@ -69,6 +71,38 @@ impl Default for AppConfig {
             last_update_check: None,
             headroom_python: Some(home.join(".headroom/venv/Scripts/python.exe")),
         }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FailoverPolicy {
+    pub openai: BTreeMap<String, Vec<String>>,
+    pub anthropic: BTreeMap<String, Vec<String>>,
+}
+
+impl FailoverPolicy {
+    pub fn rules(&self, protocol: Protocol) -> &BTreeMap<String, Vec<String>> {
+        match protocol {
+            Protocol::OpenAi => &self.openai,
+            Protocol::Anthropic => &self.anthropic,
+        }
+    }
+
+    pub fn rules_mut(&mut self, protocol: Protocol) -> &mut BTreeMap<String, Vec<String>> {
+        match protocol {
+            Protocol::OpenAi => &mut self.openai,
+            Protocol::Anthropic => &mut self.anthropic,
+        }
+    }
+
+    pub fn targets(&self, protocol: Protocol, provider: &str) -> Option<&[String]> {
+        self.rules(protocol).get(provider).map(Vec::as_slice)
+    }
+
+    pub fn counts(&self) -> (usize, usize) {
+        let rules = self.openai.values().chain(self.anthropic.values());
+        (rules.clone().count(), rules.map(Vec::len).sum())
     }
 }
 
