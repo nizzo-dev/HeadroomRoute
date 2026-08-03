@@ -255,22 +255,14 @@ unsafe fn show_menu(hwnd: HWND) {
         |since| format!("统计：自 {} UTC", since.format("%Y-%m-%d %H:%M:%S")),
     );
     unsafe {
-        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, wide(&service).as_ptr());
-        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, wide(&codex).as_ptr());
-        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, wide(&claude).as_ptr());
-        AppendMenuW(
-            menu,
-            MF_STRING | MF_DISABLED,
-            0,
-            wide(&metrics_scope).as_ptr(),
-        );
-        AppendMenuW(
-            menu,
-            MF_STRING | MF_DISABLED,
-            0,
-            wide(&compression).as_ptr(),
-        );
-        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, wide(&requests).as_ptr());
+        // Disabled native menu items are always drawn gray. ID 0 keeps these
+        // status rows inert while allowing Windows to render normal text.
+        AppendMenuW(menu, MF_STRING, 0, wide(&service).as_ptr());
+        AppendMenuW(menu, MF_STRING, 0, wide(&codex).as_ptr());
+        AppendMenuW(menu, MF_STRING, 0, wide(&claude).as_ptr());
+        AppendMenuW(menu, MF_STRING, 0, wide(&metrics_scope).as_ptr());
+        AppendMenuW(menu, MF_STRING, 0, wide(&compression).as_ptr());
+        AppendMenuW(menu, MF_STRING, 0, wide(&requests).as_ptr());
         AppendMenuW(
             menu,
             MF_STRING,
