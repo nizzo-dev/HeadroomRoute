@@ -29,3 +29,7 @@ Add focused unit tests in the module being changed; name tests after observable 
 ## Commit & Pull Request Guidelines
 
 History currently uses concise, imperative summaries (for example, `Initial release of HeadroomRoute 0.3.0`). Keep commits narrowly scoped and describe the user-visible outcome. PRs should explain motivation, testing performed, and Windows/runtime implications; link related issues and include tray screenshots for UI changes. Never commit API keys, local `%LOCALAPPDATA%` state, logs, or generated binaries.
+
+## Versioning & Packaging
+
+Before every package or release build, propose a version based on the change scope and ask the user to confirm it. Small fixes increment the patch number (for example, `0.6.0` to `0.6.1`); only larger feature or compatibility changes should increment an earlier SemVer component. Never choose or publish a packaging version without the user's confirmation.

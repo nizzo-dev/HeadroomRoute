@@ -238,16 +238,16 @@ unsafe fn show_menu(hwnd: HWND) {
         latency_text(snapshot.anthropic_latency_ms)
     );
     let compression = format!(
-        "压缩：{} → {} Token · 节省 {}（{:.1}%）",
-        snapshot.headroom_metrics.input_tokens_original,
-        snapshot.headroom_metrics.input_tokens_optimized,
-        snapshot.headroom_metrics.tokens_saved,
+        "Token：原始 {} → 优化 {} · 节省 {}（{:.1}%）",
+        compact_number(snapshot.headroom_metrics.input_tokens_original),
+        compact_number(snapshot.headroom_metrics.input_tokens_optimized),
+        compact_number(snapshot.headroom_metrics.tokens_saved),
         snapshot.headroom_metrics.compression_percent()
     );
     let requests = format!(
-        "请求：{} 完成 · {} 失败（{:.1}%）",
-        snapshot.headroom_metrics.completed_requests,
-        snapshot.headroom_metrics.failed_requests,
+        "请求：完成 {} · 失败 {}（{:.1}%）",
+        compact_number(snapshot.headroom_metrics.completed_requests),
+        compact_number(snapshot.headroom_metrics.failed_requests),
         snapshot.headroom_metrics.failure_percent()
     );
     let metrics_scope = snapshot.headroom_metrics_since.map_or_else(
@@ -255,42 +255,22 @@ unsafe fn show_menu(hwnd: HWND) {
         |since| format!("统计：自 {} UTC", since.format("%Y-%m-%d %H:%M:%S")),
     );
     unsafe {
+        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, wide(&service).as_ptr());
+        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, wide(&codex).as_ptr());
+        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, wide(&claude).as_ptr());
         AppendMenuW(
             menu,
-            MF_STRING | MF_DISABLED | MF_GRAYED,
-            0,
-            wide(&service).as_ptr(),
-        );
-        AppendMenuW(
-            menu,
-            MF_STRING | MF_DISABLED | MF_GRAYED,
-            0,
-            wide(&codex).as_ptr(),
-        );
-        AppendMenuW(
-            menu,
-            MF_STRING | MF_DISABLED | MF_GRAYED,
-            0,
-            wide(&claude).as_ptr(),
-        );
-        AppendMenuW(
-            menu,
-            MF_STRING | MF_DISABLED | MF_GRAYED,
+            MF_STRING | MF_DISABLED,
             0,
             wide(&metrics_scope).as_ptr(),
         );
         AppendMenuW(
             menu,
-            MF_STRING | MF_DISABLED | MF_GRAYED,
+            MF_STRING | MF_DISABLED,
             0,
             wide(&compression).as_ptr(),
         );
-        AppendMenuW(
-            menu,
-            MF_STRING | MF_DISABLED | MF_GRAYED,
-            0,
-            wide(&requests).as_ptr(),
-        );
+        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, wide(&requests).as_ptr());
         AppendMenuW(
             menu,
             MF_STRING,
@@ -1160,13 +1140,28 @@ fn headroom_cn(state: &str) -> &str {
 fn latency_text(value: Option<u64>) -> String {
     value.map(|v| v.to_string()).unwrap_or_else(|| "--".into())
 }
+fn compact_number(value: u64) -> String {
+    let (divisor, suffix) = if value >= 1_000_000_000 {
+        (1_000_000_000, "B")
+    } else if value >= 1_000_000 {
+        (1_000_000, "M")
+    } else if value >= 1_000 {
+        (1_000, "K")
+    } else {
+        return value.to_string();
+    };
+    let number = format!("{:.1}", value as f64 / divisor as f64);
+    format!("{}{suffix}", number.trim_end_matches(".0"))
+}
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ID_RESTART, ID_SELECT_RUNTIME, recommended_action, route_is_selected};
+    use super::{
+        ID_RESTART, ID_SELECT_RUNTIME, compact_number, recommended_action, route_is_selected,
+    };
     use crate::model::{AuthStyle, Protocol, Route};
 
     #[test]
@@ -1191,6 +1186,14 @@ mod tests {
         );
         assert!(!route_is_selected(&first, Some("second")));
         assert!(route_is_selected(&second, Some("second")));
+    }
+
+    #[test]
+    fn compacts_large_status_numbers() {
+        assert_eq!(compact_number(999), "999");
+        assert_eq!(compact_number(1_000), "1K");
+        assert_eq!(compact_number(12_345), "12.3K");
+        assert_eq!(compact_number(1_000_000), "1M");
     }
 
     #[test]

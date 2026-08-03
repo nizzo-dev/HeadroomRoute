@@ -1,7 +1,8 @@
 use crate::{
     config,
-    model::HeadroomMetrics,
+    model::{AppConfig, HeadroomMetrics},
     runtime,
+    sqlite::{self, ProviderRow},
     state::{AppState, should_stop},
     updater,
 };
@@ -109,15 +110,13 @@ fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
             let config = app.inner.lock().unwrap().config.clone();
             config.bypass_headroom || runtime::find_valid_python(&config).is_some()
         };
-        let mut cc_switch_modified = app
-            .inner
-            .lock()
-            .unwrap()
-            .config
+        let watcher_config = app.inner.lock().unwrap().config.clone();
+        let mut cc_switch_modified = watcher_config
             .cc_switch_db
             .metadata()
             .and_then(|metadata| metadata.modified())
             .ok();
+        let mut cc_switch_providers = cc_switch_provider_snapshot(&watcher_config).ok();
         let mut routing_drift_active = false;
         while !should_stop(&app) {
             if app.reset_metrics.swap(false, Ordering::Acquire) {
@@ -159,16 +158,23 @@ fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
                     *app.routing_notice.lock().unwrap() = Some((ok, message));
                 }
             }
-            let cc_switch_db = app.inner.lock().unwrap().config.cc_switch_db.clone();
-            let current_modified = cc_switch_db
+            let config = app.inner.lock().unwrap().config.clone();
+            let current_modified = config
+                .cc_switch_db
                 .metadata()
                 .and_then(|metadata| metadata.modified())
                 .ok();
-            if database_changed(&mut cc_switch_modified, current_modified) {
-                *app.config_change_notice.lock().unwrap() = Some(
-                    "CC-Switch Provider 配置已变化；请从托盘执行“同步 Codex + Claude / CC-Switch”"
-                        .into(),
-                );
+            if current_modified.is_some()
+                && current_modified != cc_switch_modified
+                && let Ok(current) = cc_switch_provider_snapshot(&config)
+            {
+                cc_switch_modified = current_modified;
+                if provider_snapshot_changed(&mut cc_switch_providers, current) {
+                    *app.config_change_notice.lock().unwrap() = Some(
+                        "CC-Switch Provider 配置已变化；请从托盘执行“同步 Codex + Claude / CC-Switch”"
+                            .into(),
+                    );
+                }
             }
             let _ = app.write_status();
             sleep_interruptible(&app, Duration::from_secs(2));
@@ -188,12 +194,29 @@ fn should_repair_drift(active: &mut bool, drifted: bool) -> bool {
     true
 }
 
-fn database_changed(
-    previous: &mut Option<std::time::SystemTime>,
-    current: Option<std::time::SystemTime>,
+fn cc_switch_provider_snapshot(
+    config: &AppConfig,
+) -> anyhow::Result<(Vec<ProviderRow>, Vec<ProviderRow>)> {
+    let codex = if config.enable_codex {
+        sqlite::providers(&config.cc_switch_db, "codex")?
+    } else {
+        Vec::new()
+    };
+    let claude = if config.enable_claude {
+        sqlite::providers(&config.cc_switch_db, "claude")?
+    } else {
+        Vec::new()
+    };
+    Ok((codex, claude))
+}
+
+fn provider_snapshot_changed(
+    previous: &mut Option<(Vec<ProviderRow>, Vec<ProviderRow>)>,
+    current: (Vec<ProviderRow>, Vec<ProviderRow>),
 ) -> bool {
-    let Some(current) = current else { return false };
-    let changed = previous.is_none_or(|previous| previous != current);
+    let changed = previous
+        .as_ref()
+        .is_some_and(|previous| previous != &current);
     *previous = Some(current);
     changed
 }
@@ -573,14 +596,30 @@ mod tests {
     }
 
     #[test]
-    fn reports_each_database_version_once() {
-        let first = std::time::SystemTime::UNIX_EPOCH;
-        let second = first + Duration::from_secs(1);
-        let mut previous = Some(first);
-        assert!(!database_changed(&mut previous, Some(first)));
-        assert!(database_changed(&mut previous, Some(second)));
-        assert!(!database_changed(&mut previous, Some(second)));
-        assert!(!database_changed(&mut previous, None));
+    fn only_reports_provider_snapshot_changes() {
+        let row = |name: &str| ProviderRow {
+            id: "provider".into(),
+            name: name.into(),
+            settings: "{}".into(),
+            website_url: String::new(),
+        };
+        let mut previous = None;
+        assert!(!provider_snapshot_changed(
+            &mut previous,
+            (vec![row("Before")], Vec::new())
+        ));
+        assert!(!provider_snapshot_changed(
+            &mut previous,
+            (vec![row("Before")], Vec::new())
+        ));
+        assert!(provider_snapshot_changed(
+            &mut previous,
+            (vec![row("After")], Vec::new())
+        ));
+        assert!(!provider_snapshot_changed(
+            &mut previous,
+            (vec![row("After")], Vec::new())
+        ));
     }
 
     #[test]
