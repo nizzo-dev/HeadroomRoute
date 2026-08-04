@@ -35,12 +35,13 @@ use windows_sys::Win32::{
         Controls::{BST_CHECKED, BST_UNCHECKED},
         Input::KeyboardAndMouse::EnableWindow,
         Shell::{
-            NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-            Shell_NotifyIconW,
+            NIF_GUID, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+            NOTIFYICONDATAW, Shell_NotifyIconW,
         },
         WindowsAndMessaging::*,
     },
 };
+use windows_sys::core::GUID;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const SS_CENTERIMAGE_STYLE: u32 = 0x0000_0200;
@@ -81,6 +82,7 @@ const ID_EDITOR_SAVE: usize = 210;
 const ID_EDITOR_CANCEL: usize = 211;
 const ID_EDITOR_STATUS: usize = 212;
 const ID_EDITOR_SOURCE_DETAIL: usize = 213;
+const TRAY_ICON_GUID: GUID = GUID::from_u128(0x5bdb64d1_1bb9_4d6d_9cb3_496b8e5a6d53);
 static APP: OnceLock<Arc<AppState>> = OnceLock::new();
 thread_local! { static URL_POPUP: Cell<HWND> = const { Cell::new(ptr::null_mut()) }; }
 
@@ -1987,8 +1989,9 @@ fn notify_data(hwnd: HWND) -> NOTIFYICONDATAW {
     data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
     data.hWnd = hwnd;
     data.uID = 1;
-    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    data.uFlags = NIF_GUID | NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = WM_TRAY;
+    data.guidItem = TRAY_ICON_GUID;
     data.hIcon = make_icon(health);
     let chars = wide(&tip);
     for (dst, src) in data.szTip.iter_mut().zip(chars) {
