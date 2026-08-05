@@ -6,8 +6,18 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::{collections::BTreeMap, fs, path::Path};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Write,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use toml_edit::{DocumentMut, Item, Table, value};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
 #[cfg(windows)]
 use windows_sys::Win32::System::Registry::{
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, REG_DWORD, REG_SZ, RegCloseKey, RegOpenKeyExW,
@@ -925,15 +935,53 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let temp = path.with_extension(format!(
-        "{}.headroom-route.tmp",
-        path.extension().and_then(|v| v.to_str()).unwrap_or("tmp")
+        "{}.{}.{}.headroom-route.tmp",
+        path.extension().and_then(|v| v.to_str()).unwrap_or("tmp"),
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default(),
     ));
-    fs::write(&temp, bytes)?;
-    if path.exists() {
-        fs::remove_file(path)?;
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace_file(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
     }
-    fs::rename(temp, path)?;
-    Ok(())
+    result
+}
+
+fn replace_file(temp: &Path, path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    if path.exists() {
+        let temp_wide: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+        let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let replaced = unsafe {
+            ReplaceFileW(
+                path_wide.as_ptr(),
+                temp_wide.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if replaced != 0 {
+            return Ok(());
+        }
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("无法安全替换配置文件: {}", path.display()));
+    }
+
+    fs::rename(temp, path).with_context(|| format!("无法替换配置文件: {}", path.display()))
 }
 
 #[cfg(test)]
@@ -1013,6 +1061,17 @@ mod tests {
     use crate::model::{AppConfig, AuthStyle, Protocol, Route};
     use serde_json::Value;
     use std::fs;
+
+    #[test]
+    fn legacy_config_defaults_api_key_hover_to_off() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("show_api_key_on_hover");
+        let loaded: AppConfig = serde_json::from_value(value).unwrap();
+        assert!(!loaded.show_api_key_on_hover);
+    }
 
     #[test]
     fn sync_claude_preserves_unknown_fields_and_secrets() {

@@ -31,6 +31,7 @@ pub struct AppConfig {
     pub metrics_since: Option<DateTime<Utc>>,
     pub auto_check_updates: bool,
     pub last_update_check: Option<DateTime<Utc>>,
+    pub show_api_key_on_hover: bool,
     pub headroom_python: Option<PathBuf>,
 }
 
@@ -69,6 +70,7 @@ impl Default for AppConfig {
             metrics_since: None,
             auto_check_updates: true,
             last_update_check: None,
+            show_api_key_on_hover: false,
             headroom_python: Some(home.join(".headroom/venv/Scripts/python.exe")),
         }
     }
@@ -321,6 +323,7 @@ pub struct Snapshot {
     pub headroom_metrics: HeadroomMetrics,
     pub headroom_metrics_since: Option<DateTime<Utc>>,
     pub auto_update_check: bool,
+    pub show_api_key_on_hover: bool,
     pub sync_status: String,
     pub restart_status: String,
     pub routes: Vec<Route>,

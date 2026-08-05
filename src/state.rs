@@ -8,7 +8,7 @@ use std::{
     fs,
     path::Path,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -48,7 +48,16 @@ pub struct AppState {
     pub maintenance_action: Mutex<Option<String>>,
 }
 
+fn config_write_mutex() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 impl AppState {
+    pub(crate) fn config_write_guard(&self) -> MutexGuard<'static, ()> {
+        config_write_mutex().lock().unwrap()
+    }
+
     pub fn new(mut config: AppConfig) -> Arc<Self> {
         let (routes, configured_openai, configured_anthropic, mut error) =
             match config::discover_routes(&config) {
@@ -88,6 +97,7 @@ impl AppState {
             config.selected_openai_provider = actual_openai.clone();
             config.selected_anthropic_provider = actual_anthropic.clone();
             let path = config.state_dir.join("config.json");
+            let _config_guard = config_write_mutex().lock().unwrap();
             if let Err(save_error) = config::save(&path, &config) {
                 error = Some(format!("修复上游选择失败: {save_error}"));
             }
@@ -202,6 +212,7 @@ impl AppState {
     }
 
     pub fn toggle_auto_failover(&self) -> Result<bool> {
+        let _config_guard = self.config_write_guard();
         let (enabled, path, saved) = {
             let mut state = self.inner.lock().unwrap();
             state.config.auto_failover = !state.config.auto_failover;
@@ -221,6 +232,7 @@ impl AppState {
     }
 
     pub fn reload_failover_policy(&self) -> Result<(usize, usize)> {
+        let _config_guard = self.config_write_guard();
         let path = self
             .inner
             .lock()
@@ -239,6 +251,7 @@ impl AppState {
         policy: FailoverPolicy,
         auto_failover: bool,
     ) -> Result<(usize, usize)> {
+        let _config_guard = self.config_write_guard();
         let (path, mut saved) = {
             let state = self.inner.lock().unwrap();
             (
@@ -257,6 +270,7 @@ impl AppState {
     }
 
     pub fn toggle_headroom_bypass(&self) -> Result<bool> {
+        let _config_guard = self.config_write_guard();
         let (current, mut updated, path, preferred) = {
             let state = self.inner.lock().unwrap();
             (
@@ -281,6 +295,7 @@ impl AppState {
     }
 
     pub fn reset_headroom_metrics(&self) -> Result<()> {
+        let _config_guard = self.config_write_guard();
         let (mut updated, path, log_file) = {
             let state = self.inner.lock().unwrap();
             (
@@ -303,6 +318,7 @@ impl AppState {
     }
 
     pub fn toggle_auto_update_check(&self) -> Result<bool> {
+        let _config_guard = self.config_write_guard();
         let (enabled, path, saved) = {
             let mut state = self.inner.lock().unwrap();
             state.config.auto_check_updates = !state.config.auto_check_updates;
@@ -319,10 +335,29 @@ impl AppState {
         Ok(enabled)
     }
 
+    pub fn toggle_show_api_key_on_hover(&self) -> Result<bool> {
+        let _config_guard = self.config_write_guard();
+        let (enabled, path, saved) = {
+            let mut state = self.inner.lock().unwrap();
+            state.config.show_api_key_on_hover = !state.config.show_api_key_on_hover;
+            (
+                state.config.show_api_key_on_hover,
+                state.config.state_dir.join("config.json"),
+                state.config.clone(),
+            )
+        };
+        if let Err(error) = config::save(&path, &saved) {
+            self.inner.lock().unwrap().config.show_api_key_on_hover = !enabled;
+            return Err(error);
+        }
+        Ok(enabled)
+    }
+
     pub fn begin_daily_update_check(
         &self,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<AppConfig>> {
+        let _config_guard = self.config_write_guard();
         let (path, saved) = {
             let mut state = self.inner.lock().unwrap();
             if !update_check_due(
@@ -378,6 +413,7 @@ impl AppState {
     }
 
     pub fn switch_index(&self, index: usize, reason: &str) -> bool {
+        let _config_guard = self.config_write_guard();
         let (protocol, provider, app_config) = {
             let state = self.inner.lock().unwrap();
             let Some(route) = state.routes.get(index) else {
@@ -444,6 +480,7 @@ impl AppState {
     }
 
     pub fn refresh_routes(&self) {
+        let _config_guard = self.config_write_guard();
         let config = self.inner.lock().unwrap().config.clone();
         match config::discover_routes(&config) {
             Ok(found) => {
@@ -700,6 +737,7 @@ impl AppState {
             headroom_metrics: state.headroom_metrics,
             headroom_metrics_since: state.config.metrics_since,
             auto_update_check: state.config.auto_check_updates,
+            show_api_key_on_hover: state.config.show_api_key_on_hover,
             sync_status: self.sync_status.lock().unwrap().clone(),
             restart_status: self.restart_status.lock().unwrap().clone(),
             routes: state.routes.clone(),
@@ -955,6 +993,55 @@ mod tests {
             now
         ));
         assert!(!update_check_due(false, None, now));
+    }
+
+    #[test]
+    fn api_key_hover_setting_is_persisted() {
+        let dir = std::env::temp_dir().join(format!(
+            "headroom-route-api-key-hover-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = AppConfig::default();
+        config.state_dir = dir.clone();
+        config.cc_switch_db = dir.join("missing.db");
+        config.codex_config = dir.join("missing.toml");
+        config.claude_settings = dir.join("missing.json");
+        config.enable_codex = false;
+        config.enable_claude = false;
+        let app = AppState::new(config);
+
+        assert!(!app.snapshot().show_api_key_on_hover);
+        assert!(app.toggle_show_api_key_on_hover().unwrap());
+        let saved: AppConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        assert!(saved.show_api_key_on_hover);
+        assert!(!app.toggle_show_api_key_on_hover().unwrap());
+        assert!(!app.snapshot().show_api_key_on_hover);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn api_key_hover_setting_rolls_back_when_persistence_fails() {
+        let path = std::env::temp_dir().join(format!(
+            "headroom-route-api-key-hover-failure-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "not a directory").unwrap();
+        let mut config = AppConfig::default();
+        config.state_dir = path.clone();
+        config.cc_switch_db = path.join("missing.db");
+        config.codex_config = path.join("missing.toml");
+        config.claude_settings = path.join("missing.json");
+        config.enable_codex = false;
+        config.enable_claude = false;
+        let app = AppState::new(config);
+
+        assert!(app.toggle_show_api_key_on_hover().is_err());
+        assert!(!app.snapshot().show_api_key_on_hover);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -45,6 +45,7 @@ use windows_sys::core::GUID;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const SS_CENTERIMAGE_STYLE: u32 = 0x0000_0200;
+const SS_NOPREFIX_STYLE: u32 = 0x0000_0080;
 const SS_ETCHEDHORZ_STYLE: u32 = 0x0000_0010;
 const ID_OPEN_STATUS: usize = 100;
 const ID_SYNC: usize = 101;
@@ -62,6 +63,7 @@ const ID_UNINSTALL: usize = 112;
 const ID_UPDATE: usize = 113;
 const ID_BYPASS: usize = 114;
 const ID_SELECT_RUNTIME: usize = 115;
+const ID_SHOW_API_KEY: usize = 116;
 const ID_RESET_METRICS: usize = 117;
 const ID_AUTO_UPDATE: usize = 118;
 const ID_PROVIDER_IDS: usize = 119;
@@ -406,6 +408,17 @@ unsafe fn show_menu(hwnd: HWND) {
             ID_AUTO_UPDATE,
             wide("每日检查软件更新").as_ptr(),
         );
+        AppendMenuW(
+            settings_menu,
+            MF_STRING
+                | if snapshot.show_api_key_on_hover {
+                    MF_CHECKED
+                } else {
+                    0
+                },
+            ID_SHOW_API_KEY,
+            wide("悬浮显示上游 API Key").as_ptr(),
+        );
         AppendMenuW(settings_menu, MF_SEPARATOR, 0, ptr::null());
         AppendMenuW(
             settings_menu,
@@ -666,6 +679,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         }
         ID_STARTUP => {
             let enabled = {
+                let _config_guard = app.config_write_guard();
                 let mut state = app.inner.lock().unwrap();
                 state.config.start_with_windows = !state.config.start_with_windows;
                 let path = state.config.state_dir.join("config.json");
@@ -680,6 +694,11 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             Ok(true) => notify(hwnd, "自动更新提醒已启用", "每天最多检查一次，只提醒不安装"),
             Ok(false) => notify(hwnd, "自动更新提醒已关闭", "仍可随时手动检查更新"),
             Err(error) => notify(hwnd, "自动更新提醒设置失败", &error.to_string()),
+        },
+        ID_SHOW_API_KEY => match app.toggle_show_api_key_on_hover() {
+            Ok(true) => notify(hwnd, "已开启", "悬停上游列表时将显示 API Key"),
+            Ok(false) => notify(hwnd, "已关闭", "不再显示 API Key"),
+            Err(error) => notify(hwnd, "设置失败", &error.to_string()),
         },
         ID_DIAG => {
             let text = app.diagnostic_text();
@@ -795,6 +814,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         }
         ID_SELECT_RUNTIME => match runtime::select_python() {
             Ok(Some(path)) => {
+                let _config_guard = app.config_write_guard();
                 let current = app.inner.lock().unwrap().config.clone();
                 match runtime::config_with_python(&current, path) {
                     Ok(updated) => {
@@ -1863,17 +1883,59 @@ unsafe fn show_status(hwnd: HWND) {
     };
 }
 
+const HOVER_KEY_LINE_WIDTH: usize = 64;
+
+fn wrap_hover_value(value: &str, width: usize) -> String {
+    let value: Vec<char> = value
+        .chars()
+        .filter(|character| !matches!(character, '\0' | '\r' | '\n'))
+        .collect();
+    value
+        .chunks(width.max(1))
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+fn route_hover_text(route: &Route, show_key: bool) -> String {
+    if !show_key {
+        return route.base_url.clone();
+    }
+    let key = route
+        .api_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+        .map(|key| wrap_hover_value(key, HOVER_KEY_LINE_WIDTH))
+        .unwrap_or_else(|| "未配置".into());
+    format!("{}\r\nAPI Key：{key}", route.base_url)
+}
+
+fn hover_popup_size(text: &str) -> (i32, i32) {
+    let max_chars = text
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let line_count = text.lines().count().max(1);
+    let width = (i32::try_from(max_chars).unwrap_or(100) * 8 + 32).clamp(300, 900);
+    let height = (i32::try_from(line_count).unwrap_or(1) * 18 + 16).max(30);
+    (width, height)
+}
+
 unsafe fn show_hovered_route_url(hwnd: HWND, wparam: WPARAM) {
     let id = wparam & 0xffff;
-    let Some(route) = APP.get().and_then(|app| {
-        app.snapshot()
+    let Some((route, show_key)) = APP.get().and_then(|app| {
+        let snapshot = app.snapshot();
+        snapshot
             .routes
             .get(id.wrapping_sub(ID_ROUTE_BASE))
             .cloned()
+            .map(|route| (route, snapshot.show_api_key_on_hover))
     }) else {
         unsafe { hide_route_url() };
         return;
     };
+    let hover_text = route_hover_text(&route, show_key);
     URL_POPUP.with(|slot| unsafe {
         let mut popup = slot.get();
         if popup.is_null() {
@@ -1881,7 +1943,7 @@ unsafe fn show_hovered_route_url(hwnd: HWND, wparam: WPARAM) {
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
                 wide("STATIC").as_ptr(),
                 ptr::null(),
-                WS_POPUP | WS_BORDER | SS_CENTERIMAGE_STYLE,
+                WS_POPUP | WS_BORDER | SS_CENTERIMAGE_STYLE | SS_NOPREFIX_STYLE,
                 0,
                 0,
                 0,
@@ -1896,17 +1958,17 @@ unsafe fn show_hovered_route_url(hwnd: HWND, wparam: WPARAM) {
         if popup.is_null() {
             return;
         }
-        SetWindowTextW(popup, wide(&route.base_url).as_ptr());
+        SetWindowTextW(popup, wide(&hover_text).as_ptr());
         let mut point = POINT::default();
         GetCursorPos(&mut point);
-        let width = (route.base_url.chars().count() as i32 * 7 + 28).clamp(300, 720);
+        let (width, height) = hover_popup_size(&hover_text);
         SetWindowPos(
             popup,
             HWND_TOPMOST,
             point.x + 18,
             point.y + 18,
             width,
-            30,
+            height,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
     });
@@ -2209,8 +2271,8 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ID_RESTART, ID_SELECT_RUNTIME, compact_number, failover_sources, move_target,
-        recommended_action, route_is_selected,
+        ID_RESTART, ID_SELECT_RUNTIME, compact_number, failover_sources, hover_popup_size,
+        move_target, recommended_action, route_hover_text, route_is_selected,
     };
     use crate::model::{AuthStyle, FailoverPolicy, Protocol, Route};
 
@@ -2244,6 +2306,30 @@ mod tests {
         assert_eq!(compact_number(1_000), "1K");
         assert_eq!(compact_number(12_345), "12.3K");
         assert_eq!(compact_number(1_000_000), "1M");
+    }
+
+    #[test]
+    fn wraps_long_api_keys_without_losing_characters() {
+        let key = "a".repeat(130);
+        let route = Route::new(
+            Protocol::OpenAi,
+            "provider".into(),
+            "Provider".into(),
+            "https://example.com/v1".into(),
+            Some(key.clone()),
+            AuthStyle::Bearer,
+            "test",
+        );
+        let text = route_hover_text(&route, true);
+        let displayed = text
+            .lines()
+            .skip(1)
+            .collect::<String>()
+            .strip_prefix("API Key：")
+            .unwrap()
+            .to_owned();
+        assert_eq!(displayed, key);
+        assert!(hover_popup_size(&text).1 > 48);
     }
 
     #[test]

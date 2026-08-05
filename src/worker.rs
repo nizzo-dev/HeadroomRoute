@@ -287,6 +287,7 @@ fn headroom_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
             *app.runtime_result.lock().unwrap() = Some((false, message));
             return;
         };
+        let _config_guard = app.config_write_guard();
         let (saved, path) = {
             let mut state = app.inner.lock().unwrap();
             state.config.headroom_python = Some(python);
@@ -299,6 +300,7 @@ fn headroom_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
         if let Err(error) = config::save(&path, &saved) {
             app.inner.lock().unwrap().last_error = Some(format!("保存运行环境配置失败: {error}"));
         }
+        drop(_config_guard);
         let client = Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
