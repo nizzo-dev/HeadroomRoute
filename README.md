@@ -39,11 +39,11 @@ HeadroomRoute 是一个轻量、原生的 Windows 托盘路由器，面向同时
 
 ### 前置环境
 
-请先自行安装 Python 3.10 或更高版本，并准备 Headroom 0.32.1。默认检测路径为 `%USERPROFILE%\.headroom\venv\Scripts\python.exe`：
+请先自行安装 Python 3.10 或更高版本，并准备 Headroom 0.34.0。默认检测路径为 `%USERPROFILE%\.headroom\venv\Scripts\python.exe`：
 
 ```powershell
 python -m venv "$env:USERPROFILE\.headroom\venv"
-& "$env:USERPROFILE\.headroom\venv\Scripts\python.exe" -m pip install "headroom-ai[code]==0.32.1"
+& "$env:USERPROFILE\.headroom\venv\Scripts\python.exe" -m pip install "headroom-ai[code]==0.34.0"
 ```
 
 如需使用其他虚拟环境，可从托盘选择 **维护与还原 → 选择 Headroom Python...**，验证通过后重新启动 HeadroomRoute。程序只检测该环境，不会安装或升级其中的任何内容。

@@ -13,7 +13,7 @@ use windows_sys::Win32::{
     },
 };
 
-const HEADROOM_VERSION: &str = "0.32.1";
+const HEADROOM_VERSION: &str = "0.34.0";
 
 pub fn setup_instructions(config: &AppConfig) -> String {
     let configured = config
@@ -212,5 +212,11 @@ mod tests {
         let original = config.headroom_python.clone();
         assert!(config_with_python(&config, PathBuf::from("missing-python.exe")).is_err());
         assert_eq!(config.headroom_python, original);
+    }
+
+    #[test]
+    fn setup_instructions_pin_supported_headroom_version() {
+        let instructions = setup_instructions(&AppConfig::default());
+        assert!(instructions.contains("headroom-ai[code]==0.34.0"));
     }
 }
