@@ -16,6 +16,14 @@ pub struct ProviderRow {
 }
 
 pub fn providers(path: &Path, app_type: &str) -> Result<Vec<ProviderRow>> {
+    query_providers(path, app_type, false)
+}
+
+pub fn current_provider(path: &Path, app_type: &str) -> Result<Option<ProviderRow>> {
+    Ok(query_providers(path, app_type, true)?.into_iter().next())
+}
+
+fn query_providers(path: &Path, app_type: &str, current_only: bool) -> Result<Vec<ProviderRow>> {
     if !matches!(app_type, "codex" | "claude") {
         return Err(anyhow!("不支持的 CC-Switch app_type"));
     }
@@ -32,8 +40,14 @@ pub fn providers(path: &Path, app_type: &str) -> Result<Vec<ProviderRow>> {
     if open != SQLITE_OK {
         return Err(anyhow!("无法只读打开 CC-Switch 数据库"));
     }
+    let current_filter = if current_only {
+        " AND is_current=1"
+    } else {
+        ""
+    };
+    let limit = if current_only { " LIMIT 1" } else { "" };
     let sql = CString::new(format!(
-        "SELECT id,name,settings_config,website_url FROM providers WHERE app_type='{app_type}' ORDER BY sort_index ASC,created_at DESC"
+        "SELECT id,name,settings_config,website_url FROM providers WHERE app_type='{app_type}'{current_filter} ORDER BY sort_index ASC,created_at DESC{limit}"
     ))?;
     let mut stmt = ptr::null_mut();
     let prepared = unsafe { sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()) };
@@ -43,6 +57,9 @@ pub fn providers(path: &Path, app_type: &str) -> Result<Vec<ProviderRow>> {
             .into_owned();
         unsafe {
             sqlite3_close(db);
+        }
+        if current_only && message.contains("no such column: is_current") {
+            return Ok(Vec::new());
         }
         return Err(anyhow!(message));
     }

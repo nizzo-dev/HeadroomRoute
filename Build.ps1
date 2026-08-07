@@ -25,7 +25,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
     New-Item -ItemType Directory -Path (Join-Path $project 'dist') -Force | Out-Null
     $releaseExe = Join-Path $project 'target\release\HeadroomRoute.exe'
+    $releaseCliExe = Join-Path $project 'target\release\HeadroomRouteCLI.exe'
     $versionedExe = Join-Path $project "dist\HeadroomRoute-$version.exe"
+    $versionedCliExe = Join-Path $project "dist\HeadroomRouteCLI-$version.exe"
+    $cliShim = Join-Path $project 'hr.cmd'
+    if (!(Test-Path $cliShim)) { throw '找不到 CLI 快捷命令 shim：hr.cmd' }
     try {
         Copy-Item $releaseExe $versionedExe -Force
     } catch [System.IO.IOException] {
@@ -37,9 +41,11 @@ try {
     } catch [System.IO.IOException] {
         Write-Warning "dist\HeadroomRoute.exe is locked; use HeadroomRoute-$version.exe."
     }
+    Copy-Item $releaseCliExe $versionedCliExe -Force
+    Copy-Item $releaseCliExe (Join-Path $project 'dist\HeadroomRouteCLI.exe') -Force
     $zip = Join-Path $project "dist\HeadroomRoute-$version-windows-x64.zip"
-    Compress-Archive -Path $versionedExe, (Join-Path $project 'Install.ps1'), (Join-Path $project 'README.md'), (Join-Path $project 'LICENSE') -DestinationPath $zip -Force
-    $checksums = @($versionedExe, $zip | ForEach-Object {
+    Compress-Archive -Path $versionedExe, $versionedCliExe, $cliShim, (Join-Path $project 'Install.ps1'), (Join-Path $project 'README.md'), (Join-Path $project 'LICENSE') -DestinationPath $zip -Force
+    $checksums = @($versionedExe, $versionedCliExe, $zip | ForEach-Object {
         $artifactPath = $_
         $hash = Get-Sha256 $artifactPath
         "$hash  $(Split-Path -Leaf $artifactPath)"

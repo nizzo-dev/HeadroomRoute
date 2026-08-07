@@ -12,7 +12,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 use toml_edit::{DocumentMut, Item, Table, value};
@@ -23,6 +23,8 @@ use windows_sys::Win32::System::Registry::{
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, REG_DWORD, REG_SZ, RegCloseKey, RegOpenKeyExW,
     RegQueryValueExW,
 };
+
+pub const DIRECT_CODEX_PROVIDER: &str = "headroom_route_direct";
 
 pub struct DiscoveredRoutes {
     pub routes: Vec<Route>,
@@ -35,6 +37,12 @@ struct InstallManifest {
     version: String,
     codex_baseline: Option<String>,
     claude_baseline: Option<String>,
+    #[serde(default)]
+    codex_auth_baseline: Option<String>,
+    #[serde(default)]
+    codex_auth_managed: bool,
+    #[serde(default)]
+    claude_provider_env_managed: bool,
 }
 
 pub fn load_or_create(path: &Path) -> Result<AppConfig> {
@@ -92,7 +100,7 @@ fn parse_codex_text(text: &str, source: &str) -> Result<(Vec<Route>, Option<Stri
 
 pub fn discover_routes(config: &AppConfig) -> Result<DiscoveredRoutes> {
     let mut routes = Vec::new();
-    let selected_openai = config.selected_openai_provider.clone();
+    let mut selected_openai = config.selected_openai_provider.clone();
     let mut selected_anthropic = config.selected_anthropic_provider.clone();
 
     if config.cc_switch_db.exists() {
@@ -104,9 +112,16 @@ pub fn discover_routes(config: &AppConfig) -> Result<DiscoveredRoutes> {
                 let Some(toml) = settings.get("config").and_then(Value::as_str) else {
                     continue;
                 };
-                let Ok((mut parsed, _)) = parse_codex_text(toml, "cc-switch") else {
+                let Ok((mut parsed, parsed_selected)) = parse_codex_text(toml, "cc-switch") else {
                     continue;
                 };
+                parsed.retain(|route| !is_local_service(&route.base_url, config));
+                if selected_openai.as_deref() == Some(DIRECT_CODEX_PROVIDER)
+                    && parsed_selected.as_deref() == Some(DIRECT_CODEX_PROVIDER)
+                    && !parsed.is_empty()
+                {
+                    selected_openai = Some(row.id.clone());
+                }
                 let api_key = settings
                     .pointer("/auth/OPENAI_API_KEY")
                     .and_then(Value::as_str)
@@ -161,7 +176,20 @@ pub fn discover_routes(config: &AppConfig) -> Result<DiscoveredRoutes> {
 
     if config.enable_codex && config.codex_config.exists() {
         let (parsed, _) = parse_codex_text(&fs::read_to_string(&config.codex_config)?, "codex")?;
-        for route in parsed {
+        for mut route in parsed {
+            if is_local_service(&route.base_url, config) {
+                continue;
+            }
+            if route.provider == DIRECT_CODEX_PROVIDER
+                && let Some(canonical) = routes.iter().find(|candidate| {
+                    candidate.protocol == Protocol::OpenAi
+                        && candidate.base_url == route.base_url
+                        && candidate.provider != DIRECT_CODEX_PROVIDER
+                })
+            {
+                route.provider = canonical.provider.clone();
+                route.name = canonical.name.clone();
+            }
             push_fallback(&mut routes, route);
         }
     }
@@ -308,9 +336,320 @@ fn client_port(config: &AppConfig) -> u16 {
     }
 }
 
+fn cc_switch_settings(
+    config: &AppConfig,
+    protocol: Protocol,
+    provider: &str,
+) -> Result<Option<Value>> {
+    if !config.cc_switch_db.exists() {
+        return Ok(None);
+    }
+    let app_type = if protocol == Protocol::OpenAi {
+        "codex"
+    } else {
+        "claude"
+    };
+    let Some(row) = sqlite::providers(&config.cc_switch_db, app_type)?
+        .into_iter()
+        .find(|row| row.id == provider)
+    else {
+        return Ok(None);
+    };
+    let settings = serde_json::from_str::<Value>(&row.settings)
+        .with_context(|| format!("CC-Switch Provider {} 配置无法解析", row.name))?;
+    Ok(Some(settings))
+}
+
+struct PendingFile {
+    path: PathBuf,
+    original: Option<Vec<u8>>,
+    updated: Vec<u8>,
+}
+
+fn rollback_files(committed: Vec<(PathBuf, Option<Vec<u8>>)>) {
+    for (path, original) in committed.into_iter().rev() {
+        match original {
+            Some(bytes) => {
+                let _ = atomic_write(&path, &bytes);
+            }
+            None => {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+fn commit_files(updates: Vec<PendingFile>) -> Result<()> {
+    let mut committed: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+    for update in updates {
+        if update.original.as_deref() == Some(update.updated.as_slice()) {
+            continue;
+        }
+        if let Some(original) = update.original.as_ref()
+            && let Err(error) = backup(&update.path, &String::from_utf8_lossy(original))
+        {
+            rollback_files(committed);
+            return Err(error);
+        }
+        if let Err(error) = atomic_write(&update.path, &update.updated) {
+            rollback_files(committed);
+            return Err(error);
+        }
+        committed.push((update.path, update.original));
+    }
+    Ok(())
+}
+
+fn codex_auth_path(config: &AppConfig) -> Option<PathBuf> {
+    config
+        .codex_config
+        .parent()
+        .map(|parent| parent.join("auth.json"))
+}
+
+fn pending_codex_auth(config: &AppConfig, settings: &Value) -> Result<Option<PendingFile>> {
+    let Some(path) = codex_auth_path(config) else {
+        return Ok(None);
+    };
+    let original = if path.exists() {
+        Some(fs::read(&path).with_context(|| format!("无法读取 {}", path.display()))?)
+    } else {
+        None
+    };
+    let original_value = original
+        .as_deref()
+        .map(|bytes| {
+            serde_json::from_slice::<Value>(bytes)
+                .with_context(|| format!("Codex auth.json 无法解析: {}", path.display()))
+        })
+        .transpose()?
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    if !original_value.is_object() {
+        return Err(anyhow!("Codex auth.json 根节点必须是对象"));
+    }
+    let mut updated = original_value;
+    let auth = settings.get("auth").and_then(Value::as_object);
+    let object = updated.as_object_mut().unwrap();
+    if let Some(auth) = auth {
+        for (key, value) in auth {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    // CC-Switch uses this key for API-key providers. Remove a previous key
+    // when the newly selected provider uses pass-through/OAuth auth instead.
+    if auth.is_none_or(|auth| !auth.contains_key("OPENAI_API_KEY")) {
+        object.remove("OPENAI_API_KEY");
+    }
+    let updated = serde_json::to_vec_pretty(&updated)?;
+    if original.as_deref() == Some(updated.as_slice()) {
+        return Ok(None);
+    }
+    Ok(Some(PendingFile {
+        path,
+        original,
+        updated,
+    }))
+}
+
+fn apply_codex_provider_document(
+    config: &AppConfig,
+    current: &mut DocumentMut,
+    source: &DocumentMut,
+) -> Result<(String, String)> {
+    let selected = source
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .ok_or_else(|| anyhow!("CC-Switch Codex Provider 缺少 model_provider"))?
+        .to_owned();
+    if matches!(selected.as_str(), "headroom" | DIRECT_CODEX_PROVIDER) {
+        return Err(anyhow!("CC-Switch Codex Provider 使用了保留名称"));
+    }
+    let source_provider = source
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(&selected))
+        .and_then(Item::as_table)
+        .ok_or_else(|| anyhow!("CC-Switch Codex Provider 缺少上游配置"))?
+        .clone();
+    let target = source_provider
+        .get("base_url")
+        .and_then(Item::as_str)
+        .map(normalize_url)
+        .transpose()?
+        .ok_or_else(|| anyhow!("CC-Switch Codex Provider 缺少有效 base_url"))?;
+    if is_local_service(&target, config) {
+        return Err(anyhow!("Codex 直连上游不能是本地 HeadroomRoute 地址"));
+    }
+    if current
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .is_none()
+    {
+        current["model_providers"] = Item::Table(Table::new());
+    }
+    let providers = current
+        .get_mut("model_providers")
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| anyhow!("Codex 配置缺少 model_providers"))?;
+    providers.remove(DIRECT_CODEX_PROVIDER);
+    providers.insert(&selected, Item::Table(source_provider));
+    current["model_provider"] = value(selected.clone());
+    if let Some(item) = source.get("model") {
+        current["model"] = item.clone();
+    } else {
+        current.remove("model");
+    }
+    if let Some(item) = source.get("openai_base_url") {
+        current["openai_base_url"] = item.clone();
+    } else if current
+        .get("openai_base_url")
+        .and_then(Item::as_str)
+        .is_some_and(|url| is_local_service(url, config))
+    {
+        current.remove("openai_base_url");
+    }
+    Ok((selected, target))
+}
+
+fn sync_codex_direct_provider(
+    config: &AppConfig,
+    provider: Option<&str>,
+    preferred: Option<&str>,
+) -> Result<String> {
+    capture_baseline(config)?;
+    if !config.enable_codex || !config.codex_config.exists() {
+        return Ok("未启用".into());
+    }
+    let path = &config.codex_config;
+    let original =
+        fs::read_to_string(path).with_context(|| format!("读取失败: {}", path.display()))?;
+    let mut doc = original
+        .parse::<DocumentMut>()
+        .context("Codex TOML 无法解析")?;
+    if let Some(provider) = provider
+        && let Some(settings) = cc_switch_settings(config, Protocol::OpenAi, provider)?
+    {
+        let source_text = settings
+            .get("config")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("CC-Switch Codex Provider 缺少 config"))?;
+        let source = source_text
+            .parse::<DocumentMut>()
+            .context("CC-Switch Codex Provider TOML 无法解析")?;
+        let (_, target) = apply_codex_provider_document(config, &mut doc, &source)?;
+        let mut updates = vec![PendingFile {
+            path: path.clone(),
+            original: Some(original.as_bytes().to_vec()),
+            updated: doc.to_string().into_bytes(),
+        }];
+        if let Some(auth) = pending_codex_auth(config, &settings)? {
+            updates.push(auth);
+        }
+        commit_files(updates)?;
+        mark_direct_managed(config, Protocol::OpenAi)?;
+        return Ok(target);
+    }
+    sync_codex_direct_legacy(config, preferred, path, &original, doc)
+}
+
+fn sync_codex_direct_legacy(
+    config: &AppConfig,
+    preferred: Option<&str>,
+    path: &Path,
+    original: &str,
+    mut doc: DocumentMut,
+) -> Result<String> {
+    let selected = doc
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let providers = doc
+        .get_mut("model_providers")
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| anyhow!("缺少 model_providers"))?;
+
+    let preferred_normalized = preferred.and_then(|url| normalize_url(url).ok());
+    let source_name = preferred
+        .and_then(|_| {
+            providers
+                .iter()
+                .find(|(name, item)| {
+                    name != &"headroom"
+                        && name != &DIRECT_CODEX_PROVIDER
+                        && table_string(item, "base_url")
+                            .and_then(|value| normalize_url(&value).ok())
+                            .as_ref()
+                            == preferred_normalized.as_ref()
+                })
+                .map(|(name, _)| name.to_owned())
+        })
+        .or_else(|| {
+            preferred
+                .is_none()
+                .then(|| {
+                    (selected != "headroom"
+                        && selected != DIRECT_CODEX_PROVIDER
+                        && providers.contains_key(&selected))
+                    .then_some(selected.clone())
+                })
+                .flatten()
+        });
+    let target = preferred
+        .map(normalize_url)
+        .transpose()?
+        .or_else(|| {
+            source_name.as_deref().and_then(|name| {
+                providers
+                    .get(name)
+                    .and_then(Item::as_table)
+                    .and_then(|item| item.get("base_url"))
+                    .and_then(Item::as_str)
+                    .and_then(|url| normalize_url(url).ok())
+            })
+        })
+        .or_else(|| {
+            providers.iter().find_map(|(name, item)| {
+                if name == "headroom" || name == DIRECT_CODEX_PROVIDER {
+                    return None;
+                }
+                table_string(item, "base_url").and_then(|url| normalize_url(&url).ok())
+            })
+        })
+        .ok_or_else(|| anyhow!("无法确定 Codex 直连上游 Provider"))?;
+    if is_local_service(&target, config) {
+        return Err(anyhow!("Codex 直连上游不能是本地 HeadroomRoute 地址"));
+    }
+
+    let canonical_source = source_name.clone();
+    if let Some(_source_name) = source_name {
+        providers.remove(DIRECT_CODEX_PROVIDER);
+    } else {
+        let mut direct = Table::new();
+        direct.insert("name", value("HeadroomRoute Direct"));
+        direct.insert("base_url", value(target.clone()));
+        providers.insert(DIRECT_CODEX_PROVIDER, Item::Table(direct));
+    }
+    let _ = providers;
+    doc["model_provider"] = value(canonical_source.unwrap_or_else(|| DIRECT_CODEX_PROVIDER.into()));
+    let updated = doc.to_string();
+    if updated != original {
+        backup(path, original)?;
+        atomic_write(path, updated.as_bytes())?;
+    }
+    Ok(target)
+}
+
 pub fn sync_codex(config: &AppConfig, preferred: Option<&str>) -> Result<String> {
     if !config.enable_codex || !config.codex_config.exists() {
         return Ok("未启用".into());
+    }
+    if config.direct_codex {
+        return sync_codex_direct_provider(
+            config,
+            config.selected_openai_provider.as_deref(),
+            preferred,
+        );
     }
     let path = &config.codex_config;
     let original =
@@ -331,18 +670,25 @@ pub fn sync_codex(config: &AppConfig, preferred: Option<&str>) -> Result<String>
         providers
             .iter()
             .find(|(name, item)| {
-                *name != "headroom" && table_string(item, "base_url").as_deref() == Some(url)
+                *name != "headroom"
+                    && *name != DIRECT_CODEX_PROVIDER
+                    && table_string(item, "base_url").as_deref() == Some(url)
             })
             .map(|(name, _)| name.to_owned())
     });
     let upstream = if let Some(provider) = preferred_provider {
         provider
-    } else if selected != "headroom" && providers.contains_key(&selected) {
+    } else if selected != "headroom"
+        && selected != DIRECT_CODEX_PROVIDER
+        && providers.contains_key(&selected)
+    {
         selected
     } else {
         providers
             .iter()
-            .find(|(name, item)| *name != "headroom" && item.as_table().is_some())
+            .find(|(name, item)| {
+                *name != "headroom" && *name != DIRECT_CODEX_PROVIDER && item.as_table().is_some()
+            })
             .map(|(name, _)| name.to_owned())
             .unwrap_or_default()
     };
@@ -385,9 +731,192 @@ pub fn sync_codex(config: &AppConfig, preferred: Option<&str>) -> Result<String>
     Ok(upstream)
 }
 
-pub fn sync_claude(config: &AppConfig) -> Result<String> {
+fn is_claude_provider_key(key: &str) -> bool {
+    key == "ANTHROPIC_BASE_URL"
+        || key == "ANTHROPIC_API_KEY"
+        || key == "ANTHROPIC_AUTH_TOKEN"
+        || key.starts_with("ANTHROPIC_")
+        || key.starts_with("CLAUDE_CODE_")
+}
+
+fn apply_claude_provider_settings(
+    config: &AppConfig,
+    root: &mut Value,
+    settings: &Value,
+    preferred: Option<&str>,
+) -> Result<String> {
+    let source_env = settings
+        .get("env")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("CC-Switch Claude Provider 缺少 env"))?;
+    let source_target = source_env
+        .get("ANTHROPIC_BASE_URL")
+        .and_then(Value::as_str)
+        .map(normalize_url)
+        .transpose()?;
+    let target = preferred
+        .and_then(|value| normalize_url(value).ok())
+        .or(source_target)
+        .ok_or_else(|| anyhow!("无法确定 Claude 直连上游 Provider"))?;
+    if is_local_service(&target, config) {
+        return Err(anyhow!("Claude 直连上游不能是本地 HeadroomRoute 地址"));
+    }
+    if !root.is_object() {
+        return Err(anyhow!("Claude settings.json 根节点必须是对象"));
+    }
+    let root_obj = root.as_object_mut().unwrap();
+    if !root_obj.get("env").is_some_and(Value::is_object) {
+        root_obj.insert("env".into(), Value::Object(Map::new()));
+    }
+    let env = root_obj
+        .get_mut("env")
+        .and_then(Value::as_object_mut)
+        .unwrap();
+    // Provider-scoped variables must not leak from the previous account.
+    env.retain(|key, _| !is_claude_provider_key(key));
+    for (key, value) in source_env {
+        env.insert(key.clone(), value.clone());
+    }
+    env.insert("ANTHROPIC_BASE_URL".into(), Value::String(target.clone()));
+    if let Some(model) = settings.get("model") {
+        root_obj.insert("model".into(), model.clone());
+    }
+    Ok(target)
+}
+
+fn sync_claude_direct_provider(
+    config: &AppConfig,
+    provider: Option<&str>,
+    preferred: Option<&str>,
+) -> Result<String> {
+    capture_baseline(config)?;
     if !config.enable_claude {
         return Ok("未启用".into());
+    }
+    let path = &config.claude_settings;
+    let original = if path.exists() {
+        fs::read(path).with_context(|| format!("读取失败: {}", path.display()))?
+    } else {
+        b"{}".to_vec()
+    };
+    let original_text =
+        String::from_utf8(original.clone()).context("Claude settings.json 不是 UTF-8")?;
+    let mut root: Value =
+        serde_json::from_slice(&original).context("Claude settings.json 无法解析")?;
+    if let Some(provider) = provider
+        && let Some(settings) = cc_switch_settings(config, Protocol::Anthropic, provider)?
+    {
+        let target = apply_claude_provider_settings(config, &mut root, &settings, preferred)?;
+        let updated = serde_json::to_vec_pretty(&root)?;
+        commit_files(vec![PendingFile {
+            path: path.clone(),
+            original: Some(original),
+            updated,
+        }])?;
+        mark_direct_managed(config, Protocol::Anthropic)?;
+        return Ok(target);
+    }
+
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Claude settings.json 根节点必须是对象"))?;
+    if !root_obj.get("env").is_some_and(Value::is_object) {
+        root_obj.insert("env".into(), Value::Object(Map::new()));
+    }
+    let env = root_obj
+        .get_mut("env")
+        .and_then(Value::as_object_mut)
+        .unwrap();
+    let target = preferred
+        .map(normalize_url)
+        .transpose()?
+        .or_else(|| {
+            env.get("ANTHROPIC_BASE_URL")
+                .and_then(Value::as_str)
+                .and_then(|value| normalize_url(value).ok())
+        })
+        .ok_or_else(|| anyhow!("无法确定 Claude 直连上游 Provider"))?;
+    if is_local_service(&target, config) {
+        return Err(anyhow!("Claude 直连上游不能是本地 HeadroomRoute 地址"));
+    }
+    env.insert("ANTHROPIC_BASE_URL".into(), Value::String(target.clone()));
+    let updated = serde_json::to_vec_pretty(&root)?;
+    commit_files(vec![PendingFile {
+        path: path.clone(),
+        original: Some(original_text.into_bytes()),
+        updated,
+    }])?;
+    mark_direct_managed(config, Protocol::Anthropic)?;
+    Ok(target)
+}
+
+pub fn sync_direct_provider(
+    config: &AppConfig,
+    protocol: Protocol,
+    provider: &str,
+) -> Result<String> {
+    capture_baseline(config)?;
+    let preferred = discover_routes(config)
+        .ok()
+        .and_then(|found| {
+            found
+                .routes
+                .into_iter()
+                .find(|route| route.protocol == protocol && route.provider == provider)
+        })
+        .map(|route| route.base_url);
+    match protocol {
+        Protocol::OpenAi => {
+            sync_codex_direct_provider(config, Some(provider), preferred.as_deref())
+        }
+        Protocol::Anthropic => {
+            sync_claude_direct_provider(config, Some(provider), preferred.as_deref())
+        }
+    }
+}
+
+pub fn handoff_direct_to_cc_switch(config: &AppConfig) -> Result<String> {
+    if !config.cc_switch_db.exists() {
+        return Ok("未发现 CC-Switch 数据库，保留当前直连配置".into());
+    }
+    let mut updated = config.clone();
+    let mut handed_off = Vec::new();
+    if config.direct_codex
+        && let Some(provider) = sqlite::current_provider(&config.cc_switch_db, "codex")?
+    {
+        sync_direct_provider(config, Protocol::OpenAi, &provider.id)?;
+        updated.selected_openai_provider = Some(provider.id.clone());
+        handed_off.push(format!("Codex={}", provider.name));
+    }
+    if config.direct_claude
+        && let Some(provider) = sqlite::current_provider(&config.cc_switch_db, "claude")?
+    {
+        sync_direct_provider(config, Protocol::Anthropic, &provider.id)?;
+        updated.selected_anthropic_provider = Some(provider.id.clone());
+        handed_off.push(format!("Claude={}", provider.name));
+    }
+    if updated.selected_openai_provider != config.selected_openai_provider
+        || updated.selected_anthropic_provider != config.selected_anthropic_provider
+    {
+        save(&config.state_dir.join("config.json"), &updated)?;
+    }
+    if handed_off.is_empty() {
+        Ok("CC-Switch 没有当前 Provider，保留当前直连配置".into())
+    } else {
+        Ok(handed_off.join(", "))
+    }
+}
+
+pub fn sync_claude_with_target(config: &AppConfig, preferred: Option<&str>) -> Result<String> {
+    if !config.enable_claude {
+        return Ok("未启用".into());
+    }
+    if config.direct_claude {
+        return sync_claude_direct_provider(
+            config,
+            config.selected_anthropic_provider.as_deref(),
+            preferred,
+        );
     }
     let path = &config.claude_settings;
     let original = if path.exists() {
@@ -408,9 +937,9 @@ pub fn sync_claude(config: &AppConfig) -> Result<String> {
         .get_mut("env")
         .and_then(Value::as_object_mut)
         .unwrap();
-    let local = format!("http://127.0.0.1:{}", client_port(config));
-    let already = env.get("ANTHROPIC_BASE_URL").and_then(Value::as_str) == Some(local.as_str());
-    env.insert("ANTHROPIC_BASE_URL".into(), Value::String(local));
+    let target = format!("http://127.0.0.1:{}", client_port(config));
+    let already = env.get("ANTHROPIC_BASE_URL").and_then(Value::as_str) == Some(target.as_str());
+    env.insert("ANTHROPIC_BASE_URL".into(), Value::String(target));
     if !already {
         if path.exists() {
             backup(path, &original)?;
@@ -420,11 +949,27 @@ pub fn sync_claude(config: &AppConfig) -> Result<String> {
     Ok("Claude Code".into())
 }
 
-pub fn sync_all(config: &AppConfig, preferred_openai: Option<&str>) -> Result<String> {
+pub fn sync_all_with_targets(
+    config: &AppConfig,
+    preferred_openai: Option<&str>,
+    preferred_anthropic: Option<&str>,
+) -> Result<String> {
     capture_baseline(config)?;
     let codex = sync_codex(config, preferred_openai)?;
-    let claude = sync_claude(config)?;
+    let claude = sync_claude_with_target(config, preferred_anthropic)?;
     Ok(format!("Codex={codex}, Claude={claude}"))
+}
+
+pub fn sync_protocol_with_target(
+    config: &AppConfig,
+    protocol: Protocol,
+    preferred: Option<&str>,
+) -> Result<String> {
+    capture_baseline(config)?;
+    match protocol {
+        Protocol::OpenAi => sync_codex(config, preferred),
+        Protocol::Anthropic => sync_claude_with_target(config, preferred),
+    }
 }
 
 pub fn sync_provider_models(
@@ -547,6 +1092,20 @@ fn is_claude_model_key(key: &str) -> bool {
 pub fn capture_baseline(config: &AppConfig) -> Result<()> {
     let manifest_path = config.state_dir.join("install-manifest.json");
     if manifest_path.exists() {
+        let Ok(mut manifest) =
+            serde_json::from_str::<InstallManifest>(&fs::read_to_string(&manifest_path)?)
+        else {
+            return Ok(());
+        };
+        if manifest.codex_auth_baseline.is_none() {
+            let baseline_dir = config.state_dir.join("baseline");
+            fs::create_dir_all(&baseline_dir)?;
+            manifest.codex_auth_baseline = capture_original(
+                &codex_auth_path(config).unwrap_or_else(|| baseline_dir.join("auth.json")),
+                &baseline_dir.join("codex-auth.json"),
+            )?;
+            atomic_write(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
+        }
         return Ok(());
     }
     let baseline_dir = config.state_dir.join("baseline");
@@ -554,11 +1113,31 @@ pub fn capture_baseline(config: &AppConfig) -> Result<()> {
     let codex_baseline = capture_original(&config.codex_config, &baseline_dir.join("codex.toml"))?;
     let claude_baseline =
         capture_original(&config.claude_settings, &baseline_dir.join("claude.json"))?;
+    let codex_auth_baseline = capture_original(
+        &codex_auth_path(config).unwrap_or_else(|| baseline_dir.join("auth.json")),
+        &baseline_dir.join("codex-auth.json"),
+    )?;
     let manifest = InstallManifest {
         version: env!("CARGO_PKG_VERSION").into(),
         codex_baseline,
         claude_baseline,
+        codex_auth_baseline,
+        codex_auth_managed: false,
+        claude_provider_env_managed: false,
     };
+    atomic_write(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)
+}
+
+fn mark_direct_managed(config: &AppConfig, protocol: Protocol) -> Result<()> {
+    let manifest_path = config.state_dir.join("install-manifest.json");
+    if !manifest_path.exists() {
+        capture_baseline(config)?;
+    }
+    let mut manifest: InstallManifest = serde_json::from_str(&fs::read_to_string(&manifest_path)?)?;
+    match protocol {
+        Protocol::OpenAi => manifest.codex_auth_managed = true,
+        Protocol::Anthropic => manifest.claude_provider_env_managed = true,
+    }
     atomic_write(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)
 }
 
@@ -568,8 +1147,17 @@ pub fn restore_clients(config: &AppConfig) -> Result<()> {
         return Ok(());
     }
     let manifest: InstallManifest = serde_json::from_str(&fs::read_to_string(&manifest_path)?)?;
-    restore_codex(config, manifest.codex_baseline.as_deref())?;
-    restore_claude(config, manifest.claude_baseline.as_deref())?;
+    restore_codex(
+        config,
+        manifest.codex_baseline.as_deref(),
+        manifest.codex_auth_baseline.as_deref(),
+        manifest.codex_auth_managed,
+    )?;
+    restore_claude(
+        config,
+        manifest.claude_baseline.as_deref(),
+        manifest.claude_provider_env_managed,
+    )?;
     Ok(())
 }
 
@@ -600,68 +1188,96 @@ fn earliest_pre_route_backup(path: &Path) -> Option<std::path::PathBuf> {
     matches.into_iter().next()
 }
 
-fn restore_codex(config: &AppConfig, baseline_path: Option<&str>) -> Result<()> {
+fn restore_codex(
+    config: &AppConfig,
+    baseline_path: Option<&str>,
+    auth_baseline_path: Option<&str>,
+    auth_managed: bool,
+) -> Result<()> {
     if !config.codex_config.exists() {
         if let Some(path) = baseline_path {
             fs::copy(path, &config.codex_config)?;
         }
-        return Ok(());
-    }
-    let original = fs::read_to_string(&config.codex_config)?;
-    let mut current = original
-        .parse::<DocumentMut>()
-        .context("恢复时 Codex TOML 无法解析")?;
-    let baseline = baseline_path
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|text| text.parse::<DocumentMut>().ok());
-    if current.get("model_provider").and_then(Item::as_str) == Some("headroom") {
-        if let Some(item) = baseline
-            .as_ref()
-            .and_then(|doc| doc.get("model_provider"))
-            .cloned()
+    } else {
+        let original = fs::read_to_string(&config.codex_config)?;
+        let mut current = original
+            .parse::<DocumentMut>()
+            .context("恢复时 Codex TOML 无法解析")?;
+        let baseline = baseline_path
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|text| text.parse::<DocumentMut>().ok());
+        if auth_managed
+            || matches!(
+                current.get("model_provider").and_then(Item::as_str),
+                Some("headroom" | DIRECT_CODEX_PROVIDER)
+            )
         {
-            current["model_provider"] = item;
-        } else {
-            current.remove("model_provider");
+            if let Some(item) = baseline
+                .as_ref()
+                .and_then(|doc| doc.get("model_provider"))
+                .cloned()
+            {
+                current["model_provider"] = item;
+            } else {
+                current.remove("model_provider");
+            }
         }
-    }
-    if current
-        .get("openai_base_url")
-        .and_then(Item::as_str)
-        .is_some_and(|url| is_local_service(url, config))
-    {
-        if let Some(item) = baseline
-            .as_ref()
-            .and_then(|doc| doc.get("openai_base_url"))
-            .cloned()
+        if current
+            .get("openai_base_url")
+            .and_then(Item::as_str)
+            .is_some_and(|url| is_local_service(url, config))
         {
-            current["openai_base_url"] = item;
-        } else {
-            current.remove("openai_base_url");
+            if let Some(item) = baseline
+                .as_ref()
+                .and_then(|doc| doc.get("openai_base_url"))
+                .cloned()
+            {
+                current["openai_base_url"] = item;
+            } else {
+                current.remove("openai_base_url");
+            }
+        }
+        if let Some(providers) = current
+            .get_mut("model_providers")
+            .and_then(Item::as_table_mut)
+        {
+            providers.remove("headroom");
+            providers.remove(DIRECT_CODEX_PROVIDER);
+        }
+        if let Some(baseline) = baseline.as_ref() {
+            if let Some(item) = baseline.get("model").cloned() {
+                current["model"] = item;
+            } else {
+                current.remove("model");
+            }
+        }
+        let restored = current.to_string();
+        if restored != original {
+            backup(&config.codex_config, &original)?;
+            atomic_write(&config.codex_config, restored.as_bytes())?;
         }
     }
-    if let Some(providers) = current
-        .get_mut("model_providers")
-        .and_then(Item::as_table_mut)
+    if auth_managed
+        && let (Some(source), Some(target)) = (auth_baseline_path, codex_auth_path(config))
+        && Path::new(source).exists()
     {
-        providers.remove("headroom");
-    }
-    if let Some(baseline) = baseline.as_ref() {
-        if let Some(item) = baseline.get("model").cloned() {
-            current["model"] = item;
-        } else {
-            current.remove("model");
+        let original = fs::read(&target).ok();
+        let baseline = fs::read(source)?;
+        if original.as_deref() != Some(baseline.as_slice()) {
+            if let Some(bytes) = original.as_ref() {
+                backup(&target, &String::from_utf8_lossy(bytes))?;
+            }
+            atomic_write(&target, &baseline)?;
         }
-    }
-    let restored = current.to_string();
-    if restored != original {
-        backup(&config.codex_config, &original)?;
-        atomic_write(&config.codex_config, restored.as_bytes())?;
     }
     Ok(())
 }
 
-fn restore_claude(config: &AppConfig, baseline_path: Option<&str>) -> Result<()> {
+fn restore_claude(
+    config: &AppConfig,
+    baseline_path: Option<&str>,
+    provider_env_managed: bool,
+) -> Result<()> {
     if !config.claude_settings.exists() {
         if let Some(path) = baseline_path {
             fs::copy(path, &config.claude_settings)?;
@@ -674,17 +1290,35 @@ fn restore_claude(config: &AppConfig, baseline_path: Option<&str>) -> Result<()>
     let baseline = baseline_path
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-    let local = current
+    let current_url = current
         .pointer("/env/ANTHROPIC_BASE_URL")
         .and_then(Value::as_str)
+        .map(str::to_owned);
+    let local = current_url
+        .as_deref()
         .is_some_and(|url| is_local_service(url, config));
-    if local {
+    let direct =
+        current_url.as_deref() == selected_route_url(config, Protocol::Anthropic).as_deref();
+    if local || direct || provider_env_managed {
         let env = current
             .as_object_mut()
             .and_then(|root| root.get_mut("env"))
             .and_then(Value::as_object_mut)
             .ok_or_else(|| anyhow!("Claude env 配置无效"))?;
-        if let Some(value) = baseline
+        if provider_env_managed {
+            env.retain(|key, _| !is_claude_provider_key(key));
+            if let Some(baseline_env) = baseline
+                .as_ref()
+                .and_then(|root| root.get("env"))
+                .and_then(Value::as_object)
+            {
+                for (key, value) in baseline_env {
+                    if is_claude_provider_key(key) {
+                        env.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        } else if let Some(value) = baseline
             .as_ref()
             .and_then(|root| root.pointer("/env/ANTHROPIC_BASE_URL"))
             .cloned()
@@ -713,9 +1347,27 @@ fn restore_claude(config: &AppConfig, baseline_path: Option<&str>) -> Result<()>
     Ok(())
 }
 
-pub fn routing_drifted(config: &AppConfig) -> bool {
+fn selected_route_url(config: &AppConfig, protocol: Protocol) -> Option<String> {
+    let selected = match protocol {
+        Protocol::OpenAi => config.selected_openai_provider.as_deref(),
+        Protocol::Anthropic => config.selected_anthropic_provider.as_deref(),
+    }?;
+    discover_routes(config)
+        .ok()?
+        .routes
+        .into_iter()
+        .find(|route| route.protocol == protocol && route.provider == selected)
+        .map(|route| route.base_url)
+}
+
+pub fn routing_drifted_with_targets(
+    config: &AppConfig,
+    _preferred_openai: Option<&str>,
+    _preferred_anthropic: Option<&str>,
+) -> bool {
     let codex_local = format!("http://127.0.0.1:{}/v1", client_port(config));
-    let codex_drifted = config.enable_codex
+    let codex_drifted = !config.direct_codex
+        && config.enable_codex
         && config.codex_config.exists()
         && fs::read_to_string(&config.codex_config)
             .ok()
@@ -732,7 +1384,8 @@ pub fn routing_drifted(config: &AppConfig) -> bool {
                         != Some(codex_local.as_str())
             });
     let local = format!("http://127.0.0.1:{}", client_port(config));
-    let claude_drifted = config.enable_claude
+    let claude_drifted = !config.direct_claude
+        && config.enable_claude
         && fs::read_to_string(&config.claude_settings)
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
@@ -1055,8 +1708,8 @@ mod model_sync_tests {
 mod tests {
     #![allow(clippy::field_reassign_with_default)]
     use super::{
-        effective_claude_base_url, parse_proxy_server, push_fallback, push_unique, routing_drifted,
-        sync_all, sync_claude,
+        DocumentMut, Item, effective_claude_base_url, parse_proxy_server, push_fallback,
+        push_unique, routing_drifted_with_targets, sync_all_with_targets, sync_claude_with_target,
     };
     use crate::model::{AppConfig, AuthStyle, Protocol, Route};
     use serde_json::Value;
@@ -1084,13 +1737,13 @@ mod tests {
         config.claude_settings = path.clone();
         config.headroom_port = 8787;
         config.enable_codex = false;
-        sync_claude(&config).unwrap();
+        sync_claude_with_target(&config, None).unwrap();
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["theme"], "dark");
         assert_eq!(value["env"]["ANTHROPIC_AUTH_TOKEN"], "secret");
         assert_eq!(value["env"]["CUSTOM"], "yes");
         assert_eq!(value["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8787");
-        assert!(!routing_drifted(&config));
+        assert!(!routing_drifted_with_targets(&config, None, None));
         assert!(
             fs::read_dir(&dir)
                 .unwrap()
@@ -1154,7 +1807,7 @@ mod tests {
             "model_provider = \"upstream\"\n[model_providers.upstream]\nname = \"Upstream\"\nbase_url = \"https://api.example.com/v1\"\n",
         )
         .unwrap();
-        sync_all(&config, None).unwrap();
+        sync_all_with_targets(&config, None, None).unwrap();
         let codex = fs::read_to_string(&config.codex_config).unwrap();
         let claude: Value =
             serde_json::from_str(&fs::read_to_string(&config.claude_settings).unwrap()).unwrap();
@@ -1165,13 +1818,198 @@ mod tests {
                 .and_then(Value::as_str),
             Some("http://127.0.0.1:8790")
         );
-        assert!(!routing_drifted(&config));
+        assert!(!routing_drifted_with_targets(&config, None, None));
         fs::write(
             &config.codex_config,
             codex.replace("http://127.0.0.1:8790/v1", "http://127.0.0.1:8787/v1"),
         )
         .unwrap();
-        assert!(routing_drifted(&config));
+        assert!(routing_drifted_with_targets(&config, None, None));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn direct_codex_fallback_preserves_cli_authentication() {
+        let dir = std::env::temp_dir().join(format!(
+            "headroom-route-direct-codex-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::default();
+        config.codex_config = dir.join("config.toml");
+        config.state_dir = dir.join("state");
+        config.enable_claude = false;
+        config.direct_codex = true;
+        fs::write(
+            &config.codex_config,
+            "model_provider = \"upstream\"\n[model_providers.upstream]\nname = \"Upstream\"\nbase_url = \"https://api.example.com/v1\"\nrequires_openai_auth = true\nwire_api = \"responses\"\n[model_providers.upstream.env_http_headers]\nAuthorization = \"SECRET\"\n",
+        )
+        .unwrap();
+
+        super::sync_codex(&config, Some("https://direct.example.com/v1")).unwrap();
+        let text = fs::read_to_string(&config.codex_config).unwrap();
+        let doc = text.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            doc.get("model_provider").and_then(Item::as_str),
+            Some(super::DIRECT_CODEX_PROVIDER)
+        );
+        assert_eq!(
+            doc["model_providers"][super::DIRECT_CODEX_PROVIDER]
+                .get("base_url")
+                .and_then(Item::as_str),
+            Some("https://direct.example.com/v1")
+        );
+        assert!(
+            doc["model_providers"][super::DIRECT_CODEX_PROVIDER]
+                .get("env_http_headers")
+                .is_none()
+        );
+        assert!(!super::routing_drifted_with_targets(
+            &config,
+            Some("https://direct.example.com/v1"),
+            None
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn direct_claude_fallback_preserves_cli_authentication() {
+        let dir = std::env::temp_dir().join(format!(
+            "headroom-route-direct-claude-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::default();
+        config.claude_settings = dir.join("settings.json");
+        config.state_dir = dir.join("state");
+        config.enable_codex = false;
+        config.direct_claude = true;
+        fs::write(
+            &config.claude_settings,
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"secret","CUSTOM":"yes"}}"#,
+        )
+        .unwrap();
+
+        sync_claude_with_target(&config, Some("https://anthropic.example.com")).unwrap();
+        let saved: Value =
+            serde_json::from_str(&fs::read_to_string(&config.claude_settings).unwrap()).unwrap();
+        assert_eq!(
+            saved["env"]["ANTHROPIC_BASE_URL"],
+            "https://anthropic.example.com"
+        );
+        assert_eq!(saved["env"]["ANTHROPIC_AUTH_TOKEN"], "secret");
+        assert_eq!(saved["env"]["CUSTOM"], "yes");
+        super::restore_clients(&config).unwrap();
+        let restored: Value =
+            serde_json::from_str(&fs::read_to_string(&config.claude_settings).unwrap()).unwrap();
+        assert!(restored["env"].get("ANTHROPIC_BASE_URL").is_none());
+        assert_eq!(restored["env"]["ANTHROPIC_AUTH_TOKEN"], "secret");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn direct_provider_switch_updates_codex_config_and_auth() {
+        let dir = std::env::temp_dir().join(format!(
+            "headroom-route-direct-provider-codex-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::default();
+        config.codex_config = dir.join("config.toml");
+        config.state_dir = dir.join("state");
+        let current = "model = \"model-a\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nname = \"A\"\nbase_url = \"https://a.example.com/v1\"\n[model_providers.headroom_route_direct]\nname = \"old\"\nbase_url = \"https://a.example.com/v1\"\n";
+        fs::write(&config.codex_config, current).unwrap();
+        let auth_path = dir.join("auth.json");
+        fs::write(&auth_path, r#"{"OPENAI_API_KEY":"key-a","other":"keep"}"#).unwrap();
+        let source = "model = \"model-b\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nname = \"B\"\nbase_url = \"https://b.example.com/v1\"\nwire_api = \"chat\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let settings = serde_json::json!({
+            "auth": {"OPENAI_API_KEY": "key-b"},
+            "config": source.to_string()
+        });
+        let mut current_doc = current.parse::<DocumentMut>().unwrap();
+        let (_, target) =
+            super::apply_codex_provider_document(&config, &mut current_doc, &source).unwrap();
+        assert_eq!(target, "https://b.example.com/v1");
+        let auth = super::pending_codex_auth(&config, &settings)
+            .unwrap()
+            .unwrap();
+        super::commit_files(vec![
+            super::PendingFile {
+                path: config.codex_config.clone(),
+                original: Some(current.as_bytes().to_vec()),
+                updated: current_doc.to_string().into_bytes(),
+            },
+            auth,
+        ])
+        .unwrap();
+        let saved = fs::read_to_string(&config.codex_config).unwrap();
+        let saved_doc = saved.parse::<DocumentMut>().unwrap();
+        assert_eq!(saved_doc["model_provider"].as_str(), Some("custom"));
+        assert_eq!(saved_doc["model"].as_str(), Some("model-b"));
+        assert_eq!(
+            saved_doc["model_providers"]["custom"]["name"].as_str(),
+            Some("B")
+        );
+        assert!(
+            saved_doc["model_providers"]
+                .get(super::DIRECT_CODEX_PROVIDER)
+                .is_none()
+        );
+        let auth: Value = serde_json::from_slice(&fs::read(auth_path).unwrap()).unwrap();
+        assert_eq!(auth["OPENAI_API_KEY"], "key-b");
+        assert_eq!(auth["other"], "keep");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn direct_provider_switch_replaces_claude_credentials() {
+        let dir = std::env::temp_dir().join(format!(
+            "headroom-route-direct-provider-claude-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::default();
+        config.claude_settings = dir.join("settings.json");
+        let mut current: Value = serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://a.example.com",
+                "ANTHROPIC_API_KEY": "key-a",
+                "ANTHROPIC_MODEL": "model-a",
+                "CUSTOM": "keep"
+            }
+        });
+        fs::write(
+            &config.claude_settings,
+            serde_json::to_vec(&current).unwrap(),
+        )
+        .unwrap();
+        let settings = serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://b.example.com",
+                "ANTHROPIC_AUTH_TOKEN": "token-b",
+                "ANTHROPIC_MODEL": "model-b"
+            }
+        });
+        let target =
+            super::apply_claude_provider_settings(&config, &mut current, &settings, None).unwrap();
+        assert_eq!(target, "https://b.example.com");
+        let env = current["env"].as_object().unwrap();
+        assert_eq!(
+            env.get("ANTHROPIC_AUTH_TOKEN").and_then(Value::as_str),
+            Some("token-b")
+        );
+        assert!(!env.contains_key("ANTHROPIC_API_KEY"));
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").and_then(Value::as_str),
+            Some("model-b")
+        );
+        assert_eq!(env.get("CUSTOM").and_then(Value::as_str), Some("keep"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1234,7 +2072,7 @@ mod tests {
         config.codex_config = codex.clone();
         config.claude_settings = claude.clone();
         config.cc_switch_db = dir.join("missing.db");
-        super::sync_all(&config, Some("https://api.example.com/v1")).unwrap();
+        super::sync_all_with_targets(&config, Some("https://api.example.com/v1"), None).unwrap();
         let mut current: Value =
             serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
         current["later_user_setting"] = Value::Bool(true);
@@ -1250,6 +2088,49 @@ mod tests {
         );
         assert_eq!(restored["later_user_setting"], true);
         assert_eq!(restored["env"]["ANTHROPIC_AUTH_TOKEN"], "secret");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_direct_provider_is_parsed_when_upstream_is_real() {
+        let text = r#"
+model_provider = "headroom_route_direct"
+[model_providers.headroom_route_direct]
+name = "Legacy direct"
+base_url = "https://api.example.com/v1"
+"#;
+        let (routes, selected) = super::parse_codex_text(text, "legacy").unwrap();
+        assert_eq!(selected.as_deref(), Some(super::DIRECT_CODEX_PROVIDER));
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].base_url, "https://api.example.com/v1");
+    }
+
+    #[test]
+    fn legacy_direct_provider_rejects_headroom_local_address() {
+        let dir = std::env::temp_dir().join(format!(
+            "headroom-route-legacy-local-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let codex = dir.join("config.toml");
+        fs::write(
+            &codex,
+            r#"
+model_provider = "headroom_route_direct"
+[model_providers.headroom_route_direct]
+name = "Local loop"
+base_url = "http://127.0.0.1:8790/v1"
+"#,
+        )
+        .unwrap();
+        let mut config = AppConfig::default();
+        config.codex_config = codex;
+        config.claude_settings = dir.join("missing-claude.json");
+        config.cc_switch_db = dir.join("missing.db");
+        config.enable_claude = false;
+        let result = super::discover_routes(&config);
+        assert!(result.is_err());
         let _ = fs::remove_dir_all(dir);
     }
 }

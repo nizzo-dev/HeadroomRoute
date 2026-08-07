@@ -30,15 +30,33 @@ fn managed_python(config: &AppConfig) -> PathBuf {
 }
 
 pub fn find_valid_python(config: &AppConfig) -> Option<PathBuf> {
-    config
-        .headroom_python
-        .as_ref()
-        .filter(|path| validate_python(path))
-        .cloned()
-        .or_else(|| {
-            let path = managed_python(config);
-            validate_python(&path).then_some(path)
-        })
+    candidate_pythons(config)
+        .into_iter()
+        .find(|path| validate_python(path))
+}
+
+/// Probe order for a usable Headroom runtime. The explicitly configured path
+/// wins so the user's choice is never overridden; the managed runtime and the
+/// standard `uv tool install` home are self-healing fallbacks when the stored
+/// path goes stale.
+pub fn candidate_pythons(config: &AppConfig) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(configured) = &config.headroom_python {
+        candidates.push(configured.clone());
+    }
+    candidates.push(managed_python(config));
+    #[cfg(windows)]
+    if let Some(uv) = uv_tool_python() {
+        candidates.push(uv);
+    }
+    candidates
+}
+
+#[cfg(windows)]
+fn uv_tool_python() -> Option<PathBuf> {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .map(|base| base.join("uv/tools/headroom-ai/Scripts/python.exe"))
 }
 
 pub fn validate_python(path: &Path) -> bool {
@@ -212,6 +230,32 @@ mod tests {
         let original = config.headroom_python.clone();
         assert!(config_with_python(&config, PathBuf::from("missing-python.exe")).is_err());
         assert_eq!(config.headroom_python, original);
+    }
+
+    #[test]
+    fn candidate_pythons_prefer_configured_then_managed_then_uv() {
+        let config = AppConfig {
+            state_dir: PathBuf::from(r"C:\HeadroomRouteTestState"),
+            headroom_python: Some(PathBuf::from(r"C:\Configured\python.exe")),
+            ..AppConfig::default()
+        };
+        let candidates = candidate_pythons(&config);
+        assert_eq!(candidates[0], PathBuf::from(r"C:\Configured\python.exe"));
+        assert_eq!(
+            candidates[1],
+            PathBuf::from(r"C:\HeadroomRouteTestState").join("runtime/venv/Scripts/python.exe")
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(candidates.len(), 3);
+            let last = candidates[2].to_string_lossy().replace('\\', "/");
+            assert!(
+                last.contains("uv/tools/headroom-ai"),
+                "unexpected uv candidate: {last}"
+            );
+        }
+        #[cfg(not(windows))]
+        assert_eq!(candidates.len(), 2);
     }
 
     #[test]

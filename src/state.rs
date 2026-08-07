@@ -271,25 +271,78 @@ impl AppState {
 
     pub fn toggle_headroom_bypass(&self) -> Result<bool> {
         let _config_guard = self.config_write_guard();
-        let (current, mut updated, path, preferred) = {
+        let (current, mut updated, path, preferred_openai, preferred_anthropic) = {
             let state = self.inner.lock().unwrap();
             (
                 state.config.clone(),
                 state.config.clone(),
                 state.config.state_dir.join("config.json"),
                 active_route(&state, Protocol::OpenAi).map(|route| route.base_url.clone()),
+                active_route(&state, Protocol::Anthropic).map(|route| route.base_url.clone()),
             )
         };
         updated.bypass_headroom = !updated.bypass_headroom;
-        if let Err(error) = config::sync_all(&updated, preferred.as_deref())
-            .and_then(|_| config::save(&path, &updated))
+        if let Err(error) = config::sync_all_with_targets(
+            &updated,
+            preferred_openai.as_deref(),
+            preferred_anthropic.as_deref(),
+        )
+        .and_then(|_| config::save(&path, &updated))
         {
-            let _ = config::sync_all(&current, preferred.as_deref());
+            let _ = config::sync_all_with_targets(
+                &current,
+                preferred_openai.as_deref(),
+                preferred_anthropic.as_deref(),
+            );
             self.inner.lock().unwrap().last_error =
                 Some(format!("切换 Headroom 模式失败: {error}"));
             return Err(error);
         }
         let enabled = updated.bypass_headroom;
+        self.inner.lock().unwrap().config = updated;
+        Ok(enabled)
+    }
+
+    pub fn toggle_direct(&self, protocol: Protocol) -> Result<bool> {
+        let _config_guard = self.config_write_guard();
+        let (current, mut updated, path, preferred_openai, preferred_anthropic) = {
+            let state = self.inner.lock().unwrap();
+            (
+                state.config.clone(),
+                state.config.clone(),
+                state.config.state_dir.join("config.json"),
+                active_route(&state, Protocol::OpenAi).map(|route| route.base_url.clone()),
+                active_route(&state, Protocol::Anthropic).map(|route| route.base_url.clone()),
+            )
+        };
+        let enabled = match protocol {
+            Protocol::OpenAi => {
+                updated.direct_codex = !updated.direct_codex;
+                updated.direct_codex
+            }
+            Protocol::Anthropic => {
+                updated.direct_claude = !updated.direct_claude;
+                updated.direct_claude
+            }
+        };
+        let preferred = if protocol == Protocol::OpenAi {
+            preferred_openai.as_deref()
+        } else {
+            preferred_anthropic.as_deref()
+        };
+        if let Err(error) = config::sync_protocol_with_target(&updated, protocol, preferred)
+            .and_then(|_| config::save(&path, &updated))
+        {
+            let current_preferred = if protocol == Protocol::OpenAi {
+                preferred_openai.as_deref()
+            } else {
+                preferred_anthropic.as_deref()
+            };
+            let _ = config::sync_protocol_with_target(&current, protocol, current_preferred);
+            self.inner.lock().unwrap().last_error =
+                Some(format!("切换{}直连模式失败: {error}", protocol.label()));
+            return Err(error);
+        }
         self.inner.lock().unwrap().config = updated;
         Ok(enabled)
     }
@@ -398,35 +451,65 @@ impl AppState {
     pub fn active_url(&self) -> Option<String> {
         self.active_route().map(|route| route.base_url)
     }
+    pub fn active_anthropic_url(&self) -> Option<String> {
+        self.active_route_for(Protocol::Anthropic)
+            .map(|route| route.base_url)
+    }
     pub fn route_summary(&self, protocol: Protocol) -> String {
         let state = self.inner.lock().unwrap();
         route_summary(active_route(&state, protocol))
     }
     pub fn recovery_hint(&self) -> &'static str {
         let state = self.inner.lock().unwrap();
+        let headroom_state = if state.config.bypass_headroom
+            || (state.config.direct_codex && state.config.direct_claude)
+        {
+            "external"
+        } else {
+            &state.headroom_state
+        };
         recovery_hint(
             active_route(&state, Protocol::OpenAi),
             active_route(&state, Protocol::Anthropic),
-            &state.headroom_state,
+            headroom_state,
             state.last_error.as_deref(),
         )
     }
 
     pub fn switch_index(&self, index: usize, reason: &str) -> bool {
         let _config_guard = self.config_write_guard();
-        let (protocol, provider, app_config) = {
+        let (protocol, provider, direct, app_config) = {
             let state = self.inner.lock().unwrap();
             let Some(route) = state.routes.get(index) else {
                 return false;
             };
-            (route.protocol, route.provider.clone(), state.config.clone())
+            (
+                route.protocol,
+                route.provider.clone(),
+                match route.protocol {
+                    Protocol::OpenAi => state.config.direct_codex,
+                    Protocol::Anthropic => state.config.direct_claude,
+                },
+                state.config.clone(),
+            )
         };
-        let model_notice = match config::sync_provider_models(&app_config, protocol, &provider) {
-            Ok(notice) => notice,
-            Err(error) => {
-                self.inner.lock().unwrap().last_error =
-                    Some(format!("同步目标模型配置失败: {error}"));
+        let model_notice = if direct {
+            if let Err(error) = config::sync_direct_provider(&app_config, protocol, &provider) {
+                self.inner.lock().unwrap().last_error = Some(format!(
+                    "同步{}直连 Provider 失败: {error}",
+                    protocol.label()
+                ));
                 return false;
+            }
+            None
+        } else {
+            match config::sync_provider_models(&app_config, protocol, &provider) {
+                Ok(notice) => notice,
+                Err(error) => {
+                    self.inner.lock().unwrap().last_error =
+                        Some(format!("同步目标模型配置失败: {error}"));
+                    return false;
+                }
             }
         };
         let mut state = self.inner.lock().unwrap();
@@ -447,6 +530,28 @@ impl AppState {
             state.config.selected_anthropic_provider = Some(provider);
         }
         state.last_switch_reason = Some(format!("{}：{}", protocol.label(), reason));
+        let selected_openai = state.config.selected_openai_provider.clone();
+        let selected_anthropic = state.config.selected_anthropic_provider.clone();
+        state.routes.retain(|route| {
+            !route.name.ends_with("（已从 CC-Switch 删除，仍在使用）")
+                || match route.protocol {
+                    Protocol::OpenAi => selected_openai.as_deref() == Some(route.provider.as_str()),
+                    Protocol::Anthropic => {
+                        selected_anthropic.as_deref() == Some(route.provider.as_str())
+                    }
+                }
+        });
+        state.active = selected_openai.as_deref().and_then(|provider| {
+            state
+                .routes
+                .iter()
+                .position(|route| route.protocol == Protocol::OpenAi && route.provider == provider)
+        });
+        state.active_anthropic = selected_anthropic.as_deref().and_then(|provider| {
+            state.routes.iter().position(|route| {
+                route.protocol == Protocol::Anthropic && route.provider == provider
+            })
+        });
         let path = state.config.state_dir.join("config.json");
         let saved = state.config.clone();
         drop(state);
@@ -485,15 +590,29 @@ impl AppState {
         match config::discover_routes(&config) {
             Ok(found) => {
                 let mut state = self.inner.lock().unwrap();
-                let old_openai = state
-                    .active
-                    .and_then(|i| state.routes.get(i))
-                    .map(|r| r.provider.clone());
-                let old_anthropic = state
+                let old_openai_route = state.active.and_then(|i| state.routes.get(i)).cloned();
+                let old_anthropic_route = state
                     .active_anthropic
                     .and_then(|i| state.routes.get(i))
-                    .map(|r| r.provider.clone());
+                    .cloned();
+                let old_openai = old_openai_route.as_ref().map(|r| r.provider.clone());
+                let old_anthropic = old_anthropic_route.as_ref().map(|r| r.provider.clone());
                 let mut routes = found.routes;
+                let mut retained_deleted = Vec::new();
+                for old in [old_openai_route, old_anthropic_route]
+                    .into_iter()
+                    .flatten()
+                {
+                    if !routes.iter().any(|route| {
+                        route.protocol == old.protocol && route.provider == old.provider
+                    }) {
+                        let mut retained = old;
+                        retained.name =
+                            format!("{}（已从 CC-Switch 删除，仍在使用）", retained.name);
+                        retained_deleted.push(retained.provider.clone());
+                        routes.push(retained);
+                    }
+                }
                 for route in &mut routes {
                     if let Some(old) = state.routes.iter().find(|old| {
                         old.protocol == route.protocol && old.provider == route.provider
@@ -528,6 +647,12 @@ impl AppState {
                 let actual_anthropic = active_anthropic
                     .and_then(|index| routes.get(index))
                     .map(|route| route.provider.clone());
+                let preferred_openai = active
+                    .and_then(|index| routes.get(index))
+                    .map(|route| route.base_url.clone());
+                let preferred_anthropic = active_anthropic
+                    .and_then(|index| routes.get(index))
+                    .map(|route| route.base_url.clone());
                 let selection_changed = state.config.selected_openai_provider != actual_openai
                     || state.config.selected_anthropic_provider != actual_anthropic;
                 state.active = active;
@@ -540,10 +665,27 @@ impl AppState {
                 state.last_error = None;
                 let path = state.config.state_dir.join("config.json");
                 let saved = state.config.clone();
+                let direct_sync = saved.direct_codex || saved.direct_claude;
                 drop(state);
+                if !retained_deleted.is_empty() {
+                    *self.config_change_notice.lock().unwrap() = Some(format!(
+                        "活动 Provider {} 已从 CC-Switch 删除；切换前继续使用最后有效配置",
+                        retained_deleted.join("、")
+                    ));
+                }
                 if selection_changed && let Err(error) = config::save(&path, &saved) {
                     self.inner.lock().unwrap().last_error =
                         Some(format!("修复上游选择失败: {error}"));
+                }
+                if direct_sync
+                    && let Err(error) = config::sync_all_with_targets(
+                        &saved,
+                        preferred_openai.as_deref(),
+                        preferred_anthropic.as_deref(),
+                    )
+                {
+                    self.inner.lock().unwrap().last_error =
+                        Some(format!("同步直连上游失败: {error}"));
                 }
             }
             Err(error) => self.inner.lock().unwrap().last_error = Some(error.to_string()),
@@ -576,7 +718,12 @@ impl AppState {
             } else {
                 state.active_anthropic
             };
-            if !state.config.auto_failover
+            let direct = match protocol {
+                Protocol::OpenAi => state.config.direct_codex,
+                Protocol::Anthropic => state.config.direct_claude,
+            };
+            if direct
+                || !state.config.auto_failover
                 || active != Some(failed)
                 || state.routes[failed].state != RouteHealth::Unavailable
             {
@@ -629,7 +776,7 @@ impl AppState {
                 &serde_json::to_vec_pretty(&snapshot)?,
             )?;
             let ini = format!(
-                "[status]\r\nstate={}\r\nactive_provider={}\r\nactive_host={}\r\nclaude_provider={}\r\nclaude_host={}\r\nlatency_ms={}\r\nscore={}\r\nauto_enabled={}\r\nheadroom_state={}\r\ninflight=0\r\nroute_count={}\r\nlast_error={}\r\n",
+                "[status]\r\nstate={}\r\nactive_provider={}\r\nactive_host={}\r\nclaude_provider={}\r\nclaude_host={}\r\nlatency_ms={}\r\nscore={}\r\nauto_enabled={}\r\nbypass_headroom={}\r\ndirect_codex={}\r\ndirect_claude={}\r\nheadroom_state={}\r\ninflight=0\r\nroute_count={}\r\nlast_error={}\r\n",
                 snapshot.state,
                 snapshot.active_name.as_deref().unwrap_or("--"),
                 snapshot.active_host.as_deref().unwrap_or("--"),
@@ -641,6 +788,9 @@ impl AppState {
                     .unwrap_or_default(),
                 snapshot.active_score,
                 snapshot.auto_enabled,
+                snapshot.bypass_headroom,
+                snapshot.direct_codex,
+                snapshot.direct_claude,
                 snapshot.headroom_state,
                 snapshot.routes.len().min(32),
                 snapshot.last_error.as_deref().unwrap_or("")
@@ -660,18 +810,19 @@ impl AppState {
         let state = self.inner.lock().unwrap();
         let openai = active_route(&state, Protocol::OpenAi);
         let anthropic = active_route(&state, Protocol::Anthropic);
+        let mode = format!(
+            "Codex {}；Claude {}",
+            mode_label(&state.config, Protocol::OpenAi),
+            mode_label(&state.config, Protocol::Anthropic)
+        );
         format!(
             "Headroom Route {}\r\n模式: {}\r\nCodex: {} [{}]\r\nClaude: {} [{}]\r\nCC-Switch: {} [{}]\r\nAgent: 127.0.0.1:{}\r\nHeadroom: 127.0.0.1:{} ({}, PID={})\r\n统计范围: {}\r\n压缩 Token: {} -> {}，节省 {} ({:.1}%)\r\n完成请求: {}，失败 {} ({:.1}%)\r\nCodex 上游: {}\r\nClaude 上游: {}\r\n路由数: {}\r\n自动切换: {}\r\n最近错误: {}\r\n恢复建议: {}",
             env!("CARGO_PKG_VERSION"),
-            if state.config.bypass_headroom {
-                "旁路 Headroom"
-            } else {
-                "经过 Headroom"
-            },
+            mode,
             state.config.codex_config.display(),
-            availability(openai, transport_ready(&state)),
+            availability(openai, transport_ready(&state, Protocol::OpenAi)),
             state.config.claude_settings.display(),
-            availability(anthropic, transport_ready(&state)),
+            availability(anthropic, transport_ready(&state, Protocol::Anthropic)),
             state.config.cc_switch_db.display(),
             yes(state.config.cc_switch_db.exists()),
             state.config.agent_port,
@@ -722,16 +873,21 @@ impl AppState {
             active_host: openai.map(Route::host),
             active_score: openai.map(|r| r.score).unwrap_or(0),
             latency_ms: openai.and_then(|r| r.latency_ms),
-            codex_availability: availability(openai, transport_ready(state)),
+            codex_availability: availability(openai, transport_ready(state, Protocol::OpenAi)),
             active_anthropic_provider: anthropic.map(|r| r.provider.clone()),
             active_anthropic_name: anthropic.map(|r| r.name.clone()),
             active_anthropic_url: anthropic.map(|r| r.base_url.clone()),
             active_anthropic_host: anthropic.map(Route::host),
             active_anthropic_score: anthropic.map(|r| r.score).unwrap_or(0),
             anthropic_latency_ms: anthropic.and_then(|r| r.latency_ms),
-            claude_availability: availability(anthropic, transport_ready(state)),
+            claude_availability: availability(
+                anthropic,
+                transport_ready(state, Protocol::Anthropic),
+            ),
             auto_enabled: state.config.auto_failover,
             bypass_headroom: state.config.bypass_headroom,
+            direct_codex: state.config.direct_codex,
+            direct_claude: state.config.direct_claude,
             headroom_state: state.headroom_state.clone(),
             headroom_pid: state.headroom_pid,
             headroom_metrics: state.headroom_metrics,
@@ -747,8 +903,28 @@ impl AppState {
     }
 }
 
-fn transport_ready(state: &RuntimeState) -> bool {
-    state.config.bypass_headroom || matches!(state.headroom_state.as_str(), "healthy" | "external")
+fn transport_ready(state: &RuntimeState, protocol: Protocol) -> bool {
+    let direct = match protocol {
+        Protocol::OpenAi => state.config.direct_codex,
+        Protocol::Anthropic => state.config.direct_claude,
+    };
+    direct
+        || state.config.bypass_headroom
+        || matches!(state.headroom_state.as_str(), "healthy" | "external")
+}
+
+fn mode_label(config: &AppConfig, protocol: Protocol) -> &'static str {
+    let direct = match protocol {
+        Protocol::OpenAi => config.direct_codex,
+        Protocol::Anthropic => config.direct_claude,
+    };
+    if direct {
+        "直连上游"
+    } else if config.bypass_headroom {
+        "旁路 Headroom"
+    } else {
+        "经过 Headroom"
+    }
 }
 
 fn availability(route: Option<&Route>, transport_ready: bool) -> &'static str {

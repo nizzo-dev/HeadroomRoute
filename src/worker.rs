@@ -108,7 +108,10 @@ fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
         let mut metrics = HeadroomMetrics::default();
         let routing_available = {
             let config = app.inner.lock().unwrap().config.clone();
-            config.bypass_headroom || runtime::find_valid_python(&config).is_some()
+            config.bypass_headroom
+                || config.direct_codex
+                || config.direct_claude
+                || runtime::find_valid_python(&config).is_some()
         };
         let watcher_config = app.inner.lock().unwrap().config.clone();
         let mut cc_switch_modified = watcher_config
@@ -139,10 +142,19 @@ fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
             }
             if routing_available && !app.sync_in_progress.load(Ordering::Acquire) {
                 let cfg = app.inner.lock().unwrap().config.clone();
-                let drifted = config::routing_drifted(&cfg);
+                let preferred_openai = app.active_url();
+                let preferred_anthropic = app.active_anthropic_url();
+                let drifted = config::routing_drifted_with_targets(
+                    &cfg,
+                    preferred_openai.as_deref(),
+                    preferred_anthropic.as_deref(),
+                );
                 if should_repair_drift(&mut routing_drift_active, drifted) {
-                    let preferred = app.active_url();
-                    let result = config::sync_all(&cfg, preferred.as_deref());
+                    let result = config::sync_all_with_targets(
+                        &cfg,
+                        preferred_openai.as_deref(),
+                        preferred_anthropic.as_deref(),
+                    );
                     let (ok, message) = match result {
                         Ok(_) => (
                             true,
@@ -170,10 +182,14 @@ fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
             {
                 cc_switch_modified = current_modified;
                 if provider_snapshot_changed(&mut cc_switch_providers, current) {
-                    *app.config_change_notice.lock().unwrap() = Some(
-                        "CC-Switch Provider 配置已变化；请从托盘执行“同步 Codex + Claude / CC-Switch”"
-                            .into(),
-                    );
+                    app.refresh_routes();
+                    let mut notice = app.config_change_notice.lock().unwrap();
+                    if notice.is_none() {
+                        *notice = Some(
+                            "CC-Switch Provider 定义已刷新；HeadroomRoute 活动上游保持独立控制"
+                                .into(),
+                        );
+                    }
                 }
             }
             let _ = app.write_status();
@@ -282,9 +298,7 @@ fn headroom_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
             let message = runtime::setup_instructions(&initial_config);
             let mut state = app.inner.lock().unwrap();
             state.headroom_state = "runtime-unavailable".into();
-            state.last_error = Some(message.clone());
-            drop(state);
-            *app.runtime_result.lock().unwrap() = Some((false, message));
+            state.last_error = Some(message);
             return;
         };
         let _config_guard = app.config_write_guard();

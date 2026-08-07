@@ -27,6 +27,10 @@ pub struct AppConfig {
     pub no_subscription_tracking: bool,
     pub use_system_proxy: bool,
     pub bypass_headroom: bool,
+    /// Apply the selected provider to Codex and bypass the local route agent.
+    pub direct_codex: bool,
+    /// Apply the selected provider to Claude Code and bypass the local agent.
+    pub direct_claude: bool,
     pub metrics_log_offset: u64,
     pub metrics_since: Option<DateTime<Utc>>,
     pub auto_check_updates: bool,
@@ -66,6 +70,8 @@ impl Default for AppConfig {
             no_subscription_tracking: true,
             use_system_proxy: true,
             bypass_headroom: false,
+            direct_codex: false,
+            direct_claude: false,
             metrics_log_offset: 0,
             metrics_since: None,
             auto_check_updates: true,
@@ -318,6 +324,8 @@ pub struct Snapshot {
     pub claude_availability: &'static str,
     pub auto_enabled: bool,
     pub bypass_headroom: bool,
+    pub direct_codex: bool,
+    pub direct_claude: bool,
     pub headroom_state: String,
     pub headroom_pid: Option<u32>,
     pub headroom_metrics: HeadroomMetrics,

@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use crate::{config, model::AppConfig, progress::ProgressWindow};
+use crate::{config, model::AppConfig, notification, progress::ProgressWindow};
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{
     StatusCode,
@@ -20,7 +20,7 @@ use std::{
 };
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_YESNO, MessageBoxW,
+    IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_YESNO, MessageBoxW,
 };
 use zip::ZipArchive;
 
@@ -78,7 +78,7 @@ pub fn start_interactive(owner: usize, config: AppConfig) -> bool {
                 owner as HWND,
                 "检查更新失败",
                 &format!("{error:#}"),
-                MB_OK | MB_ICONERROR,
+                MB_ICONERROR,
             );
         }
         RUNNING.store(false, Ordering::Release);
@@ -139,7 +139,7 @@ fn run_interactive(owner: HWND, config: &AppConfig) -> Result<()> {
             owner,
             "检查软件更新",
             &format!("当前 v{} 已是最新正式版。", env!("CARGO_PKG_VERSION")),
-            MB_OK | MB_ICONINFORMATION,
+            MB_ICONINFORMATION,
         );
         return Ok(());
     };
@@ -193,7 +193,7 @@ fn run_interactive(owner: HWND, config: &AppConfig) -> Result<()> {
             owner,
             "下载已取消",
             "更新没有安装，现有程序和设置未发生变化。",
-            MB_OK | MB_ICONINFORMATION,
+            MB_ICONINFORMATION,
         );
         return Ok(());
     };
@@ -553,7 +553,15 @@ fn format_bytes(value: u64) -> String {
 }
 
 fn show_message(owner: HWND, title: &str, text: &str, flags: u32) -> i32 {
-    unsafe { MessageBoxW(owner, wide(text).as_ptr(), wide(title).as_ptr(), flags) }
+    if flags & MB_YESNO != 0 {
+        return unsafe { MessageBoxW(owner, wide(text).as_ptr(), wide(title).as_ptr(), flags) };
+    }
+    if flags & MB_ICONERROR != 0 {
+        notification::error(title, text);
+    } else {
+        notification::info(title, text);
+    }
+    0
 }
 
 fn wide(value: &str) -> Vec<u16> {
