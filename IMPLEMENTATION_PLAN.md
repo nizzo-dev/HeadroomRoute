@@ -158,8 +158,8 @@
 ## 11. CLI 确认悬浮窗
 
 - 状态：`已完成`
-- 目标：Claude Code CLI 和 Codex CLI 等待确认时，在 Windows 桌面顶部显示可直接操作的拒绝/允许一次悬浮窗。
-- 设计约束：ConPTY 保持真实终端交互；本地命名管道只传递有界的确认摘要；最多排队 8 个请求；30 秒无操作自动取消；不保存完整终端输出；不使用全局模拟键盘；请求超时、队列满和托盘不可用均默认拒绝。
+- 目标：Claude Code CLI 和 Codex CLI 等待确认时，在 Windows 桌面顶部提供原生语义的拒绝并反馈、允许一次和允许此类命令操作。
+- 设计约束：ConPTY 保持真实终端交互；活动标签页保留原生确认，后台标签页延迟 3 秒提醒；请求无限等待明确选择；最多跟踪 32 个请求；不保存完整终端输出；不使用全局模拟键盘；队列满和托盘不可用时回退原生 CLI 交互。
 - 已完成：独立控制台 `HeadroomRouteCLI.exe` wrapper、命名管道 broker、原生 TopMost/NoActivate 悬浮窗、托盘演示入口、请求队列和超时模型；0.6.9 增加结构化 CLI 提示解析、确认期间输入隔离、CLI 退出撤销、当前显示器定位、操作详情及实时倒计时。后台发现 Headroom 环境缺失时只更新托盘状态，不再弹出与当前 CLI 操作无关的通知。
 - 完成日期：2026-08-05
 - 验证记录：0.6.9 两个二进制共 67 项测试通过，包含 Claude 工作区信任提示不被误判、Ctrl+C 不终止 wrapper、Codex VT 私有模式复位的回归覆盖；进程级中断测试确认子 CLI 返回 Ctrl+C 状态后 wrapper 能完成 ConPTY 排空并正常退出；`cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、release 编译、命名管道 IPC 测试及主程序/CLI 的安装升级与失败回退测试通过；本机 Claude Code 2.1.218 和 Codex CLI 0.146.0 的前台版本命令通过；`Build.ps1` 已生成版本化 EXE、CLI EXE、ZIP 和校验文件并完成 SHA-256 复核。

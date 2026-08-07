@@ -48,20 +48,20 @@ use windows_sys::Win32::{
             UpdateProcThreadAttribute, WaitForSingleObject,
         },
     },
-    UI::WindowsAndMessaging::{PostMessageW, WM_APP},
+    UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, GetForegroundWindow, PostMessageW, WM_APP},
 };
 
 pub const WM_APPROVAL: u32 = WM_APP + 7;
 
 const PIPE_NAME: &str = r"\\.\pipe\HeadroomRouteApproval-v1";
 const MAX_MESSAGE_BYTES: usize = 8 * 1024;
-const MAX_PENDING_REQUESTS: usize = 8;
-const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_PENDING_REQUESTS: usize = 32;
 const CHILD_SCREEN_WIDTH: i16 = 120;
 const CHILD_SCREEN_HEIGHT: i16 = 40;
 const GENERIC_READ_FLAG: u32 = 0x8000_0000;
 const GENERIC_WRITE_FLAG: u32 = 0x4000_0000;
 const PIPE_ACCESS_DUPLEX_FLAG: u32 = 0x0000_0003;
+const BACKGROUND_REMINDER_DELAY: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug)]
 pub struct ApprovalRequest {
@@ -71,16 +71,12 @@ pub struct ApprovalRequest {
     pub cwd: String,
     pub action: String,
     pub summary: String,
-    pub expires_at: Instant,
-}
-
-impl ApprovalRequest {
-    pub fn remaining_secs(&self) -> u64 {
-        self.expires_at
-            .saturating_duration_since(Instant::now())
-            .as_secs()
-            .saturating_add(1)
-    }
+    pub allow_rule: bool,
+    pub feedback: bool,
+    pub source_window: u64,
+    pub focus_known: bool,
+    pub focused: bool,
+    pub demo: bool,
 }
 
 impl ConfirmationPrompt {
@@ -107,6 +103,18 @@ struct WireRequest {
     action: String,
     #[serde(default)]
     summary: String,
+    #[serde(default)]
+    allow_rule: bool,
+    #[serde(default)]
+    feedback: bool,
+    #[serde(default)]
+    source_window: u64,
+    #[serde(default)]
+    focus_known: bool,
+    #[serde(default)]
+    focused: bool,
+    #[serde(default)]
+    demo: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,6 +122,8 @@ struct ConfirmationPrompt {
     action: String,
     summary: String,
     approve_answer: &'static str,
+    allow_rule_answer: Option<&'static str>,
+    feedback_answer: Option<&'static str>,
     deny_answer: &'static str,
 }
 
@@ -126,9 +136,18 @@ struct WireResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ApprovalDecision {
     Approved,
+    ApprovedAlways,
+    Feedback,
     Denied,
     Cancelled,
-    TimedOut,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalChoice {
+    Deny,
+    AllowOnce,
+    AllowRule,
+    Feedback,
 }
 
 struct Waiter {
@@ -151,25 +170,17 @@ impl Waiter {
 
     fn wait(&self) -> ApprovalDecision {
         let mut result = self.result.lock().unwrap();
-        let deadline = Instant::now() + APPROVAL_TIMEOUT;
         while result.is_none() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            let (guard, timeout) = self.ready.wait_timeout(result, remaining).unwrap();
-            result = guard;
-            if timeout.timed_out() {
-                break;
-            }
+            result = self.ready.wait(result).unwrap();
         }
-        result.unwrap_or(ApprovalDecision::TimedOut)
+        result.expect("approval waiter must be resolved")
     }
 }
 
 struct PendingRequest {
     request: ApprovalRequest,
     waiter: Option<Arc<Waiter>>,
+    background_since: Option<Instant>,
 }
 
 struct BrokerState {
@@ -295,35 +306,89 @@ pub fn clear_tray_hwnd(hwnd: windows_sys::Win32::Foundation::HWND) {
 }
 
 pub fn next_request() -> Option<ApprovalRequest> {
-    expire_requests();
     let broker = broker();
     let mut state = broker.state.lock().unwrap();
-    while let Some(id) = state.queue.pop_front() {
-        if let Some(pending) = state.pending.get(&id) {
+    let live = state
+        .pending
+        .keys()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    state.queue.retain(|id| live.contains(id));
+    let ids = state.queue.iter().copied().collect::<Vec<_>>();
+    for id in ids {
+        if let Some(pending) = state.pending.get_mut(&id)
+            && update_request_visibility(pending)
+        {
             return Some(pending.request.clone());
         }
     }
     None
 }
 
+pub fn should_show(id: u64) -> bool {
+    broker()
+        .state
+        .lock()
+        .unwrap()
+        .pending
+        .get_mut(&id)
+        .is_some_and(update_request_visibility)
+}
+
+fn update_request_visibility(pending: &mut PendingRequest) -> bool {
+    if pending.request.demo {
+        return true;
+    }
+    let foreground = unsafe { GetForegroundWindow() };
+    let foreground_root = if foreground.is_null() {
+        0
+    } else {
+        (unsafe { GetAncestor(foreground, GA_ROOT) }) as usize as u64
+    };
+    let background = pending.request.source_window == 0
+        || foreground_root != pending.request.source_window
+        || !pending.request.focus_known
+        || !pending.request.focused;
+    if !background {
+        pending.background_since = None;
+        return false;
+    }
+    let since = pending.background_since.get_or_insert_with(Instant::now);
+    since.elapsed() >= BACKGROUND_REMINDER_DELAY
+}
+
 pub fn is_pending(id: u64) -> bool {
-    expire_requests();
     broker().state.lock().unwrap().pending.contains_key(&id)
 }
 
 pub fn pending_count() -> usize {
-    expire_requests();
     broker().state.lock().unwrap().pending.len()
 }
 
-pub fn resolve(id: u64, approved: bool) -> bool {
+pub fn request_position(id: u64) -> (usize, usize) {
+    let state = broker().state.lock().unwrap();
+    let live = state
+        .queue
+        .iter()
+        .filter(|queued| state.pending.contains_key(queued))
+        .copied()
+        .collect::<Vec<_>>();
+    let position = live
+        .iter()
+        .position(|queued| *queued == id)
+        .map_or(1, |index| index + 1);
+    (position, live.len().max(1))
+}
+
+pub fn resolve(id: u64, choice: ApprovalChoice) -> bool {
     let pending = broker().state.lock().unwrap().pending.remove(&id);
     let Some(pending) = pending else { return false };
     if let Some(waiter) = pending.waiter {
-        waiter.resolve(if approved {
-            ApprovalDecision::Approved
-        } else {
-            ApprovalDecision::Denied
+        waiter.resolve(match choice {
+            ApprovalChoice::Deny => ApprovalDecision::Denied,
+            ApprovalChoice::AllowOnce => ApprovalDecision::Approved,
+            ApprovalChoice::AllowRule => ApprovalDecision::ApprovedAlways,
+            ApprovalChoice::Feedback => ApprovalDecision::Feedback,
         });
     }
     broker().notify_ui();
@@ -355,6 +420,25 @@ fn cancel_pid(pid: u32) -> usize {
     count
 }
 
+fn update_pid_focus(pid: u32, focused: bool) -> usize {
+    let broker = broker();
+    let mut state = broker.state.lock().unwrap();
+    let mut count = 0;
+    for pending in state.pending.values_mut() {
+        if pending.request.pid == pid {
+            pending.request.focus_known = true;
+            pending.request.focused = focused;
+            pending.background_since = None;
+            count += 1;
+        }
+    }
+    drop(state);
+    if count > 0 {
+        broker.notify_ui();
+    }
+    count
+}
+
 pub fn enqueue_demo() -> bool {
     enqueue(
         "演示".into(),
@@ -365,6 +449,12 @@ pub fn enqueue_demo() -> bool {
             .unwrap_or_default(),
         "git status".into(),
         "请求执行：git status（这是演示请求，不会执行任何命令）".into(),
+        false,
+        false,
+        0,
+        false,
+        false,
+        true,
         None,
     )
     .is_some()
@@ -375,6 +465,9 @@ fn request_approval(
     pid: u32,
     cwd: &str,
     prompt: &ConfirmationPrompt,
+    source_window: u64,
+    focus_known: bool,
+    focused: bool,
 ) -> ApprovalDecision {
     approval_trace("requesting popup decision");
     let mut stream = match connect_pipe() {
@@ -395,6 +488,12 @@ fn request_approval(
         cwd: clamp_text(cwd, 260),
         action: clamp_text(&prompt.action, 300),
         summary: clamp_text(&prompt.summary, 900),
+        allow_rule: prompt.allow_rule_answer.is_some(),
+        feedback: prompt.feedback_answer.is_some(),
+        source_window,
+        focus_known,
+        focused,
+        demo: false,
     };
     let Ok(mut body) = serde_json::to_vec(&payload) else {
         return ApprovalDecision::Cancelled;
@@ -416,7 +515,8 @@ fn request_approval(
         .map(|response| match response.reason.as_str() {
             "approved" if response.approved => ApprovalDecision::Approved,
             "denied" => ApprovalDecision::Denied,
-            "timed_out" => ApprovalDecision::TimedOut,
+            "approved_always" if response.approved => ApprovalDecision::ApprovedAlways,
+            "feedback" => ApprovalDecision::Feedback,
             _ => ApprovalDecision::Cancelled,
         })
         .unwrap_or(ApprovalDecision::Cancelled);
@@ -424,15 +524,21 @@ fn request_approval(
     decision
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enqueue(
     cli: String,
     pid: u32,
     cwd: String,
     action: String,
     summary: String,
+    allow_rule: bool,
+    feedback: bool,
+    source_window: u64,
+    focus_known: bool,
+    focused: bool,
+    demo: bool,
     waiter: Option<Arc<Waiter>>,
 ) -> Option<ApprovalRequest> {
-    expire_requests();
     let broker = broker();
     let mut state = broker.state.lock().unwrap();
     if state.pending.len() >= MAX_PENDING_REQUESTS {
@@ -441,7 +547,6 @@ fn enqueue(
         }
         return None;
     }
-    let now = Instant::now();
     let request = ApprovalRequest {
         id: broker.next_id.fetch_add(1, Ordering::Relaxed),
         cli: clamp_text(&cli, 32),
@@ -449,7 +554,12 @@ fn enqueue(
         cwd: clamp_text(&cwd, 260),
         action: clamp_text(&action, 300),
         summary: clamp_text(&summary, 900),
-        expires_at: now + APPROVAL_TIMEOUT,
+        allow_rule,
+        feedback,
+        source_window,
+        focus_known,
+        focused,
+        demo,
     };
     state.queue.push_back(request.id);
     state.pending.insert(
@@ -457,33 +567,12 @@ fn enqueue(
         PendingRequest {
             request: request.clone(),
             waiter,
+            background_since: None,
         },
     );
     drop(state);
     broker.notify_ui();
     Some(request)
-}
-
-fn expire_requests() {
-    let broker = broker();
-    let now = Instant::now();
-    let mut expired = Vec::new();
-    {
-        let mut state = broker.state.lock().unwrap();
-        let ids: Vec<u64> = state
-            .pending
-            .iter()
-            .filter_map(|(id, pending)| (pending.request.expires_at <= now).then_some(*id))
-            .collect();
-        for id in ids {
-            if let Some(pending) = state.pending.remove(&id) {
-                expired.push(pending.waiter);
-            }
-        }
-    }
-    for waiter in expired.into_iter().flatten() {
-        waiter.resolve(ApprovalDecision::TimedOut);
-    }
 }
 
 impl Broker {
@@ -653,6 +742,11 @@ fn handle_pipe(pipe: isize) {
         let _ = write_reason(&mut stream, false, "cancelled");
         return;
     }
+    if request.kind == "focus_update" {
+        update_pid_focus(request.pid, request.focused);
+        let _ = write_reason(&mut stream, false, "focus_updated");
+        return;
+    }
     let waiter = Arc::new(Waiter::new());
     let Some(enqueued) = enqueue(
         request.cli,
@@ -660,6 +754,12 @@ fn handle_pipe(pipe: isize) {
         request.cwd,
         request.action,
         request.summary,
+        request.allow_rule,
+        request.feedback,
+        request.source_window,
+        request.focus_known,
+        request.focused,
+        request.demo,
         Some(waiter.clone()),
     ) else {
         let _ = write_reason(&mut stream, false, "queue_full");
@@ -674,7 +774,7 @@ fn handle_pipe(pipe: isize) {
 }
 
 fn valid_wire_request(request: &WireRequest) -> bool {
-    (request.kind == "cancel_pid" && request.pid > 0)
+    ((request.kind == "cancel_pid" || request.kind == "focus_update") && request.pid > 0)
         || (request.kind == "approval_request"
             && !request.cli.trim().is_empty()
             && request.pid > 0
@@ -693,6 +793,12 @@ fn cancel_remote_requests(pid: u32) {
         cwd: String::new(),
         action: String::new(),
         summary: String::new(),
+        allow_rule: false,
+        feedback: false,
+        source_window: 0,
+        focus_known: false,
+        focused: false,
+        demo: false,
     };
     let Ok(mut body) = serde_json::to_vec(&payload) else {
         return;
@@ -705,9 +811,10 @@ fn cancel_remote_requests(pid: u32) {
 fn write_response(stream: &mut File, decision: ApprovalDecision) -> io::Result<()> {
     let (approved, reason) = match decision {
         ApprovalDecision::Approved => (true, "approved"),
+        ApprovalDecision::ApprovedAlways => (true, "approved_always"),
+        ApprovalDecision::Feedback => (false, "feedback"),
         ApprovalDecision::Denied => (false, "denied"),
         ApprovalDecision::Cancelled => (false, "cancelled"),
-        ApprovalDecision::TimedOut => (false, "timed_out"),
     };
     write_reason(stream, approved, reason)
 }
@@ -755,6 +862,9 @@ struct InputSink {
     next_approval_token: AtomicU64,
     active_approval_token: AtomicU64,
     pid: u32,
+    source_window: u64,
+    focus_known: AtomicBool,
+    focused: AtomicBool,
 }
 
 impl InputSink {
@@ -794,8 +904,10 @@ impl InputSink {
         }
         let answer = match decision {
             ApprovalDecision::Approved => Some(prompt.approve_answer),
+            ApprovalDecision::ApprovedAlways => prompt.allow_rule_answer,
+            ApprovalDecision::Feedback => prompt.feedback_answer,
             ApprovalDecision::Denied => Some(prompt.deny_answer),
-            ApprovalDecision::Cancelled | ApprovalDecision::TimedOut => None,
+            ApprovalDecision::Cancelled => None,
         };
         if let Some(answer) = answer {
             let _ = self.write(answer.as_bytes());
@@ -810,6 +922,21 @@ impl InputSink {
                 .spawn(move || cancel_remote_requests(pid));
         }
         self.write(bytes)
+    }
+
+    fn observe_focus(&self, bytes: &[u8]) -> Option<bool> {
+        let focused = match bytes {
+            b"\x1b[I" => true,
+            b"\x1b[O" => false,
+            _ => return None,
+        };
+        self.focus_known.store(true, Ordering::Release);
+        self.focused.store(focused, Ordering::Release);
+        let pid = self.pid;
+        let _ = thread::Builder::new()
+            .name("headroom-focus-update".into())
+            .spawn(move || update_remote_focus(pid, focused));
+        Some(focused)
     }
 
     fn close(&self) {
@@ -836,6 +963,7 @@ pub fn run_cli_command(args: &[String]) -> Result<i32> {
     if !ensure_server() {
         eprintln!("HeadroomRoute：确认托盘未能启动，确认请求将自动取消");
     }
+    let source_window = foreground_root_window();
     let cwd = std::env::current_dir().context("无法读取当前工作目录")?;
     let command_line = build_command_line(&cli, &args[1..]);
     let spawned = SpawnedConsole::spawn(&command_line, cwd.to_string_lossy().as_ref())?;
@@ -845,6 +973,9 @@ pub fn run_cli_command(args: &[String]) -> Result<i32> {
         next_approval_token: AtomicU64::new(1),
         active_approval_token: AtomicU64::new(0),
         pid: child_pid,
+        source_window,
+        focus_known: AtomicBool::new(source_window != 0),
+        focused: AtomicBool::new(source_window != 0),
     });
     let reader_input = input.clone();
     let reader_cli = cli.clone();
@@ -869,6 +1000,7 @@ pub fn run_cli_command(args: &[String]) -> Result<i32> {
         .spawn(move || resize_pseudo_console_loop(spawned.console, resize_stop_thread))
         .ok();
 
+    let _ = write_cli_output(b"\x1b[?1004h");
     let stdin_input = input.clone();
     let _ = thread::Builder::new()
         .name("headroom-cli-input".into())
@@ -897,8 +1029,10 @@ pub fn run_cli_command(args: &[String]) -> Result<i32> {
         Err(_) => Some(anyhow::anyhow!("CLI 输出线程异常退出")),
     };
     if let Some(error) = output_error {
+        let _ = write_cli_output(b"\x1b[?1004l");
         return Err(error.context("转发 CLI 输出失败"));
     }
+    let _ = write_cli_output(b"\x1b[?1004l");
     Ok((exit_code & 0xff) as i32)
 }
 
@@ -940,6 +1074,9 @@ fn read_cli_output(
                                 pid,
                                 &approval_cwd,
                                 &approval_prompt,
+                                approval_input.source_window,
+                                approval_input.focus_known.load(Ordering::Acquire),
+                                approval_input.focused.load(Ordering::Acquire),
                             );
                             approval_input.finish_approval(token, decision, &approval_prompt);
                         });
@@ -1064,7 +1201,13 @@ fn forward_stdin(input: Arc<InputSink>) {
         if read == 0 {
             return;
         }
-        if input.write_user_input(&buffer[..read]).is_err() {
+        let bytes = &buffer[..read];
+        let result = if input.observe_focus(bytes).is_some() {
+            input.write(bytes)
+        } else {
+            input.write_user_input(bytes)
+        };
+        if result.is_err() {
             return;
         }
     }
@@ -1303,11 +1446,14 @@ fn confirmation_prompt(cli: &str, text: &str) -> Option<ConfirmationPrompt> {
         return None;
     }
     let summary = prompt_summary(&cleaned);
-    let (approve_answer, deny_answer) = confirmation_answers(&summary);
+    let (approve_answer, allow_rule_answer, feedback_answer, deny_answer) =
+        confirmation_answers(&summary);
     Some(ConfirmationPrompt {
         action: extract_prompt_action(text, cli),
         summary,
         approve_answer,
+        allow_rule_answer,
+        feedback_answer,
         deny_answer,
     })
 }
@@ -1371,22 +1517,58 @@ fn contains_word(text: &str, word: &str) -> bool {
         .any(|token| token == word)
 }
 
-fn confirmation_answers(summary: &str) -> (&'static str, &'static str) {
+fn confirmation_answers(
+    summary: &str,
+) -> (
+    &'static str,
+    Option<&'static str>,
+    Option<&'static str>,
+    &'static str,
+) {
     let lower = summary.to_ascii_lowercase();
     if lower.contains("1.") && (lower.contains("yes") || lower.contains("allow")) {
-        let deny = if lower.contains("3.")
-            && ["no", "deny", "reject", "cancel"]
+        let allow_rule = (lower.contains("2.")
+            && ["always", "don't ask", "do not ask", "again"]
                 .iter()
-                .any(|word| lower.contains(word))
-        {
-            "3\n"
-        } else {
-            "2\n"
-        };
-        ("1\n", deny)
+                .any(|word| lower.contains(word)))
+        .then_some("2\n");
+        let feedback = (lower.contains("3.")
+            && lower.contains("tell")
+            && ["different", "instead", "feedback"]
+                .iter()
+                .any(|word| lower.contains(word)))
+        .then_some("3\n");
+        let deny = if lower.contains("3.") { "3\n" } else { "2\n" };
+        ("1\n", allow_rule, feedback, deny)
     } else {
-        ("y\n", "n\n")
+        ("y\n", None, None, "n\n")
     }
+}
+
+fn update_remote_focus(pid: u32, focused: bool) {
+    let Ok(mut stream) = connect_pipe() else {
+        return;
+    };
+    let payload = WireRequest {
+        kind: "focus_update".into(),
+        cli: String::new(),
+        pid,
+        cwd: String::new(),
+        action: String::new(),
+        summary: String::new(),
+        allow_rule: false,
+        feedback: false,
+        source_window: 0,
+        focus_known: true,
+        focused,
+        demo: false,
+    };
+    let Ok(mut body) = serde_json::to_vec(&payload) else {
+        return;
+    };
+    body.push(b'\n');
+    let _ = stream.write_all(&body);
+    let _ = stream.flush();
 }
 
 fn strip_ansi(value: &str) -> String {
@@ -1427,6 +1609,15 @@ fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
 
+fn foreground_root_window() -> u64 {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_null() {
+        0
+    } else {
+        (unsafe { GetAncestor(foreground, GA_ROOT) }) as usize as u64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1436,7 +1627,10 @@ mod tests {
     };
     use std::{
         io::{BufRead, BufReader, Write},
-        sync::{Mutex, atomic::AtomicU64},
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, AtomicU64},
+        },
         time::Duration,
     };
     use windows_sys::Win32::System::Console::COORD;
@@ -1512,11 +1706,16 @@ mod tests {
             next_approval_token: AtomicU64::new(1),
             active_approval_token: AtomicU64::new(0),
             pid: 1,
+            source_window: 0,
+            focus_known: AtomicBool::new(false),
+            focused: AtomicBool::new(false),
         };
         let prompt = ConfirmationPrompt {
             action: "git status".into(),
             summary: "Would you like to allow this command? Yes / No".into(),
             approve_answer: "y\n",
+            allow_rule_answer: None,
+            feedback_answer: None,
             deny_answer: "n\n",
         };
         let token = sink.begin_approval();
@@ -1541,8 +1740,22 @@ mod tests {
     #[test]
     fn selects_first_or_last_numbered_permission_option() {
         let prompt = "1. Yes, allow once 2. Yes always 3. No";
-        assert_eq!(confirmation_answers(prompt), ("1\n", "3\n"));
-        assert_eq!(confirmation_answers("Proceed? (y/n)"), ("y\n", "n\n"));
+        assert_eq!(
+            confirmation_answers(prompt),
+            ("1\n", Some("2\n"), None, "3\n")
+        );
+        assert_eq!(
+            confirmation_answers("Proceed? (y/n)"),
+            ("y\n", None, None, "n\n")
+        );
+    }
+
+    #[test]
+    fn exposes_native_allow_rule_and_feedback_answers() {
+        let answers = confirmation_answers(
+            "1. Yes, allow once 2. Yes, and don't ask again 3. No, and tell Codex what to do differently",
+        );
+        assert_eq!(answers, ("1\n", Some("2\n"), Some("3\n"), "3\n"));
     }
 
     #[test]

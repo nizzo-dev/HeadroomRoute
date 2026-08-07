@@ -1,6 +1,6 @@
 #![cfg(windows)]
 use crate::{
-    approval::{self, ApprovalRequest},
+    approval::{self, ApprovalChoice, ApprovalRequest},
     config,
     model::{FailoverPolicy, Protocol, Route, Snapshot},
     notification, runtime,
@@ -28,9 +28,9 @@ use windows_sys::Win32::{
         BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW,
         CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen, CreateRoundRectRgn,
         CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH, DT_CENTER,
-        DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_VCENTER,
-        DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, FF_DONTCARE, FW_NORMAL,
-        FW_SEMIBOLD, FillRect, GetMonitorInfoW, GetStockObject, GetSysColorBrush, InvalidateRect,
+        DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, DT_VCENTER, DT_WORDBREAK,
+        DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD,
+        FillRect, GetMonitorInfoW, GetStockObject, GetSysColorBrush, InvalidateRect,
         MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
         PS_SOLID, RoundRect, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
         SetWindowRgn, TRANSPARENT,
@@ -127,6 +127,7 @@ enum ApprovalPhase {
 enum ApprovalHit {
     None,
     Deny,
+    Rule,
     Allow,
 }
 
@@ -146,7 +147,6 @@ struct ApprovalVisual {
     animation_from_width: i32,
     animation_from_height: i32,
     animation_from_alpha: u8,
-    last_remaining: u64,
     hover: ApprovalHit,
     title_font: usize,
     body_font: usize,
@@ -2434,7 +2434,7 @@ unsafe fn refresh_approval_popup() {
     let current_id =
         APPROVAL_REQUEST.with(|request| request.borrow().as_ref().map(|request| request.id));
     if let Some(id) = current_id {
-        if !approval::is_pending(id) {
+        if !approval::is_pending(id) || !approval::should_show(id) {
             unsafe { begin_approval_close() };
         } else {
             unsafe { update_approval_countdown() };
@@ -2486,7 +2486,6 @@ unsafe fn refresh_approval_popup() {
             animation_from_width: compact_width,
             animation_from_height: compact_height,
             animation_from_alpha: 175,
-            last_remaining: 0,
             hover: ApprovalHit::None,
             title_font: 0,
             body_font: 0,
@@ -2521,7 +2520,7 @@ unsafe fn refresh_approval_popup() {
     if popup.is_null() {
         let id = APPROVAL_REQUEST.with(|slot| slot.borrow().as_ref().map(|request| request.id));
         if let Some(id) = id {
-            approval::resolve(id, false);
+            approval::resolve(id, ApprovalChoice::Deny);
         }
         APPROVAL_REQUEST.with(|slot| *slot.borrow_mut() = None);
         APPROVAL_VISUAL.with(|slot| *slot.borrow_mut() = None);
@@ -2749,32 +2748,7 @@ unsafe fn advance_approval_animation(hwnd: HWND) {
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn update_approval_countdown() {
-    let Some(remaining) =
-        APPROVAL_REQUEST.with(|slot| slot.borrow().as_ref().map(ApprovalRequest::remaining_secs))
-    else {
-        return;
-    };
-    let popup = APPROVAL_POPUP.with(Cell::get);
-    if popup.is_null() {
-        return;
-    }
-    let changed = APPROVAL_VISUAL.with(|slot| {
-        let mut visual = slot.borrow_mut();
-        let Some(visual) = visual.as_mut() else {
-            return false;
-        };
-        if visual.last_remaining == remaining {
-            false
-        } else {
-            visual.last_remaining = remaining;
-            true
-        }
-    });
-    if changed {
-        InvalidateRect(popup, ptr::null(), 0);
-    }
-}
+unsafe fn update_approval_countdown() {}
 
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn hide_approval_popup() {
@@ -2792,10 +2766,10 @@ unsafe fn hide_approval_popup() {
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn resolve_approval_popup(hwnd: HWND, approved: bool) {
+unsafe fn resolve_approval_popup(hwnd: HWND, choice: ApprovalChoice) {
     let id = APPROVAL_REQUEST.with(|slot| slot.borrow().as_ref().map(|request| request.id));
     if let Some(id) = id {
-        approval::resolve(id, approved);
+        approval::resolve(id, choice);
     }
     unsafe { begin_approval_close() };
     let _ = hwnd;
@@ -2815,12 +2789,6 @@ unsafe extern "system" fn approval_window_proc(
                     visual.title_font = create_approval_font(16, FW_SEMIBOLD as i32, visual.dpi);
                     visual.body_font = create_approval_font(14, FW_NORMAL as i32, visual.dpi);
                     visual.small_font = create_approval_font(12, FW_NORMAL as i32, visual.dpi);
-                    visual.last_remaining = APPROVAL_REQUEST.with(|request| {
-                        request
-                            .borrow()
-                            .as_ref()
-                            .map_or(0, ApprovalRequest::remaining_secs)
-                    });
                 }
             });
             0
@@ -2870,19 +2838,41 @@ unsafe extern "system" fn approval_window_proc(
         }
         WM_LBUTTONUP => {
             let hit = approval_hit_test(hwnd, lparam);
-            if hit == ApprovalHit::Allow || hit == ApprovalHit::Deny {
-                unsafe { resolve_approval_popup(hwnd, hit == ApprovalHit::Allow) };
+            if matches!(
+                hit,
+                ApprovalHit::Allow | ApprovalHit::Rule | ApprovalHit::Deny
+            ) {
+                let choice = match hit {
+                    ApprovalHit::Allow => ApprovalChoice::AllowOnce,
+                    ApprovalHit::Rule => ApprovalChoice::AllowRule,
+                    ApprovalHit::Deny => APPROVAL_REQUEST.with(|slot| {
+                        if slot
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|request| request.feedback)
+                        {
+                            ApprovalChoice::Feedback
+                        } else {
+                            ApprovalChoice::Deny
+                        }
+                    }),
+                    ApprovalHit::None => ApprovalChoice::Deny,
+                };
+                unsafe { resolve_approval_popup(hwnd, choice) };
             }
             0
         }
         WM_CLOSE => {
-            unsafe { resolve_approval_popup(hwnd, false) };
+            unsafe { resolve_approval_popup(hwnd, ApprovalChoice::Deny) };
             0
         }
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_SETCURSOR => {
             let hit = approval_hit_test_screen(hwnd);
-            if hit == ApprovalHit::Allow || hit == ApprovalHit::Deny {
+            if matches!(
+                hit,
+                ApprovalHit::Allow | ApprovalHit::Rule | ApprovalHit::Deny
+            ) {
                 SetCursor(LoadCursorW(ptr::null_mut(), IDC_HAND));
             } else {
                 SetCursor(LoadCursorW(ptr::null_mut(), IDC_ARROW));
@@ -2968,8 +2958,17 @@ unsafe fn approval_hit_test_point(hwnd: HWND, x: i32, y: i32) -> ApprovalHit {
     let dpi = APPROVAL_VISUAL.with(|slot| slot.borrow().as_ref().map_or(96, |visual| visual.dpi));
     let deny = approval_deny_rect(width, height, dpi);
     let allow = approval_allow_rect(width, height, dpi);
+    let rule = approval_rule_rect(width, height, dpi);
     if point_in_rect(allow, x, y) {
         ApprovalHit::Allow
+    } else if point_in_rect(rule, x, y)
+        && APPROVAL_REQUEST.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|request| request.allow_rule)
+        })
+    {
+        ApprovalHit::Rule
     } else if point_in_rect(deny, x, y) {
         ApprovalHit::Deny
     } else {
@@ -2983,18 +2982,46 @@ fn point_in_rect(rect: RECT, x: i32, y: i32) -> bool {
 
 fn approval_deny_rect(width: i32, height: i32, dpi: u32) -> RECT {
     let scale = |value: i32| approval_scale(value, dpi);
+    let three = APPROVAL_REQUEST.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|request| request.allow_rule)
+    });
     RECT {
-        left: width - scale(218),
+        left: if three { scale(18) } else { width - scale(218) },
         top: height - scale(56),
-        right: width - scale(122),
+        right: if three {
+            scale(160)
+        } else {
+            width - scale(122)
+        },
+        bottom: height - scale(18),
+    }
+}
+
+fn approval_rule_rect(width: i32, height: i32, dpi: u32) -> RECT {
+    let scale = |value: i32| approval_scale(value, dpi);
+    RECT {
+        left: scale(166),
+        top: height - scale(56),
+        right: width - scale(166),
         bottom: height - scale(18),
     }
 }
 
 fn approval_allow_rect(width: i32, height: i32, dpi: u32) -> RECT {
     let scale = |value: i32| approval_scale(value, dpi);
+    let three = APPROVAL_REQUEST.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|request| request.allow_rule)
+    });
     RECT {
-        left: width - scale(112),
+        left: if three {
+            width - scale(160)
+        } else {
+            width - scale(112)
+        },
         top: height - scale(56),
         right: width - scale(18),
         bottom: height - scale(18),
@@ -3080,33 +3107,26 @@ unsafe fn draw_approval_contents(
         approval_rgb(255, 165, 87)
     };
     draw_circle(dc, scale(22), scale(22), scale(7), accent);
-    let title = format!("{} 需要确认", request.cli.to_uppercase());
+    let (position, total) = approval::request_position(request.id);
+    let title = format!(
+        "{} · 会话 {:04} · 请求 {}/{}",
+        request.cli.to_uppercase(),
+        request.pid % 10_000,
+        position,
+        total
+    );
     draw_approval_text(
         dc,
         &title,
         RECT {
             left: scale(38),
             top: scale(12),
-            right: width - scale(110),
+            right: width - scale(20),
             bottom: scale(36),
         },
         visual.title_font,
         approval_rgb(245, 247, 250),
         DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
-    );
-    let remaining = format!("{}s", visual.last_remaining.max(1));
-    draw_approval_text(
-        dc,
-        &remaining,
-        RECT {
-            left: width - scale(90),
-            top: scale(14),
-            right: width - scale(20),
-            bottom: scale(34),
-        },
-        visual.small_font,
-        accent,
-        DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
     );
     if height < visual.expanded_height - scale(35) {
         return;
@@ -3167,28 +3187,8 @@ unsafe fn draw_approval_contents(
         approval_rgb(116, 127, 142),
         DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
     );
-    let progress_width = ((width - scale(40)) as u64 * visual.last_remaining.min(30) / 30) as i32;
-    draw_round_box(
-        dc,
-        scale(20),
-        height - scale(66),
-        width - scale(20),
-        height - scale(62),
-        scale(2),
-        approval_rgb(43, 51, 62),
-        approval_rgb(43, 51, 62),
-    );
-    draw_round_box(
-        dc,
-        scale(20),
-        height - scale(66),
-        scale(20) + progress_width,
-        height - scale(62),
-        scale(2),
-        accent,
-        accent,
-    );
     let deny = approval_deny_rect(width, height, visual.dpi);
+    let rule = approval_rule_rect(width, height, visual.dpi);
     let allow = approval_allow_rect(width, height, visual.dpi);
     let deny_color = if visual.hover == ApprovalHit::Deny {
         approval_rgb(112, 44, 52)
@@ -3199,6 +3199,11 @@ unsafe fn draw_approval_contents(
         approval_rgb(61, 151, 103)
     } else {
         approval_rgb(42, 116, 80)
+    };
+    let rule_color = if visual.hover == ApprovalHit::Rule {
+        approval_rgb(55, 105, 170)
+    } else {
+        approval_rgb(37, 72, 118)
     };
     draw_round_box(
         dc,
@@ -3220,9 +3225,33 @@ unsafe fn draw_approval_contents(
         allow_color,
         allow_color,
     );
+    if request.allow_rule {
+        draw_round_box(
+            dc,
+            rule.left,
+            rule.top,
+            rule.right,
+            rule.bottom,
+            scale(12),
+            rule_color,
+            rule_color,
+        );
+        draw_approval_text(
+            dc,
+            "允许此类命令",
+            rule,
+            visual.small_font,
+            approval_rgb(232, 242, 255),
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+    }
     draw_approval_text(
         dc,
-        "拒绝",
+        if request.feedback {
+            "拒绝并反馈"
+        } else {
+            "拒绝"
+        },
         deny,
         visual.body_font,
         approval_rgb(255, 224, 226),
@@ -3230,7 +3259,7 @@ unsafe fn draw_approval_contents(
     );
     draw_approval_text(
         dc,
-        "允许一次",
+        "仅允许一次",
         allow,
         visual.body_font,
         approval_rgb(235, 255, 244),
@@ -3242,7 +3271,6 @@ unsafe fn draw_approval_contents(
 struct ApprovalVisualSnapshot {
     dpi: u32,
     expanded_height: i32,
-    last_remaining: u64,
     hover: ApprovalHit,
     title_font: usize,
     body_font: usize,
@@ -3254,7 +3282,6 @@ impl ApprovalVisual {
         ApprovalVisualSnapshot {
             dpi: self.dpi,
             expanded_height: self.expanded_height,
-            last_remaining: self.last_remaining,
             hover: self.hover,
             title_font: self.title_font,
             body_font: self.body_font,
