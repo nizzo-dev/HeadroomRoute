@@ -13,7 +13,7 @@ use windows_sys::Win32::{
     },
 };
 
-const HEADROOM_VERSION: &str = "0.34.0";
+pub const HEADROOM_VERSION: &str = "0.34.0";
 
 pub fn setup_instructions(config: &AppConfig) -> String {
     let configured = config

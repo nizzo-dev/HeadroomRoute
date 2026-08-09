@@ -20,18 +20,20 @@ use windows_sys::Win32::{
     UI::{
         HiDpi::GetDpiForSystem,
         WindowsAndMessaging::{
-            CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-            GetClientRect, GetMessageW, HWND_TOPMOST, IDC_ARROW, KillTimer, LoadCursorW,
-            MoveWindow, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-            SWP_NOSIZE, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WM_DESTROY,
-            WM_LBUTTONUP, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-            WS_EX_TOPMOST, WS_POPUP,
+            AW_CENTER, AW_HIDE, AnimateWindow, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
+            DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, HWND_TOPMOST, IDC_ARROW,
+            KillTimer, LoadCursorW, MoveWindow, RegisterClassW, SWP_NOACTIVATE, SWP_NOMOVE,
+            SWP_NOSIZE, SetTimer, SetWindowPos, TranslateMessage, WM_DESTROY, WM_LBUTTONUP,
+            WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+            WS_POPUP,
         },
     },
 };
 
 const TIMER_ID: usize = 1;
-const TIMER_MS: u32 = 50;
+const TIMER_MS: u32 = 16;
+const POPUP_OPEN_ANIMATION_MS: u32 = 180;
+const POPUP_CLOSE_ANIMATION_MS: u32 = 140;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Level {
@@ -290,7 +292,7 @@ unsafe fn tick(hwnd: HWND) {
         if has_current() {
             unsafe {
                 position(hwnd);
-                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                AnimateWindow(hwnd, POPUP_OPEN_ANIMATION_MS, AW_CENTER);
                 SetWindowPos(
                     hwnd,
                     HWND_TOPMOST,
@@ -303,7 +305,7 @@ unsafe fn tick(hwnd: HWND) {
                 InvalidateRect(hwnd, ptr::null(), 1);
             }
         } else {
-            unsafe { ShowWindow(hwnd, SW_HIDE) };
+            unsafe { AnimateWindow(hwnd, POPUP_CLOSE_ANIMATION_MS, AW_HIDE | AW_CENTER) };
         }
     }
 }
@@ -314,7 +316,7 @@ unsafe fn close_current(hwnd: HWND) {
             acknowledge(host.current.take());
         }
     });
-    unsafe { ShowWindow(hwnd, SW_HIDE) };
+    unsafe { AnimateWindow(hwnd, POPUP_CLOSE_ANIMATION_MS, AW_HIDE | AW_CENTER) };
 }
 
 fn acknowledge(current: Option<Current>) {

@@ -24,6 +24,9 @@ use windows_sys::Win32::System::Registry::{
     RegQueryValueExW,
 };
 
+#[path = "config_portability.rs"]
+pub mod portability;
+
 pub const DIRECT_CODEX_PROVIDER: &str = "headroom_route_direct";
 
 pub struct DiscoveredRoutes {
@@ -56,6 +59,10 @@ pub fn load_or_create(path: &Path) -> Result<AppConfig> {
 }
 
 pub fn save(path: &Path, config: &AppConfig) -> Result<()> {
+    config
+        .routing_strategy
+        .validate()
+        .context("routing strategy configuration is invalid")?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -363,39 +370,78 @@ fn cc_switch_settings(
 struct PendingFile {
     path: PathBuf,
     original: Option<Vec<u8>>,
-    updated: Vec<u8>,
+    /// `None` removes the file instead of writing it.
+    updated: Option<Vec<u8>>,
 }
 
-fn rollback_files(committed: Vec<(PathBuf, Option<Vec<u8>>)>) {
+/// Best-effort transaction rollback. Returns the paths whose rollback itself
+/// failed so the caller can report them instead of silently losing the
+/// original state. For files created during the transaction (original is
+/// `None`) a `NotFound` while removing them is considered success: the target
+/// state (file absent) is already reached.
+fn rollback_files(committed: Vec<(PathBuf, Option<Vec<u8>>)>) -> Vec<String> {
+    let mut failures = Vec::new();
     for (path, original) in committed.into_iter().rev() {
-        match original {
-            Some(bytes) => {
-                let _ = atomic_write(&path, &bytes);
-            }
-            None => {
-                let _ = fs::remove_file(&path);
-            }
+        let result = match original {
+            Some(bytes) => atomic_write(&path, &bytes),
+            None => match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(anyhow::Error::from(error)),
+            },
+        };
+        if let Err(error) = result {
+            failures.push(format!("{}: {error}", path.display()));
         }
     }
+    failures
 }
 
 fn commit_files(updates: Vec<PendingFile>) -> Result<()> {
     let mut committed: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
     for update in updates {
-        if update.original.as_deref() == Some(update.updated.as_slice()) {
+        let remove = update.updated.is_none();
+        let unchanged = match (&update.original, &update.updated) {
+            (Some(original), Some(updated)) => original == updated,
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
             continue;
         }
-        if let Some(original) = update.original.as_ref()
-            && let Err(error) = backup(&update.path, &String::from_utf8_lossy(original))
-        {
-            rollback_files(committed);
-            return Err(error);
+        let outcome = if remove {
+            let Some(original) = update.original.as_ref() else {
+                continue;
+            };
+            match backup(&update.path, &String::from_utf8_lossy(original)) {
+                Ok(()) => fs::remove_file(&update.path)
+                    .with_context(|| format!("无法删除文件: {}", update.path.display())),
+                Err(error) => Err(error),
+            }
+        } else {
+            let updated = update.updated.as_deref().unwrap_or_default();
+            match update.original.as_ref() {
+                Some(original) => match backup(&update.path, &String::from_utf8_lossy(original)) {
+                    Ok(()) => atomic_write(&update.path, updated),
+                    Err(error) => Err(error),
+                },
+                None => atomic_write(&update.path, updated),
+            }
+        };
+        match outcome {
+            Ok(()) => committed.push((update.path, update.original)),
+            Err(error) => {
+                let rollback_failures = rollback_files(committed);
+                return if rollback_failures.is_empty() {
+                    Err(error)
+                } else {
+                    Err(anyhow!(
+                        "{error}；事务回滚也未完全成功: {}",
+                        rollback_failures.join("；")
+                    ))
+                };
+            }
         }
-        if let Err(error) = atomic_write(&update.path, &update.updated) {
-            rollback_files(committed);
-            return Err(error);
-        }
-        committed.push((update.path, update.original));
     }
     Ok(())
 }
@@ -447,7 +493,7 @@ fn pending_codex_auth(config: &AppConfig, settings: &Value) -> Result<Option<Pen
     Ok(Some(PendingFile {
         path,
         original,
-        updated,
+        updated: Some(updated),
     }))
 }
 
@@ -540,7 +586,7 @@ fn sync_codex_direct_provider(
         let mut updates = vec![PendingFile {
             path: path.clone(),
             original: Some(original.as_bytes().to_vec()),
-            updated: doc.to_string().into_bytes(),
+            updated: Some(doc.to_string().into_bytes()),
         }];
         if let Some(auth) = pending_codex_auth(config, &settings)? {
             updates.push(auth);
@@ -811,7 +857,7 @@ fn sync_claude_direct_provider(
         commit_files(vec![PendingFile {
             path: path.clone(),
             original: Some(original),
-            updated,
+            updated: Some(updated),
         }])?;
         mark_direct_managed(config, Protocol::Anthropic)?;
         return Ok(target);
@@ -844,7 +890,7 @@ fn sync_claude_direct_provider(
     commit_files(vec![PendingFile {
         path: path.clone(),
         original: Some(original_text.into_bytes()),
-        updated,
+        updated: Some(updated),
     }])?;
     mark_direct_managed(config, Protocol::Anthropic)?;
     Ok(target)
@@ -1727,6 +1773,46 @@ mod tests {
     }
 
     #[test]
+    fn rollback_files_ignores_missing_created_files_and_reports_other_failures() {
+        let dir = std::env::temp_dir().join(format!(
+            "headroom-route-rollback-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let created = dir.join("created.json");
+        assert!(!created.exists());
+        let failures = super::rollback_files(vec![(created.clone(), None)]);
+        assert!(
+            failures.is_empty(),
+            "missing created file is already reverted"
+        );
+
+        fs::write(&created, b"{}").unwrap();
+        let failures = super::rollback_files(vec![(created.clone(), None)]);
+        assert!(failures.is_empty());
+        assert!(
+            !created.exists(),
+            "created file should be removed on rollback"
+        );
+
+        let restored = dir.join("restored.json");
+        fs::write(&restored, b"old").unwrap();
+        let failures = super::rollback_files(vec![(restored.clone(), Some(b"new".to_vec()))]);
+        assert!(failures.is_empty());
+        assert_eq!(fs::read(&restored).unwrap(), b"new".to_vec());
+
+        let blocked = dir.join("blocked");
+        fs::write(&blocked, b"not-a-directory").unwrap();
+        let failures =
+            super::rollback_files(vec![(blocked.join("child.json"), Some(b"x".to_vec()))]);
+        assert_eq!(failures.len(), 1, "real rollback failures must be reported");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn sync_claude_preserves_unknown_fields_and_secrets() {
         let dir = std::env::temp_dir().join(format!("headroom-route-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1942,7 +2028,7 @@ mod tests {
             super::PendingFile {
                 path: config.codex_config.clone(),
                 original: Some(current.as_bytes().to_vec()),
-                updated: current_doc.to_string().into_bytes(),
+                updated: Some(current_doc.to_string().into_bytes()),
             },
             auth,
         ])

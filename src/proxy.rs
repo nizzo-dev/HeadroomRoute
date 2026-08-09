@@ -1,11 +1,13 @@
 use crate::{
     config,
     model::AuthStyle,
+    notification,
     state::{AppState, should_stop},
 };
 use anyhow::{Context, Result, anyhow};
 use rand::{Rng, distr::Alphanumeric};
 use reqwest::blocking::Client;
+use serde_json::Value;
 use std::{
     collections::HashMap,
     fs,
@@ -48,9 +50,16 @@ fn mirror_token(dir: &Path, token: &str) -> Result<()> {
 pub fn run(app: Arc<AppState>, token: String) -> Result<thread::JoinHandle<()>> {
     let runtime_config = app.inner.lock().unwrap().config.clone();
     let port = runtime_config.agent_port;
-    prepare_port(port)?;
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .with_context(|| format!("无法监听 127.0.0.1:{port}"))?;
+    if let Err(error) = prepare_port(port) {
+        return Err(report_port_conflict(&app, port, error));
+    }
+    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|error| {
+        report_port_conflict(
+            &app,
+            port,
+            anyhow!(error).context(format!("无法监听 127.0.0.1:{port}")),
+        )
+    })?;
     listener.set_nonblocking(true)?;
     let mut client_builder = Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -86,6 +95,59 @@ pub fn run(app: Arc<AppState>, token: String) -> Result<thread::JoinHandle<()>> 
             }
         }
     }))
+}
+
+fn report_port_conflict(app: &AppState, port: u16, error: anyhow::Error) -> anyhow::Error {
+    let occupant = listener_occupant(port);
+    let detail = occupant.map_or_else(
+        || format!("本地代理端口 {port} 被占用，未能确定监听进程；请关闭占用程序后重试"),
+        |occupant| {
+            format!(
+                "本地代理端口 {port} 被 PID {}（{}，{}）占用；为避免结束用户进程，已停止启动",
+                occupant.pid,
+                occupant.name,
+                if occupant.is_headroom {
+                    "Headroom 进程"
+                } else {
+                    "其他进程"
+                }
+            )
+        },
+    );
+    app.inner.lock().unwrap().last_error = Some(detail.clone());
+    app.process_recovery_event(crate::environment_recovery::EnvironmentEvent::PortConflict);
+    app.process_recovery_event(crate::environment_recovery::EnvironmentEvent::RecoveryFailed);
+    error.context(detail)
+}
+
+fn listener_occupant(port: u16) -> Option<crate::environment_recovery::PortOccupant> {
+    use std::os::windows::process::CommandExt;
+
+    let pid = listener_pid(port)?;
+    let filter = format!("PID eq {pid}");
+    let process_name = std::process::Command::new("tasklist.exe")
+        .args(["/FI", filter.as_str(), "/FO", "CSV", "/NH"])
+        .creation_flags(0x08000000)
+        .output()
+        .ok()
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| {
+                    if !line.starts_with('"') {
+                        return None;
+                    }
+                    line.split(',')
+                        .next()
+                        .map(|name| name.trim_matches('"').to_owned())
+                })
+        })
+        .unwrap_or_else(|| format!("proc-{pid}"));
+    crate::environment_recovery::classify_port_with_process(
+        pid,
+        process_name,
+        Some(std::process::id()),
+    )
 }
 
 fn configure_client_stream(stream: &TcpStream) -> std::io::Result<()> {
@@ -286,7 +348,13 @@ fn handle(mut stream: TcpStream, app: &Arc<AppState>, token: &str, client: &Clie
     if path.starts_with("/_headroom_route_agent/") || path == "/livez" {
         return control(&mut stream, app, token, request, &path);
     }
+    let model = top_level_model(&request.body);
+    if let Err(error) = app.route_for_request(&path, model.as_deref()) {
+        app.inner.lock().unwrap().last_error =
+            Some(format!("路由策略决策失败，沿用当前 Provider: {error}"));
+    }
     let Some(route) = app.active_route_for_path(&path) else {
+        notify_ai_error(&path, "HeadroomRoute", "没有可用的上游路由");
         write_json(
             &mut stream,
             503,
@@ -326,6 +394,7 @@ fn handle(mut stream: TcpStream, app: &Arc<AppState>, token: &str, client: &Clie
             value
         }
         Err(error) => {
+            notify_ai_error(&path, &route.provider, &error.to_string());
             app.record_route_result(
                 route.protocol,
                 &route.provider,
@@ -344,6 +413,14 @@ fn handle(mut stream: TcpStream, app: &Arc<AppState>, token: &str, client: &Clie
         }
     };
     let status = response.status();
+    let is_success = status.is_success();
+    if !is_success {
+        notify_ai_error(
+            &path,
+            &route.provider,
+            &format!("返回 HTTP {}", status.as_u16()),
+        );
+    }
     stream.write_all(
         format!(
             "HTTP/1.1 {} {}\r\n",
@@ -363,8 +440,55 @@ fn handle(mut stream: TcpStream, app: &Arc<AppState>, token: &str, client: &Clie
     }
     stream.write_all(b"Connection: close\r\n\r\n")?;
     let mut body = response;
-    std::io::copy(&mut body, &mut stream)?;
+    if let Err(error) = std::io::copy(&mut body, &mut stream) {
+        if is_success {
+            notify_ai_error(&path, &route.provider, &error.to_string());
+        }
+        return Err(error.into());
+    }
+    if is_success {
+        notify_ai_completed(&path, &route.provider, started.elapsed().as_millis());
+    }
     Ok(())
+}
+
+fn is_ai_conversation_path(path: &str) -> bool {
+    let path = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(path)
+        .trim_end_matches('/');
+
+    matches!(
+        path,
+        "/v1/chat/completions" | "/v1/completions" | "/v1/responses" | "/v1/messages"
+    )
+}
+
+fn notify_ai_completed(path: &str, provider: &str, elapsed_ms: u128) {
+    if is_ai_conversation_path(path) {
+        notification::success("AI 回复完成", format!("{} · {} ms", provider, elapsed_ms));
+    }
+}
+
+fn notify_ai_error(path: &str, provider: &str, detail: &str) {
+    if is_ai_conversation_path(path) {
+        notification::error(
+            "AI 接口错误",
+            format!(
+                "{}：{}",
+                provider,
+                config::portability::redact_sensitive_text(detail)
+            ),
+        );
+    }
+}
+
+fn top_level_model(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let object = value.as_object()?;
+    let model = object.get("model")?.as_str()?.trim();
+    (!model.is_empty()).then(|| model.chars().take(160).collect())
 }
 
 fn control(
@@ -381,20 +505,51 @@ fn control(
             serde_json::json!({"service":"headroom-route","status":"healthy"}),
         );
     }
-    if path.ends_with("/status") && request.method == "GET" {
-        return write_json(stream, 200, serde_json::to_value(app.snapshot())?);
+    // Compatibility endpoint used only to identify an older local instance.
+    // Returns only stable, non-sensitive identity fields: prepare_port needs
+    // the `service` value to tell a HeadroomRoute instance apart from the
+    // legacy RouteAgent, and nothing else (no last_error, routes, active_url).
+    if path == "/_headroom_route_agent/status" && request.method == "GET" {
+        return write_json(stream, 200, compat_status(app));
     }
-    if request
-        .headers
-        .get("x-route-agent-token")
-        .map(String::as_str)
-        != Some(token)
-    {
+    if !valid_control_token(&request.headers, token) {
         return write_json(
             stream,
             401,
             serde_json::json!({"detail":"invalid control token"}),
         );
+    }
+    if path == "/_headroom_route_agent/v1/status" {
+        if request.method != "GET" {
+            return write_json(
+                stream,
+                405,
+                serde_json::json!({"detail":"method not allowed"}),
+            );
+        }
+        return write_json(stream, 200, stable_status(app));
+    }
+    if let Some(ticket_id) = path.strip_prefix("/_headroom_route_agent/v1/undo/") {
+        if request.method != "POST" {
+            return write_json(
+                stream,
+                405,
+                serde_json::json!({"detail":"method not allowed"}),
+            );
+        }
+        let confirmation = request
+            .headers
+            .get("x-route-agent-confirmation")
+            .map(String::as_str)
+            .unwrap_or_default();
+        return match app.undo_switch(ticket_id, confirmation) {
+            Ok(()) => write_json(stream, 200, serde_json::to_value(app.snapshot())?),
+            Err(error) => write_json(
+                stream,
+                409,
+                serde_json::json!({"detail": error.to_string()}),
+            ),
+        };
     }
     let mut ok = true;
     if path.ends_with("/check") {
@@ -429,6 +584,85 @@ fn control(
     }
     let status = if ok { 200 } else { 409 };
     write_json(stream, status, serde_json::to_value(app.snapshot())?)
+}
+
+fn valid_control_token(headers: &HashMap<String, String>, token: &str) -> bool {
+    !token.is_empty() && headers.get("x-route-agent-token").map(String::as_str) == Some(token)
+}
+
+/// Minimal, non-sensitive identity for the legacy `/status` endpoint. Only the
+/// `service` field is consumed (by `prepare_port` to distinguish a running
+/// HeadroomRoute instance from the legacy RouteAgent); the version is included
+/// for logging. Sensitive snapshot fields such as `last_error`, `routes` and
+/// `active_url` are deliberately omitted.
+fn compat_status(app: &AppState) -> serde_json::Value {
+    let snapshot = app.snapshot();
+    serde_json::json!({
+        "service": snapshot.service,
+        "version": snapshot.version,
+    })
+}
+
+fn stable_status(app: &AppState) -> serde_json::Value {
+    let snapshot = app.snapshot();
+    let history_entries = app.operation_history().len();
+    let pending_undo = app.pending_undo_ticket().map(|ticket| {
+        serde_json::json!({
+            "id": ticket.id,
+            "protocol": ticket.protocol,
+            "restore_provider": ticket.restore_provider,
+            "expires_at": ticket.expires_at,
+        })
+    });
+    serde_json::json!({
+        "schema_version": config::portability::LOCAL_STATUS_API_VERSION,
+        "service": snapshot.service,
+        "version": snapshot.version,
+        "health": snapshot.state,
+        "protocols": {
+            "codex": {
+                "availability": snapshot.codex_availability,
+                "mode": protocol_mode(snapshot.direct_codex, snapshot.bypass_headroom),
+                "active_name": snapshot.active_name,
+                "active_host": snapshot.active_host,
+                "latency_ms": snapshot.latency_ms,
+            },
+            "claude": {
+                "availability": snapshot.claude_availability,
+                "mode": protocol_mode(snapshot.direct_claude, snapshot.bypass_headroom),
+                "active_name": snapshot.active_anthropic_name,
+                "active_host": snapshot.active_anthropic_host,
+                "latency_ms": snapshot.anthropic_latency_ms,
+            }
+        },
+        "automation": {
+            "auto_failover": snapshot.auto_enabled,
+        },
+        "runtime": {
+            "headroom_state": snapshot.headroom_state,
+            "headroom_pid": snapshot.headroom_pid,
+        },
+        "operations": {
+            "sync": snapshot.sync_status,
+            "restart": snapshot.restart_status,
+            "history_entries": history_entries,
+            "pending_undo": pending_undo,
+        },
+        "last_error": snapshot
+            .last_error
+            .as_deref()
+            .map(config::portability::redact_sensitive_text),
+    })
+}
+
+fn protocol_mode(direct: bool, bypass: bool) -> &'static str {
+    if direct {
+        "direct"
+    } else if bypass {
+        "bypass"
+    } else {
+        "managed"
+    }
 }
 
 fn join_url(base: &str, target: &str) -> Result<String> {
@@ -476,12 +710,13 @@ fn write_json(stream: &mut TcpStream, status: u16, value: serde_json::Value) -> 
         400 => "Bad Request",
         401 => "Unauthorized",
         409 => "Conflict",
+        405 => "Method Not Allowed",
         413 => "Payload Too Large",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Response",
     };
-    stream.write_all(format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes())?;
+    stream.write_all(format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes())?;
     stream.write_all(&body)?;
     Ok(())
 }
@@ -526,16 +761,122 @@ fn decode_chunked(raw: &[u8]) -> Result<Option<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::field_reassign_with_default)]
     use super::{
-        configure_client_stream, is_route_failure, join_url, read_request,
-        should_forward_request_header,
+        compat_status, configure_client_stream, is_route_failure, join_url, read_request,
+        should_forward_request_header, stable_status, top_level_model, valid_control_token,
     };
     use std::{
+        collections::HashMap,
         io::Write,
         net::{TcpListener, TcpStream},
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn versioned_status_api_requires_exact_control_token() {
+        let mut headers = HashMap::new();
+        assert!(!valid_control_token(&headers, "control-secret"));
+        headers.insert("x-route-agent-token".into(), "wrong".into());
+        assert!(!valid_control_token(&headers, "control-secret"));
+        headers.insert("x-route-agent-token".into(), "control-secret".into());
+        assert!(valid_control_token(&headers, "control-secret"));
+        assert!(!valid_control_token(&headers, ""));
+    }
+
+    #[test]
+    fn stable_status_exposes_stable_redacted_fields() {
+        use crate::model::AppConfig;
+        use crate::state::AppState;
+        let dir = std::env::temp_dir().join(format!(
+            "headroom-route-status-api-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let codex = dir.join("codex.toml");
+        std::fs::write(
+            &codex,
+            "model_provider = \"upstream\"\n[model_providers.upstream]\nname = \"Upstream\"\nbase_url = \"https://api.example.com/v1\"\n",
+        )
+        .unwrap();
+        let mut config = AppConfig::default();
+        config.state_dir = dir.join("state");
+        config.codex_config = codex;
+        config.claude_settings = dir.join("missing-claude.json");
+        config.cc_switch_db = dir.join("missing.db");
+        config.enable_claude = false;
+        let app = AppState::new(config);
+        let secret = "sk-status-secret-0123456789abcdef";
+        app.inner.lock().unwrap().last_error = Some(format!("Bearer {secret}"));
+        let value = stable_status(&app);
+        let schema = value.get("schema_version").unwrap();
+        assert_eq!(
+            schema.as_u64(),
+            Some(crate::config::portability::LOCAL_STATUS_API_VERSION as u64)
+        );
+        assert_eq!(value["service"], "headroom-route");
+        assert!(value["health"].is_string());
+        for protocol in ["codex", "claude"] {
+            let fields = &value["protocols"][protocol];
+            for field in [
+                "availability",
+                "mode",
+                "active_name",
+                "active_host",
+                "latency_ms",
+            ] {
+                assert!(fields.get(field).is_some(), "{protocol}.{field}");
+            }
+        }
+        assert!(value["automation"]["auto_failover"].is_boolean());
+        assert!(value["runtime"]["headroom_state"].is_string());
+        assert!(value["operations"]["sync"].is_string());
+        assert!(value["operations"]["restart"].is_string());
+        assert_eq!(value["last_error"], "Bearer [REDACTED]");
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains(secret));
+        assert!(!serialized.contains("api_key"));
+        assert!(!serialized.contains("token"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compat_status_exposes_only_service_and_version() {
+        use crate::model::AppConfig;
+        use crate::state::AppState;
+        let dir = std::env::temp_dir().join(format!(
+            "headroom-route-compat-status-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::default();
+        config.state_dir = dir.join("state");
+        config.codex_config = dir.join("missing-codex.toml");
+        config.claude_settings = dir.join("missing-claude.json");
+        config.cc_switch_db = dir.join("missing.db");
+        let app = AppState::new(config);
+        app.inner.lock().unwrap().last_error = Some("Bearer sk-status-secret-0123456789".into());
+        let value = compat_status(&app);
+        assert_eq!(value["service"], "headroom-route");
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        for sensitive in [
+            "last_error",
+            "routes",
+            "active_url",
+            "active_provider",
+            "active_name",
+            "health",
+            "headroom_state",
+        ] {
+            assert!(value.get(sensitive).is_none(), "should omit {sensitive}");
+        }
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains("sk-status-secret"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn joins_openai_paths_without_duplicate_v1() {
@@ -547,6 +888,16 @@ mod tests {
             join_url("https://example.com", "/v1/models").unwrap(),
             "https://example.com/v1/models"
         );
+    }
+
+    #[test]
+    fn model_selection_reads_only_the_json_top_level() {
+        assert_eq!(
+            top_level_model(br#"{"model":"gpt-4o","input":[{"model":"nested"}]}"#),
+            Some("gpt-4o".into())
+        );
+        assert_eq!(top_level_model(br#"{"input":{"model":"nested"}}"#), None);
+        assert_eq!(top_level_model(b"not-json"), None);
     }
 
     #[test]
@@ -574,6 +925,28 @@ mod tests {
         assert!(is_route_failure(401));
         assert!(is_route_failure(429));
         assert!(is_route_failure(502));
+    }
+
+    #[test]
+    fn recognizes_ai_conversation_paths() {
+        for path in [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/v1/messages/",
+            "/v1/responses?stream=true",
+        ] {
+            assert!(super::is_ai_conversation_path(path), "{path}");
+        }
+
+        for path in [
+            "/v1/models",
+            "/v1/embeddings",
+            "/v1/responses/status",
+            "/healthz",
+        ] {
+            assert!(!super::is_ai_conversation_path(path), "{path}");
+        }
     }
 
     #[test]

@@ -1,9 +1,21 @@
 use crate::{
     config,
-    model::{AppConfig, FailoverPolicy, HeadroomMetrics, Protocol, Route, RouteHealth, Snapshot},
+    environment_recovery::{
+        EnvironmentEvent, RecoveryAction, RecoveryConfig, RecoveryEngine, RecoveryState,
+        SessionStore,
+    },
+    model::{
+        AppConfig, FailoverPolicy, HeadroomMetrics, Protocol, Route, RouteHealth, RuntimeStatus,
+        RuntimeStatusInput, Snapshot, evaluate_runtime_status,
+    },
+    operation_history::{
+        DEFAULT_COOLDOWN, OperationHistory, OperationKind, OperationRecord, SwitchCooldown,
+        UndoGrant, UndoTicket,
+    },
+    routing_policy::{self, DecisionMode, RoutingDecision},
 };
-use anyhow::Result;
-use serde_json::json;
+use anyhow::{Result, anyhow};
+use serde_json::{Value, json};
 use std::{
     fs,
     path::Path,
@@ -45,6 +57,14 @@ pub struct AppState {
     pub config_change_notice: Mutex<Option<String>>,
     pub routing_notice: Mutex<Option<(bool, String)>>,
     pub update_notice: Mutex<Option<String>>,
+    pub operation_history: Mutex<OperationHistory>,
+    pub switch_cooldown: Mutex<SwitchCooldown>,
+    pub recovery: Mutex<RecoveryEngine>,
+    pub recovery_in_progress: AtomicBool,
+    pub recovery_notice: Mutex<Option<String>>,
+    pub operation_notice: Mutex<Option<String>>,
+    pub pending_undo: Mutex<Option<UndoGrant>>,
+    pub routing_log_lock: Mutex<()>,
     pub maintenance_action: Mutex<Option<String>>,
 }
 
@@ -102,6 +122,32 @@ impl AppState {
                 error = Some(format!("修复上游选择失败: {save_error}"));
             }
         }
+        let history_path = config.state_dir.join("operation-history.json");
+        let history = match OperationHistory::load(&history_path) {
+            Ok(outcome) => {
+                if let Some(quarantined) = outcome.quarantined {
+                    let message = format!(
+                        "操作历史文件已隔离，已从空历史继续: {}",
+                        quarantined.display()
+                    );
+                    error = Some(match error.take() {
+                        Some(existing) => format!("{existing}；{message}"),
+                        None => message,
+                    });
+                }
+                outcome.history
+            }
+            Err(load_error) => {
+                let message = format!("加载操作历史失败，已从空历史继续: {load_error}");
+                error = Some(match error.take() {
+                    Some(existing) => format!("{existing}；{message}"),
+                    None => message,
+                });
+                OperationHistory::new()
+            }
+        };
+        let cooldown = SwitchCooldown::from_history(&history, DEFAULT_COOLDOWN);
+        let recovery = RecoveryEngine::new(RecoveryConfig::default());
         Arc::new(Self {
             inner: Mutex::new(RuntimeState {
                 config,
@@ -132,6 +178,14 @@ impl AppState {
             config_change_notice: Mutex::new(None),
             routing_notice: Mutex::new(None),
             update_notice: Mutex::new(None),
+            operation_history: Mutex::new(history),
+            switch_cooldown: Mutex::new(cooldown),
+            recovery: Mutex::new(recovery),
+            recovery_in_progress: AtomicBool::new(false),
+            recovery_notice: Mutex::new(None),
+            operation_notice: Mutex::new(None),
+            pending_undo: Mutex::new(None),
+            routing_log_lock: Mutex::new(()),
             maintenance_action: Mutex::new(None),
         })
     }
@@ -182,6 +236,11 @@ impl AppState {
         };
         *self.restart_result.lock().unwrap() = Some((ok, message));
         self.restart_in_progress.store(false, Ordering::Release);
+        self.process_recovery_event(if ok {
+            EnvironmentEvent::RecoverySucceeded
+        } else {
+            EnvironmentEvent::RecoveryFailed
+        });
     }
 
     pub fn take_restart_result(&self) -> Option<(bool, String)> {
@@ -209,6 +268,191 @@ impl AppState {
 
     pub fn take_update_notice(&self) -> Option<String> {
         self.update_notice.lock().unwrap().take()
+    }
+
+    pub fn take_operation_notice(&self) -> Option<String> {
+        self.operation_notice.lock().unwrap().take()
+    }
+
+    pub fn take_recovery_notice(&self) -> Option<String> {
+        self.recovery_notice.lock().unwrap().take()
+    }
+
+    pub fn recovery_state(&self) -> RecoveryState {
+        self.recovery.lock().unwrap().state()
+    }
+
+    pub fn begin_session(&self) -> Result<bool> {
+        let path = self.session_path();
+        let store = SessionStore::new(path);
+        let previous_unclean = store.begin_session_with_status()?;
+        if previous_unclean {
+            let _ = self.process_recovery_event(EnvironmentEvent::PreviousSessionUnclean);
+        }
+        Ok(previous_unclean)
+    }
+
+    pub fn heartbeat_session(&self) -> Result<()> {
+        let store = SessionStore::new(self.session_path());
+        store.heartbeat()
+    }
+
+    pub fn finish_session(&self) -> Result<()> {
+        let store = SessionStore::new(self.session_path());
+        store.finish_session()
+    }
+
+    pub fn process_recovery_event(&self, event: EnvironmentEvent) -> RecoveryAction {
+        let action = {
+            let mut recovery = self.recovery.lock().unwrap();
+            let action = recovery.process(event.clone());
+            let active = matches!(
+                recovery.state(),
+                RecoveryState::InProgress | RecoveryState::Failed
+            );
+            self.recovery_in_progress.store(active, Ordering::Release);
+            action
+        };
+        if !matches!(action, RecoveryAction::NoOp) {
+            *self.recovery_notice.lock().unwrap() = Some(format!(
+                "环境事件 {:?}：恢复动作 {:?}；重试次数 {}",
+                event,
+                action,
+                self.recovery.lock().unwrap().retry_count()
+            ));
+        }
+        action
+    }
+
+    pub fn take_recovery_retry(&self) -> Option<EnvironmentEvent> {
+        let mut recovery = self.recovery.lock().unwrap();
+        if recovery.state() != RecoveryState::Failed || !recovery.can_retry() {
+            return None;
+        }
+        let event = recovery.last_event().cloned()?;
+        recovery.attempt_retry().ok()?;
+        self.recovery_in_progress.store(true, Ordering::Release);
+        Some(event)
+    }
+
+    pub fn record_routing_decision(&self, decision: &RoutingDecision) -> Result<()> {
+        let record = decision.as_record();
+        let mut record = serde_json::to_value(record)?;
+        if let Some(model) = record
+            .get("model")
+            .and_then(Value::as_str)
+            .map(|model| model.chars().take(160).collect::<String>())
+        {
+            let safe_model = model;
+            record["model"] = Value::String(safe_model);
+        }
+        if let Some(rationale) = record
+            .get("rationale")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        {
+            let safe = config::portability::redact_sensitive_text(&rationale);
+            record["rationale"] = Value::String(safe.chars().take(500).collect());
+        }
+        let line = serde_json::to_string(&record)?;
+        let _log_guard = self.routing_log_lock.lock().unwrap();
+        let path = {
+            let state = self.inner.lock().unwrap();
+            state.config.state_dir.join("routing-decisions.jsonl")
+        };
+        let mut lines = fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .filter(|value| !value.trim().is_empty())
+            .collect::<Vec<_>>();
+        lines.push(line);
+        let keep_from = lines.len().saturating_sub(200);
+        let content = lines[keep_from..].join("\n") + "\n";
+        atomic_write(&path, content.as_bytes())
+    }
+
+    pub fn operation_history(&self) -> Vec<OperationRecord> {
+        self.operation_history.lock().unwrap().entries().to_vec()
+    }
+
+    pub fn pending_undo_ticket(&self) -> Option<UndoTicket> {
+        self.pending_undo
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|grant| grant.ticket.clone())
+    }
+
+    pub fn undo_switch(&self, ticket_id: &str, confirmation_token: &str) -> Result<()> {
+        let (protocol, switched_to, restore_provider) = {
+            let history = self.operation_history.lock().unwrap();
+            let ticket = history
+                .undo_ticket(ticket_id)
+                .ok_or_else(|| anyhow!("撤销票据不存在或已使用"))?;
+            (
+                ticket.protocol,
+                ticket.switched_to.clone(),
+                ticket.restore_provider.clone(),
+            )
+        };
+        let (current_provider, target_index) = {
+            let state = self.inner.lock().unwrap();
+            let current = active_route(&state, protocol)
+                .map(|route| route.provider.clone())
+                .ok_or_else(|| anyhow!("当前协议没有活动 Provider"))?;
+            let target = state
+                .routes
+                .iter()
+                .position(|route| route.protocol == protocol && route.provider == restore_provider)
+                .ok_or_else(|| anyhow!("撤销目标 Provider 已不存在"))?;
+            (current, target)
+        };
+        if current_provider != switched_to {
+            return Err(anyhow!("当前 Provider 已变化，撤销票据不再适用"));
+        }
+        {
+            let history = self.operation_history.lock().unwrap();
+            history.verify_undo(ticket_id, confirmation_token, &current_provider)?;
+        }
+        if !self.switch_index_impl(target_index, "撤销上一次 Provider 切换", None) {
+            return Err(anyhow!("撤销切换未能应用"));
+        }
+        let record = {
+            let mut history = self.operation_history.lock().unwrap();
+            let record = history.record_undo(ticket_id, confirmation_token, &current_provider)?;
+            self.save_operation_history(&history)?;
+            record
+        };
+        self.pending_undo
+            .lock()
+            .unwrap()
+            .take_if(|grant| grant.ticket.id == ticket_id);
+        *self.operation_notice.lock().unwrap() = Some(format!(
+            "已撤销 Provider 切换：{} -> {}（记录 {}）",
+            switched_to, restore_provider, record.id
+        ));
+        Ok(())
+    }
+
+    fn session_path(&self) -> std::path::PathBuf {
+        self.inner
+            .lock()
+            .unwrap()
+            .config
+            .state_dir
+            .join("session-marker.json")
+    }
+
+    fn save_operation_history(&self, history: &OperationHistory) -> Result<()> {
+        let path = self
+            .inner
+            .lock()
+            .unwrap()
+            .config
+            .state_dir
+            .join("operation-history.json");
+        history.save(&path)
     }
 
     pub fn toggle_auto_failover(&self) -> Result<bool> {
@@ -448,6 +692,75 @@ impl AppState {
     pub fn active_route_for_path(&self, path: &str) -> Option<Route> {
         self.active_route_for(protocol_for_path(path))
     }
+
+    pub fn route_for_request(&self, path: &str, model: Option<&str>) -> Result<Option<Route>> {
+        let protocol = protocol_for_path(path);
+        let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(self.active_route_for(protocol));
+        };
+        let (strategy, candidates, current_provider, active, allowed_targets) = {
+            let state = self.inner.lock().unwrap();
+            let current_provider =
+                active_route(&state, protocol).map(|route| route.provider.clone());
+            let allowed_targets = current_provider
+                .as_deref()
+                .map(|provider| {
+                    routing_policy::allowed_targets(
+                        &state.config.failover_policy,
+                        protocol,
+                        provider,
+                    )
+                })
+                .unwrap_or_default();
+            let candidates = state
+                .routes
+                .iter()
+                .filter(|route| route.protocol == protocol)
+                .map(|route| routing_policy::CandidateFacts::from_route(model, route))
+                .collect::<Vec<_>>();
+            (
+                state.config.routing_strategy.clone(),
+                candidates,
+                current_provider,
+                active_route(&state, protocol).cloned(),
+                allowed_targets,
+            )
+        };
+        let decision = routing_policy::decide_with_context(
+            &routing_policy::DecisionContext {
+                model: model.chars().take(160).collect(),
+                protocol,
+                allowed_targets,
+                provider: current_provider.clone(),
+                provider_cost: None,
+            },
+            &candidates,
+            &strategy,
+        )?;
+        if let Err(error) = self.record_routing_decision(&decision) {
+            self.inner.lock().unwrap().last_error = Some(format!("保存路由策略决策失败: {error}"));
+        }
+        if decision.decision == DecisionMode::Apply
+            && let Some(provider) = decision.selected_provider.as_deref()
+            && current_provider.as_deref() != Some(provider)
+        {
+            let target = {
+                let state = self.inner.lock().unwrap();
+                state
+                    .routes
+                    .iter()
+                    .position(|route| route.protocol == protocol && route.provider == provider)
+            };
+            if let Some(target) = target {
+                let rationale = format!("路由策略 apply：{}", decision.rationale);
+                if self.switch_index_impl(target, &rationale, Some(OperationKind::ManualSwitch)) {
+                    return Ok(self.active_route_for(protocol));
+                }
+            }
+        }
+        Ok(active)
+    }
+
     pub fn active_url(&self) -> Option<String> {
         self.active_route().map(|route| route.base_url)
     }
@@ -477,15 +790,27 @@ impl AppState {
     }
 
     pub fn switch_index(&self, index: usize, reason: &str) -> bool {
+        self.switch_index_impl(index, reason, Some(OperationKind::ManualSwitch))
+    }
+
+    fn switch_index_impl(
+        &self,
+        index: usize,
+        reason: &str,
+        history_kind: Option<OperationKind>,
+    ) -> bool {
         let _config_guard = self.config_write_guard();
-        let (protocol, provider, direct, app_config) = {
+        let (protocol, provider, from_provider, direct, app_config) = {
             let state = self.inner.lock().unwrap();
             let Some(route) = state.routes.get(index) else {
                 return false;
             };
+            let from_provider =
+                active_route(&state, route.protocol).map(|active| active.provider.clone());
             (
                 route.protocol,
                 route.provider.clone(),
+                from_provider,
                 match route.protocol {
                     Protocol::OpenAi => state.config.direct_codex,
                     Protocol::Anthropic => state.config.direct_claude,
@@ -523,11 +848,11 @@ impl AppState {
         if protocol == Protocol::OpenAi {
             state.active = Some(index);
             state.selected_provider = Some(provider.clone());
-            state.config.selected_openai_provider = Some(provider);
+            state.config.selected_openai_provider = Some(provider.clone());
         } else {
             state.active_anthropic = Some(index);
             state.selected_anthropic_provider = Some(provider.clone());
-            state.config.selected_anthropic_provider = Some(provider);
+            state.config.selected_anthropic_provider = Some(provider.clone());
         }
         state.last_switch_reason = Some(format!("{}：{}", protocol.label(), reason));
         let selected_openai = state.config.selected_openai_provider.clone();
@@ -552,6 +877,15 @@ impl AppState {
                 route.protocol == Protocol::Anthropic && route.provider == provider
             })
         });
+        if history_kind == Some(OperationKind::AutoFailover)
+            && let Some(failed_provider) = from_provider.as_deref()
+            && let Some(route) = state
+                .routes
+                .iter_mut()
+                .find(|route| route.protocol == protocol && route.provider == failed_provider)
+        {
+            route.failover_blocked_until = Some(chrono::Utc::now() + chrono::Duration::minutes(5));
+        }
         let path = state.config.state_dir.join("config.json");
         let saved = state.config.clone();
         drop(state);
@@ -560,6 +894,76 @@ impl AppState {
         }
         if let Some(notice) = model_notice {
             *self.model_change_notice.lock().unwrap() = Some(notice);
+        }
+        if let Some(kind) = history_kind {
+            let operation = {
+                let mut history = self.operation_history.lock().unwrap();
+                let result = match kind {
+                    OperationKind::ManualSwitch => history.record_manual_switch(
+                        protocol,
+                        from_provider.as_deref(),
+                        &provider,
+                        reason,
+                    ),
+                    OperationKind::AutoFailover => from_provider.as_deref().map_or_else(
+                        || Err(anyhow!("自动切换缺少原 Provider")),
+                        |from| {
+                            history
+                                .record_auto_failover(protocol, from, &provider, reason)
+                                .map(|(record, grant)| (record, Some(grant)))
+                        },
+                    ),
+                    OperationKind::UndoSwitch | OperationKind::CooldownBlocked => {
+                        Err(anyhow!("该操作类型不能由普通切换入口记录"))
+                    }
+                };
+                match result {
+                    Ok((record, grant)) => {
+                        let save_result = self.save_operation_history(&history);
+                        (Ok(record), grant, save_result)
+                    }
+                    Err(error) => (Err(error), None, Ok(())),
+                }
+            };
+            match operation {
+                (Ok(record), grant, save_result) => {
+                    if let Err(error) = save_result {
+                        self.inner.lock().unwrap().last_error =
+                            Some(format!("保存操作历史失败: {error}"));
+                    }
+                    if let Some(grant) = grant {
+                        let token = grant.confirmation_token.clone();
+                        let ticket_id = grant.ticket.id.clone();
+                        *self.pending_undo.lock().unwrap() = Some(grant);
+                        *self.operation_notice.lock().unwrap() = Some(format!(
+                            "已记录{}切换 {}；撤销票据 {}，确认码 {}",
+                            if kind == OperationKind::AutoFailover {
+                                "自动"
+                            } else {
+                                "手动"
+                            },
+                            record.id,
+                            ticket_id,
+                            token
+                        ));
+                    } else {
+                        *self.operation_notice.lock().unwrap() =
+                            Some(format!("已记录 Provider 切换操作 {}", record.id));
+                    }
+                    if kind == OperationKind::AutoFailover
+                        && let Some(from) = from_provider.as_deref()
+                    {
+                        self.switch_cooldown
+                            .lock()
+                            .unwrap()
+                            .apply_auto_failover(protocol, from);
+                    }
+                }
+                (Err(error), _, _) => {
+                    self.inner.lock().unwrap().last_error =
+                        Some(format!("记录 Provider 切换失败: {error}"));
+                }
+            }
         }
         true
     }
@@ -703,7 +1107,7 @@ impl AppState {
         error: Option<String>,
         request: bool,
     ) {
-        let failover = {
+        let (failover, blocked) = {
             let mut state = self.inner.lock().unwrap();
             let Some(failed) = state
                 .routes
@@ -727,26 +1131,49 @@ impl AppState {
                 || active != Some(failed)
                 || state.routes[failed].state != RouteHealth::Unavailable
             {
-                None
+                (None, None)
             } else {
-                failover_candidate(
-                    &state.routes,
-                    protocol,
-                    failed,
-                    &state.config.failover_policy,
-                )
-                .map(|next| {
+                let mut cooldown = self.switch_cooldown.lock().unwrap();
+                cooldown.prune();
+                let failed_provider = state.routes[failed].provider.clone();
+                if !cooldown.protocol_allowed(protocol) {
                     (
-                        next,
-                        failed,
-                        state.routes[failed].name.clone(),
-                        state.routes[next].name.clone(),
+                        None,
+                        Some((
+                            failed_provider,
+                            None::<String>,
+                            format!("{} 协议仍在自动切换冷却期", protocol.label()),
+                        )),
                     )
-                })
+                } else {
+                    let candidate = failover_candidate_if(
+                        &state.routes,
+                        protocol,
+                        failed,
+                        &state.config.failover_policy,
+                        |target| cooldown.provider_allowed(protocol, target),
+                    );
+                    match candidate {
+                        Some(next) => (
+                            Some((
+                                next,
+                                failed,
+                                state.routes[failed].name.clone(),
+                                state.routes[next].name.clone(),
+                            )),
+                            None,
+                        ),
+                        None => (None, None),
+                    }
+                }
             }
         };
         if let Some((next, failed_index, failed, replacement)) = failover
-            && self.switch_index(next, "自动故障切换（连续 3 次失败）")
+            && self.switch_index_impl(
+                next,
+                "自动故障切换（连续 3 次失败）",
+                Some(OperationKind::AutoFailover),
+            )
         {
             self.inner.lock().unwrap().routes[failed_index].failover_blocked_until =
                 Some(chrono::Utc::now() + chrono::Duration::minutes(5));
@@ -756,6 +1183,33 @@ impl AppState {
                 failed,
                 replacement
             ));
+        }
+        if let Some((from, to, reason)) = blocked {
+            let record = {
+                let mut history = self.operation_history.lock().unwrap();
+                let record = history
+                    .record_blocked_failover(protocol, &from, to.as_deref(), &reason)
+                    .map_err(|error| {
+                        self.inner.lock().unwrap().last_error =
+                            Some(format!("记录冷却阻止操作失败: {error}"));
+                        error
+                    });
+                match record {
+                    Ok(record) => match self.save_operation_history(&history) {
+                        Ok(()) => Some(record),
+                        Err(error) => {
+                            self.inner.lock().unwrap().last_error =
+                                Some(format!("保存操作历史失败: {error}"));
+                            Some(record)
+                        }
+                    },
+                    Err(_) => None,
+                }
+            };
+            if let Some(record) = record {
+                *self.operation_notice.lock().unwrap() =
+                    Some(format!("自动切换已被冷却期阻止：{}", record.reason));
+            }
         }
     }
 
@@ -807,66 +1261,79 @@ impl AppState {
     }
 
     pub fn diagnostic_text(&self) -> String {
-        let state = self.inner.lock().unwrap();
-        let openai = active_route(&state, Protocol::OpenAi);
-        let anthropic = active_route(&state, Protocol::Anthropic);
-        let mode = format!(
-            "Codex {}；Claude {}",
-            mode_label(&state.config, Protocol::OpenAi),
-            mode_label(&state.config, Protocol::Anthropic)
-        );
-        format!(
-            "Headroom Route {}\r\n模式: {}\r\nCodex: {} [{}]\r\nClaude: {} [{}]\r\nCC-Switch: {} [{}]\r\nAgent: 127.0.0.1:{}\r\nHeadroom: 127.0.0.1:{} ({}, PID={})\r\n统计范围: {}\r\n压缩 Token: {} -> {}，节省 {} ({:.1}%)\r\n完成请求: {}，失败 {} ({:.1}%)\r\nCodex 上游: {}\r\nClaude 上游: {}\r\n路由数: {}\r\n自动切换: {}\r\n最近错误: {}\r\n恢复建议: {}",
-            env!("CARGO_PKG_VERSION"),
-            mode,
-            state.config.codex_config.display(),
-            availability(openai, transport_ready(&state, Protocol::OpenAi)),
-            state.config.claude_settings.display(),
-            availability(anthropic, transport_ready(&state, Protocol::Anthropic)),
-            state.config.cc_switch_db.display(),
-            yes(state.config.cc_switch_db.exists()),
-            state.config.agent_port,
-            state.config.headroom_port,
-            state.headroom_state,
-            state
-                .headroom_pid
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "--".into()),
-            metrics_scope(state.config.metrics_since),
-            state.headroom_metrics.input_tokens_original,
-            state.headroom_metrics.input_tokens_optimized,
-            state.headroom_metrics.tokens_saved,
-            state.headroom_metrics.compression_percent(),
-            state.headroom_metrics.completed_requests,
-            state.headroom_metrics.failed_requests,
-            state.headroom_metrics.failure_percent(),
-            route_summary(openai),
-            route_summary(anthropic),
-            state.routes.len(),
-            yes(state.config.auto_failover),
-            state.last_error.as_deref().unwrap_or("无"),
-            recovery_hint(
-                openai,
-                anthropic,
-                &state.headroom_state,
-                state.last_error.as_deref()
+        let (config, headroom_state, runtime_status) = {
+            let state = self.inner.lock().unwrap();
+            (
+                state.config.clone(),
+                state.headroom_state.clone(),
+                self.runtime_status_unlocked(&state),
             )
-        )
+        };
+        let precheck = crate::precheck::collect(&config);
+        // --doctor 在 worker 启动前执行，headroom_state 仍是初始的“检测中”；
+        // 运行结论改用与预检一致的探测结果，避免健康环境被误判为“恢复中”。
+        let runtime_status = if headroom_state == "检测中" {
+            precheck.runtime_status.clone()
+        } else {
+            runtime_status
+        };
+        let existing = {
+            let state = self.inner.lock().unwrap();
+            let openai = active_route(&state, Protocol::OpenAi);
+            let anthropic = active_route(&state, Protocol::Anthropic);
+            format!(
+                "Headroom Route {}\r\n运行结论: {}\r\n结论原因: {}\r\nCodex 状态: {}\r\nClaude 状态: {}\r\nHeadroom 状态: {}\r\nCodex: {} [{}]\r\nClaude: {} [{}]\r\nCC-Switch: {} [{}]\r\nAgent: 127.0.0.1:{}\r\nHeadroom: 127.0.0.1:{} ({}, PID={})\r\n统计范围: {}\r\n压缩 Token: {} -> {}，节省 {} ({:.1}%)\r\n完成请求: {}，失败 {} ({:.1}%)\r\nCodex 上游: {}\r\nClaude 上游: {}\r\n路由数: {}\r\n自动切换: {}\r\n最近错误: {}\r\n恢复建议: {}",
+                env!("CARGO_PKG_VERSION"),
+                runtime_status.mode.label(),
+                runtime_status.reason,
+                runtime_status.codex.summary(),
+                runtime_status.claude.summary(),
+                runtime_status.headroom.summary(),
+                state.config.codex_config.display(),
+                availability(openai, transport_ready(&state, Protocol::OpenAi)),
+                state.config.claude_settings.display(),
+                availability(anthropic, transport_ready(&state, Protocol::Anthropic)),
+                state.config.cc_switch_db.display(),
+                yes(state.config.cc_switch_db.exists()),
+                state.config.agent_port,
+                state.config.headroom_port,
+                state.headroom_state,
+                state
+                    .headroom_pid
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "--".into()),
+                metrics_scope(state.config.metrics_since),
+                state.headroom_metrics.input_tokens_original,
+                state.headroom_metrics.input_tokens_optimized,
+                state.headroom_metrics.tokens_saved,
+                state.headroom_metrics.compression_percent(),
+                state.headroom_metrics.completed_requests,
+                state.headroom_metrics.failed_requests,
+                state.headroom_metrics.failure_percent(),
+                route_summary(openai),
+                route_summary(anthropic),
+                state.routes.len(),
+                yes(state.config.auto_failover),
+                state.last_error.as_deref().unwrap_or("无"),
+                recovery_hint(
+                    openai,
+                    anthropic,
+                    &state.headroom_state,
+                    state.last_error.as_deref()
+                )
+            )
+        };
+        format!("{existing}\r\n\r\n{}", precheck.to_text())
     }
 
     fn snapshot_unlocked(&self, state: &RuntimeState) -> Snapshot {
         let openai = state.active.and_then(|i| state.routes.get(i));
         let anthropic = state.active_anthropic.and_then(|i| state.routes.get(i));
-        let health = combined_health(openai.map(|r| r.state), anthropic.map(|r| r.state));
+        let runtime_status = self.runtime_status_unlocked(state);
         Snapshot {
             service: "headroom-route",
             version: env!("CARGO_PKG_VERSION"),
-            state: match health {
-                RouteHealth::Healthy => "healthy",
-                RouteHealth::Degraded => "degraded",
-                RouteHealth::Unknown => "unknown",
-                RouteHealth::Unavailable => "unavailable",
-            },
+            state: runtime_status.mode.health_key(),
             active_provider: openai.map(|r| r.provider.clone()),
             active_name: openai.map(|r| r.name.clone()),
             active_url: openai.map(|r| r.base_url.clone()),
@@ -899,7 +1366,24 @@ impl AppState {
             routes: state.routes.clone(),
             last_switch_reason: state.last_switch_reason.clone(),
             last_error: state.last_error.clone(),
+            runtime_status,
         }
+    }
+
+    fn runtime_status_unlocked(&self, state: &RuntimeState) -> RuntimeStatus {
+        evaluate_runtime_status(RuntimeStatusInput {
+            codex_enabled: state.config.enable_codex,
+            claude_enabled: state.config.enable_claude,
+            direct_codex: state.config.direct_codex,
+            direct_claude: state.config.direct_claude,
+            bypass_headroom: state.config.bypass_headroom,
+            codex_route_health: active_route(state, Protocol::OpenAi).map(|route| route.state),
+            claude_route_health: active_route(state, Protocol::Anthropic).map(|route| route.state),
+            headroom_state: &state.headroom_state,
+            sync_in_progress: self.sync_in_progress.load(Ordering::Acquire),
+            restart_in_progress: self.restart_in_progress.load(Ordering::Acquire),
+            recovery_in_progress: self.recovery_in_progress.load(Ordering::Acquire),
+        })
     }
 }
 
@@ -911,20 +1395,6 @@ fn transport_ready(state: &RuntimeState, protocol: Protocol) -> bool {
     direct
         || state.config.bypass_headroom
         || matches!(state.headroom_state.as_str(), "healthy" | "external")
-}
-
-fn mode_label(config: &AppConfig, protocol: Protocol) -> &'static str {
-    let direct = match protocol {
-        Protocol::OpenAi => config.direct_codex,
-        Protocol::Anthropic => config.direct_claude,
-    };
-    if direct {
-        "直连上游"
-    } else if config.bypass_headroom {
-        "旁路 Headroom"
-    } else {
-        "经过 Headroom"
-    }
 }
 
 fn availability(route: Option<&Route>, transport_ready: bool) -> &'static str {
@@ -971,6 +1441,7 @@ fn provider_exists(routes: &[Route], protocol: Protocol, provider: &str) -> bool
         .iter()
         .any(|route| route.protocol == protocol && route.provider == provider)
 }
+
 fn valid_provider(routes: &[Route], protocol: Protocol, provider: Option<&str>) -> Option<String> {
     provider
         .filter(|id| provider_exists(routes, protocol, id))
@@ -998,16 +1469,21 @@ fn preserve_index(
         })
         .or_else(|| select_index(routes, protocol, selected))
 }
-fn failover_candidate(
+fn failover_candidate_if<F>(
     routes: &[Route],
     protocol: Protocol,
     failed: usize,
     policy: &FailoverPolicy,
-) -> Option<usize> {
+    allowed: F,
+) -> Option<usize>
+where
+    F: Fn(&str) -> bool,
+{
     let eligible = |index: usize, route: &Route| {
         index != failed
             && route.protocol == protocol
             && route.state == RouteHealth::Healthy
+            && allowed(route.provider.as_str())
             && route
                 .failover_blocked_until
                 .is_none_or(|until| until <= chrono::Utc::now())
@@ -1100,18 +1576,6 @@ fn recovery_hint(
     }
     "当前无需操作"
 }
-fn combined_health(a: Option<RouteHealth>, b: Option<RouteHealth>) -> RouteHealth {
-    let values = [a, b];
-    if values.iter().flatten().any(|v| *v == RouteHealth::Healthy) {
-        RouteHealth::Healthy
-    } else if values.iter().flatten().any(|v| *v == RouteHealth::Degraded) {
-        RouteHealth::Degraded
-    } else if values.iter().flatten().any(|v| *v == RouteHealth::Unknown) {
-        RouteHealth::Unknown
-    } else {
-        RouteHealth::Unavailable
-    }
-}
 fn protocol_for_path(path: &str) -> Protocol {
     if path == "/api/oauth/usage" || path.starts_with("/v1/messages") {
         Protocol::Anthropic
@@ -1139,13 +1603,119 @@ pub fn should_stop(app: &AppState) -> bool {
 mod tests {
     #![allow(clippy::field_reassign_with_default)]
     use super::{
-        AppState, RuntimeState, availability, failover_candidate, preserve_index,
-        protocol_for_path, recovery_hint, route_summary, update_check_due,
+        AppState, OperationHistory, RecoveryConfig, RecoveryEngine, RuntimeState, SwitchCooldown,
+        availability, failover_candidate_if, preserve_index, protocol_for_path, recovery_hint,
+        route_summary, update_check_due,
     };
     use crate::model::{
         AppConfig, AuthStyle, FailoverPolicy, HeadroomMetrics, Protocol, Route, RouteHealth,
+        RuntimeMode,
     };
-    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    fn test_app(config: AppConfig, routes: Vec<Route>) -> Arc<AppState> {
+        let active = routes
+            .iter()
+            .position(|route| route.protocol == Protocol::OpenAi);
+        let active_anthropic = routes
+            .iter()
+            .position(|route| route.protocol == Protocol::Anthropic);
+        Arc::new(AppState {
+            inner: Mutex::new(RuntimeState {
+                config,
+                routes,
+                active,
+                active_anthropic,
+                selected_provider: None,
+                selected_anthropic_provider: None,
+                headroom_state: "检测中".into(),
+                headroom_pid: None,
+                headroom_metrics: HeadroomMetrics::default(),
+                last_switch_reason: None,
+                last_error: None,
+            }),
+            stop: AtomicBool::new(false),
+            restart_headroom: AtomicBool::new(false),
+            force_probe: AtomicBool::new(false),
+            reset_metrics: AtomicBool::new(false),
+            sync_in_progress: AtomicBool::new(false),
+            sync_status: Mutex::new("未同步".into()),
+            sync_result: Mutex::new(None),
+            restart_in_progress: AtomicBool::new(false),
+            restart_status: Mutex::new("未重启".into()),
+            restart_result: Mutex::new(None),
+            model_change_notice: Mutex::new(None),
+            auto_switch_notice: Mutex::new(None),
+            runtime_result: Mutex::new(None),
+            config_change_notice: Mutex::new(None),
+            routing_notice: Mutex::new(None),
+            update_notice: Mutex::new(None),
+            operation_history: Mutex::new(OperationHistory::new()),
+            switch_cooldown: Mutex::new(SwitchCooldown::new()),
+            recovery: Mutex::new(RecoveryEngine::new(RecoveryConfig::default())),
+            recovery_in_progress: AtomicBool::new(false),
+            recovery_notice: Mutex::new(None),
+            operation_notice: Mutex::new(None),
+            pending_undo: Mutex::new(None),
+            routing_log_lock: Mutex::new(()),
+            maintenance_action: Mutex::new(None),
+        })
+    }
+
+    #[test]
+    fn snapshot_state_derives_from_runtime_mode() {
+        let mut routes = vec![
+            Route::new(
+                Protocol::OpenAi,
+                "codex".into(),
+                "Codex".into(),
+                "https://api.example.com/v1".into(),
+                None,
+                AuthStyle::Bearer,
+                "test",
+            ),
+            Route::new(
+                Protocol::Anthropic,
+                "claude".into(),
+                "Claude".into(),
+                "https://api.anthropic.com/v1".into(),
+                None,
+                AuthStyle::Bearer,
+                "test",
+            ),
+        ];
+        for route in &mut routes {
+            route.state = RouteHealth::Healthy;
+        }
+        let app = test_app(AppConfig::default(), routes);
+        app.inner.lock().unwrap().headroom_state = "runtime-unavailable".into();
+        let snapshot = app.snapshot();
+        assert_eq!(snapshot.runtime_status.mode, RuntimeMode::Degraded);
+        assert_eq!(snapshot.state, "degraded");
+
+        app.inner.lock().unwrap().config.bypass_headroom = true;
+        let snapshot = app.snapshot();
+        assert_eq!(snapshot.runtime_status.mode, RuntimeMode::Bypass);
+        assert_eq!(snapshot.state, "healthy");
+    }
+
+    #[test]
+    fn runtime_status_observes_sync_and_restart_flags() {
+        let mut config = AppConfig::default();
+        config.enable_codex = false;
+        config.enable_claude = false;
+        let app = test_app(config, Vec::new());
+        assert_eq!(app.snapshot().runtime_status.mode, RuntimeMode::Normal);
+
+        app.sync_in_progress.store(true, Ordering::Release);
+        assert_eq!(app.snapshot().runtime_status.mode, RuntimeMode::Recovering);
+        app.sync_in_progress.store(false, Ordering::Release);
+        app.restart_in_progress.store(true, Ordering::Release);
+        assert_eq!(app.snapshot().runtime_status.mode, RuntimeMode::Recovering);
+    }
 
     #[test]
     fn classifies_openai_and_anthropic_paths() {
@@ -1297,6 +1867,14 @@ mod tests {
             config_change_notice: Mutex::new(None),
             routing_notice: Mutex::new(None),
             update_notice: Mutex::new(None),
+            operation_history: Mutex::new(OperationHistory::new()),
+            switch_cooldown: Mutex::new(SwitchCooldown::new()),
+            recovery: Mutex::new(RecoveryEngine::new(RecoveryConfig::default())),
+            recovery_in_progress: AtomicBool::new(false),
+            recovery_notice: Mutex::new(None),
+            operation_notice: Mutex::new(None),
+            pending_undo: Mutex::new(None),
+            routing_log_lock: Mutex::new(()),
             maintenance_action: Mutex::new(None),
         });
         app.record_route_result(Protocol::OpenAi, "second", true, 25, Some(200), None, true);
@@ -1387,6 +1965,14 @@ mod tests {
             config_change_notice: Mutex::new(None),
             routing_notice: Mutex::new(None),
             update_notice: Mutex::new(None),
+            operation_history: Mutex::new(OperationHistory::new()),
+            switch_cooldown: Mutex::new(SwitchCooldown::new()),
+            recovery: Mutex::new(RecoveryEngine::new(RecoveryConfig::default())),
+            recovery_in_progress: AtomicBool::new(false),
+            recovery_notice: Mutex::new(None),
+            operation_notice: Mutex::new(None),
+            pending_undo: Mutex::new(None),
+            routing_log_lock: Mutex::new(()),
             maintenance_action: Mutex::new(None),
         });
         assert!(app.toggle_auto_failover().unwrap());
@@ -1421,6 +2007,17 @@ mod tests {
             app.inner.lock().unwrap().routes[0]
                 .failover_blocked_until
                 .is_some()
+        );
+        let history = app.operation_history();
+        assert!(
+            history
+                .iter()
+                .any(|record| record.kind == crate::operation_history::OperationKind::AutoFailover)
+        );
+        assert!(app.switch_index(0, "manual 3 failure test"));
+        assert_eq!(
+            app.operation_history().last().map(|record| &record.kind),
+            Some(&crate::operation_history::OperationKind::ManualSwitch)
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1464,7 +2061,7 @@ mod tests {
             .openai
             .insert("primary".into(), vec!["first".into(), "second".into()]);
         assert_eq!(
-            failover_candidate(&routes, Protocol::OpenAi, 0, &policy),
+            failover_candidate_if(&routes, Protocol::OpenAi, 0, &policy, |_| true),
             Some(1)
         );
 
@@ -1472,11 +2069,17 @@ mod tests {
             .openai
             .insert("primary".into(), vec!["missing".into()]);
         assert_eq!(
-            failover_candidate(&routes, Protocol::OpenAi, 0, &policy),
+            failover_candidate_if(&routes, Protocol::OpenAi, 0, &policy, |_| true),
             None
         );
         assert_eq!(
-            failover_candidate(&routes, Protocol::OpenAi, 0, &FailoverPolicy::default()),
+            failover_candidate_if(
+                &routes,
+                Protocol::OpenAi,
+                0,
+                &FailoverPolicy::default(),
+                |_| true,
+            ),
             Some(2)
         );
     }
@@ -1541,6 +2144,14 @@ mod tests {
             config_change_notice: Mutex::new(None),
             routing_notice: Mutex::new(None),
             update_notice: Mutex::new(None),
+            operation_history: Mutex::new(OperationHistory::new()),
+            switch_cooldown: Mutex::new(SwitchCooldown::new()),
+            recovery: Mutex::new(RecoveryEngine::new(RecoveryConfig::default())),
+            recovery_in_progress: AtomicBool::new(false),
+            recovery_notice: Mutex::new(None),
+            operation_notice: Mutex::new(None),
+            pending_undo: Mutex::new(None),
+            routing_log_lock: Mutex::new(()),
             maintenance_action: Mutex::new(None),
         });
         assert!(app.switch_index(1, "test"));

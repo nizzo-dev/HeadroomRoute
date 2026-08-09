@@ -61,7 +61,8 @@ const CHILD_SCREEN_HEIGHT: i16 = 40;
 const GENERIC_READ_FLAG: u32 = 0x8000_0000;
 const GENERIC_WRITE_FLAG: u32 = 0x4000_0000;
 const PIPE_ACCESS_DUPLEX_FLAG: u32 = 0x0000_0003;
-const BACKGROUND_REMINDER_DELAY: Duration = Duration::from_secs(3);
+// 给终端短暂的焦点切换时间，避免后台请求在瞬时失焦时立刻抢占；不再等待 3 秒。
+const BACKGROUND_REMINDER_DELAY: Duration = Duration::from_millis(350);
 
 #[derive(Clone, Debug)]
 pub struct ApprovalRequest {

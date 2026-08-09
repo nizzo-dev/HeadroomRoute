@@ -340,6 +340,8 @@ fn download_update(
     }
     let installer = package_dir.join("Install.ps1");
     let executable = package_dir.join(format!("HeadroomRoute-{}.exe", update.version));
+    let cli_executable = package_dir.join(format!("HeadroomRouteCLI-{}.exe", update.version));
+    let shim = package_dir.join("hr.cmd");
     extract_files(
         &archive_path,
         &[
@@ -348,6 +350,11 @@ fn download_update(
                 &format!("HeadroomRoute-{}.exe", update.version),
                 executable.as_path(),
             ),
+            (
+                &format!("HeadroomRouteCLI-{}.exe", update.version),
+                cli_executable.as_path(),
+            ),
+            ("hr.cmd", shim.as_path()),
         ],
     )?;
     if progress.is_cancelled() {
@@ -570,8 +577,23 @@ fn wide(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GithubRelease, checksum_for, parse_version, select_update, write_download};
+    use super::{
+        GithubRelease, checksum_for, extract_files, parse_version, select_update, write_download,
+    };
     use std::{cell::Cell, fs, io::Cursor};
+
+    fn write_package_zip(path: &std::path::Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let file = fs::File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        for (name, content) in entries {
+            archive
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(content).unwrap();
+        }
+        archive.finish().unwrap();
+    }
 
     #[test]
     fn compares_three_part_versions() {
@@ -645,5 +667,71 @@ mod tests {
         assert!(write_download(Cursor::new([3u8, 4]), &path, 2, 4, || false, |_, _| {}).unwrap());
         assert_eq!(fs::read(&path).unwrap(), [1, 2, 3, 4]);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn extracts_cli_and_shim_alongside_installer() {
+        let unique = format!("{}-extract", std::process::id());
+        let archive = std::env::temp_dir().join(format!("headroom-route-extract-{unique}.zip"));
+        let target = std::env::temp_dir().join(format!("headroom-route-extract-{unique}-out"));
+        fs::create_dir_all(&target).unwrap();
+        write_package_zip(
+            &archive,
+            &[
+                ("Install.ps1", b"installer"),
+                ("HeadroomRoute-0.5.0.exe", b"main"),
+                ("HeadroomRouteCLI-0.5.0.exe", b"cli"),
+                ("hr.cmd", b"shim"),
+            ],
+        );
+        let result = extract_files(
+            &archive,
+            &[
+                ("Install.ps1", target.join("Install.ps1").as_path()),
+                ("HeadroomRoute-0.5.0.exe", target.join("main.exe").as_path()),
+                (
+                    "HeadroomRouteCLI-0.5.0.exe",
+                    target.join("cli.exe").as_path(),
+                ),
+                ("hr.cmd", target.join("hr.cmd").as_path()),
+            ],
+        );
+        assert!(result.is_ok());
+        assert_eq!(fs::read(target.join("main.exe")).unwrap(), b"main");
+        assert_eq!(fs::read(target.join("cli.exe")).unwrap(), b"cli");
+        assert_eq!(fs::read(target.join("hr.cmd")).unwrap(), b"shim");
+        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_file(&archive);
+    }
+
+    #[test]
+    fn update_fails_when_package_lacks_cli() {
+        let unique = format!("{}-noclipkg", std::process::id());
+        let archive = std::env::temp_dir().join(format!("headroom-route-extract-{unique}.zip"));
+        let target = std::env::temp_dir().join(format!("headroom-route-extract-{unique}-out"));
+        fs::create_dir_all(&target).unwrap();
+        write_package_zip(
+            &archive,
+            &[
+                ("Install.ps1", b"installer"),
+                ("HeadroomRoute-0.5.0.exe", b"main"),
+            ],
+        );
+        let error = extract_files(
+            &archive,
+            &[
+                ("Install.ps1", target.join("Install.ps1").as_path()),
+                ("HeadroomRoute-0.5.0.exe", target.join("main.exe").as_path()),
+                (
+                    "HeadroomRouteCLI-0.5.0.exe",
+                    target.join("cli.exe").as_path(),
+                ),
+                ("hr.cmd", target.join("hr.cmd").as_path()),
+            ],
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("HeadroomRouteCLI"));
+        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_file(&archive);
     }
 }

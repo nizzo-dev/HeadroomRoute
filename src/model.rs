@@ -1,3 +1,4 @@
+use crate::routing_policy::RoutingStrategyConfig;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
@@ -37,6 +38,8 @@ pub struct AppConfig {
     pub last_update_check: Option<DateTime<Utc>>,
     pub show_api_key_on_hover: bool,
     pub headroom_python: Option<PathBuf>,
+    /// Policy defaults keep existing routing unchanged until explicitly enabled.
+    pub routing_strategy: RoutingStrategyConfig,
 }
 
 impl Default for AppConfig {
@@ -78,6 +81,7 @@ impl Default for AppConfig {
             last_update_check: None,
             show_api_key_on_hover: false,
             headroom_python: Some(home.join(".headroom/venv/Scripts/python.exe")),
+            routing_strategy: RoutingStrategyConfig::default(),
         }
     }
 }
@@ -138,7 +142,7 @@ pub enum AuthStyle {
     PassThrough,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Route {
     pub protocol: Protocol,
     pub provider: String,
@@ -257,7 +261,7 @@ impl Route {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RouteHealth {
     Unknown,
@@ -303,11 +307,333 @@ fn percent(part: u64, total: u64) -> f64 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeMode {
+    Normal,
+    Degraded,
+    Bypass,
+    Direct,
+    Recovering,
+}
+
+impl RuntimeMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "正常",
+            Self::Degraded => "降级",
+            Self::Bypass => "旁路",
+            Self::Direct => "直连",
+            Self::Recovering => "恢复中",
+        }
+    }
+
+    pub fn health_key(self) -> &'static str {
+        match self {
+            Self::Normal | Self::Bypass | Self::Direct => "healthy",
+            Self::Degraded => "degraded",
+            Self::Recovering => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientPath {
+    Disabled,
+    Headroom,
+    Bypass,
+    Direct,
+}
+
+impl ClientPath {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "未启用",
+            Self::Headroom => "经 Headroom",
+            Self::Bypass => "旁路 Headroom",
+            Self::Direct => "直连上游",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComponentState {
+    Disabled,
+    NotRequired,
+    Ready,
+    Checking,
+    Degraded,
+    Unavailable,
+}
+
+impl ComponentState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "未启用",
+            Self::NotRequired => "不需要",
+            Self::Ready => "可用",
+            Self::Checking => "检测中",
+            Self::Degraded => "降级",
+            Self::Unavailable => "不可用",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ClientRuntimeStatus {
+    pub path: ClientPath,
+    pub state: ComponentState,
+    pub reason: String,
+}
+
+impl ClientRuntimeStatus {
+    pub fn summary(&self) -> String {
+        format!(
+            "{} · {} · {}",
+            self.path.label(),
+            self.state.label(),
+            self.reason
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct HeadroomRuntimeStatus {
+    pub state: ComponentState,
+    pub reason: String,
+}
+
+impl HeadroomRuntimeStatus {
+    pub fn summary(&self) -> String {
+        format!("{} · {}", self.state.label(), self.reason)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RuntimeStatus {
+    pub mode: RuntimeMode,
+    pub reason: String,
+    pub codex: ClientRuntimeStatus,
+    pub claude: ClientRuntimeStatus,
+    pub headroom: HeadroomRuntimeStatus,
+}
+
+impl RuntimeStatus {
+    pub fn summary(&self) -> String {
+        format!("{} · {}", self.mode.label(), self.reason)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeStatusInput<'a> {
+    pub codex_enabled: bool,
+    pub claude_enabled: bool,
+    pub direct_codex: bool,
+    pub direct_claude: bool,
+    pub bypass_headroom: bool,
+    pub codex_route_health: Option<RouteHealth>,
+    pub claude_route_health: Option<RouteHealth>,
+    pub headroom_state: &'a str,
+    pub sync_in_progress: bool,
+    pub restart_in_progress: bool,
+    pub recovery_in_progress: bool,
+}
+
+/// 五种运行模式的统一判定，是托盘、完整状态、预检与诊断报告共用的单一强类型来源。
+///
+/// 优先级从高到低（首次命中的分支即当前模式；条件变化后重新求值即进入/退出，
+/// 无需手动迁移，`reason` 即为可读的迁移原因）：
+///
+/// 1. `Degraded`（降级）：必需且正在使用的组件失败 —— 需要 Headroom 但 Headroom
+///    不可用，或任一启用客户端的当前路由失败/不可用/未配置。真实请求已受影响，
+///    故优先级最高；退出条件是失败组件恢复为可用/待验证。
+/// 2. `Recovering`（恢复中，显式操作）：重启或同步进行中。这是用户可见的进行中
+///    操作，即使在直连/旁路拓扑下也应在顶层显示；退出条件是操作完成。
+/// 3. `Direct`（直连）：任一启用客户端直连上游（不经本地代理，也必然不经 Headroom）。
+///    显式拓扑，优先于校验态；退出条件是全部直连客户端恢复经代理路由。
+/// 4. `Bypass`（旁路）：`bypass_headroom` 开启且存在启用但未直连的客户端。显式拓扑，
+///    优先于校验态；退出条件是旁路开关关闭。
+/// 5. `Recovering`（恢复中，校验态）：必需组件仍在检测（Headroom 启动、Headroom
+///    路径路由等待验证）。仅 `RouteHealth::Unknown` 会进入此态，不打断稳定的
+///    Direct/Bypass；仅作观察层：不改变实际请求路径，也不阻塞真实请求；退出条件是
+///    操作完成或组件进入就绪/失败态。
+/// 6. `Normal`（正常）：所有启用客户端与所需组件均可用，且无进行中操作。
+pub fn evaluate_runtime_status(input: RuntimeStatusInput<'_>) -> RuntimeStatus {
+    let codex_path = client_path(
+        input.codex_enabled,
+        input.direct_codex,
+        input.bypass_headroom,
+    );
+    let claude_path = client_path(
+        input.claude_enabled,
+        input.direct_claude,
+        input.bypass_headroom,
+    );
+    let headroom_required =
+        matches!(codex_path, ClientPath::Headroom) || matches!(claude_path, ClientPath::Headroom);
+    let headroom = headroom_status(headroom_required, input.headroom_state);
+    let codex = client_status(codex_path, input.codex_route_health, &headroom);
+    let claude = client_status(claude_path, input.claude_route_health, &headroom);
+
+    let headroom_failed = headroom_required && headroom.state == ComponentState::Unavailable;
+    let client_failed = [(&codex, "Codex"), (&claude, "Claude")]
+        .into_iter()
+        .find(|(status, _)| {
+            matches!(
+                status.state,
+                ComponentState::Degraded | ComponentState::Unavailable
+            )
+        });
+    let bypass = input.bypass_headroom
+        && [codex_path, claude_path]
+            .into_iter()
+            .any(|path| path == ClientPath::Bypass);
+    let direct = [codex_path, claude_path]
+        .into_iter()
+        .any(|path| path == ClientPath::Direct);
+
+    let (mode, reason) = if headroom_failed {
+        (RuntimeMode::Degraded, headroom.reason.clone())
+    } else if let Some((status, name)) = client_failed {
+        (RuntimeMode::Degraded, format!("{name}：{}", status.reason))
+    } else if input.restart_in_progress {
+        (RuntimeMode::Recovering, "正在重启 Headroom".into())
+    } else if input.sync_in_progress {
+        (RuntimeMode::Recovering, "正在同步客户端路由配置".into())
+    } else if input.recovery_in_progress {
+        (RuntimeMode::Recovering, "正在恢复本地运行环境".into())
+    } else if direct {
+        let all_enabled_direct = [codex_path, claude_path]
+            .into_iter()
+            .filter(|path| *path != ClientPath::Disabled)
+            .all(|path| path == ClientPath::Direct);
+        (
+            RuntimeMode::Direct,
+            if all_enabled_direct {
+                "所有启用的客户端均直连上游".into()
+            } else {
+                "部分客户端直连上游，其余客户端保持当前路径".into()
+            },
+        )
+    } else if bypass {
+        (
+            RuntimeMode::Bypass,
+            "启用的非直连客户端已旁路 Headroom".into(),
+        )
+    } else if headroom.state == ComponentState::Checking {
+        (RuntimeMode::Recovering, headroom.reason.clone())
+    } else if let Some((status, name)) = [(&codex, "Codex"), (&claude, "Claude")]
+        .into_iter()
+        .find(|(status, _)| status.state == ComponentState::Checking)
+    {
+        (
+            RuntimeMode::Recovering,
+            format!("{name}：{}", status.reason),
+        )
+    } else {
+        let any_enabled = [codex_path, claude_path]
+            .into_iter()
+            .any(|path| path != ClientPath::Disabled);
+        (
+            RuntimeMode::Normal,
+            if any_enabled {
+                "所有启用的客户端与所需组件均可用".into()
+            } else {
+                "Codex 与 Claude 均未启用".into()
+            },
+        )
+    };
+
+    RuntimeStatus {
+        mode,
+        reason,
+        codex,
+        claude,
+        headroom,
+    }
+}
+
+fn client_path(enabled: bool, direct: bool, bypass_headroom: bool) -> ClientPath {
+    if !enabled {
+        ClientPath::Disabled
+    } else if direct {
+        ClientPath::Direct
+    } else if bypass_headroom {
+        ClientPath::Bypass
+    } else {
+        ClientPath::Headroom
+    }
+}
+
+fn headroom_status(required: bool, state: &str) -> HeadroomRuntimeStatus {
+    if !required {
+        return HeadroomRuntimeStatus {
+            state: ComponentState::NotRequired,
+            reason: "当前客户端路径不经过 Headroom".into(),
+        };
+    }
+    let (state, reason) = match state {
+        "healthy" => (ComponentState::Ready, "本地 Headroom 正常"),
+        "external" => (ComponentState::Ready, "已连接外部 Headroom"),
+        "检测中" | "运行环境就绪" | "starting" | "restarting" => {
+            (ComponentState::Checking, "Headroom 正在启动或恢复")
+        }
+        "runtime-unavailable" => (ComponentState::Unavailable, "Headroom 运行环境不可用"),
+        _ => (ComponentState::Unavailable, "Headroom 服务不可用"),
+    };
+    HeadroomRuntimeStatus {
+        state,
+        reason: reason.into(),
+    }
+}
+
+fn client_status(
+    path: ClientPath,
+    route_health: Option<RouteHealth>,
+    headroom: &HeadroomRuntimeStatus,
+) -> ClientRuntimeStatus {
+    if path == ClientPath::Disabled {
+        return ClientRuntimeStatus {
+            path,
+            state: ComponentState::Disabled,
+            reason: "客户端未启用".into(),
+        };
+    }
+    let Some(route_health) = route_health else {
+        return ClientRuntimeStatus {
+            path,
+            state: ComponentState::Unavailable,
+            reason: "未配置可用路由".into(),
+        };
+    };
+    if path == ClientPath::Headroom && headroom.state != ComponentState::Ready {
+        return ClientRuntimeStatus {
+            path,
+            state: headroom.state,
+            reason: headroom.reason.clone(),
+        };
+    }
+    let (state, reason) = match route_health {
+        RouteHealth::Healthy => (ComponentState::Ready, "当前路由已验证"),
+        RouteHealth::Unknown => (ComponentState::Checking, "当前路由等待验证"),
+        RouteHealth::Degraded => (ComponentState::Degraded, "当前路由出现失败"),
+        RouteHealth::Unavailable => (ComponentState::Unavailable, "当前路由不可用"),
+    };
+    ClientRuntimeStatus {
+        path,
+        state,
+        reason: reason.into(),
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
     pub service: &'static str,
     pub version: &'static str,
     pub state: &'static str,
+    pub runtime_status: RuntimeStatus,
     pub active_provider: Option<String>,
     pub active_name: Option<String>,
     pub active_url: Option<String>,
@@ -337,4 +663,298 @@ pub struct Snapshot {
     pub routes: Vec<Route>,
     pub last_switch_reason: Option<String>,
     pub last_error: Option<String>,
+}
+
+#[cfg(test)]
+mod runtime_status_tests {
+    use super::{
+        AppConfig, ClientPath, ComponentState, RouteHealth, RuntimeMode, RuntimeStatusInput,
+        evaluate_runtime_status,
+    };
+
+    #[test]
+    fn old_config_without_routing_strategy_uses_disabled_defaults() {
+        let config: AppConfig = serde_json::from_str(r#"{"enable_codex":true}"#).unwrap();
+        assert!(!config.routing_strategy.enabled);
+        assert!(config.routing_strategy.observe_only);
+        assert!(config.routing_strategy.provider_costs.is_empty());
+    }
+
+    #[test]
+    fn routing_strategy_costs_are_provider_id_mappings() {
+        let config: AppConfig =
+            serde_json::from_str(r#"{"routing_strategy":{"provider_costs":{"provider-a":0.25}}}"#)
+                .unwrap();
+        assert_eq!(
+            config.routing_strategy.provider_cost("provider-a"),
+            Some(0.25)
+        );
+        assert!(
+            serde_json::from_str::<AppConfig>(
+                r#"{"routing_strategy":{"provider_costs":{"provider-a":-1.0}}}"#
+            )
+            .is_err()
+        );
+    }
+
+    fn healthy_input() -> RuntimeStatusInput<'static> {
+        RuntimeStatusInput {
+            codex_enabled: true,
+            claude_enabled: true,
+            direct_codex: false,
+            direct_claude: false,
+            bypass_headroom: false,
+            codex_route_health: Some(RouteHealth::Healthy),
+            claude_route_health: Some(RouteHealth::Healthy),
+            headroom_state: "healthy",
+            sync_in_progress: false,
+            restart_in_progress: false,
+            recovery_in_progress: false,
+        }
+    }
+
+    #[test]
+    fn healthy_headroom_routes_are_normal() {
+        let status = evaluate_runtime_status(healthy_input());
+        assert_eq!(status.mode, RuntimeMode::Normal);
+        assert_eq!(status.codex.path, ClientPath::Headroom);
+        assert_eq!(status.claude.state, ComponentState::Ready);
+        assert_eq!(status.headroom.state, ComponentState::Ready);
+    }
+
+    #[test]
+    fn unhealthy_required_component_is_degraded() {
+        let status = evaluate_runtime_status(RuntimeStatusInput {
+            headroom_state: "runtime-unavailable",
+            ..healthy_input()
+        });
+        assert_eq!(status.mode, RuntimeMode::Degraded);
+        assert_eq!(status.codex.state, ComponentState::Unavailable);
+        assert!(status.reason.contains("Headroom 运行环境不可用"));
+    }
+
+    #[test]
+    fn bypass_and_direct_are_explicit_operating_modes() {
+        let bypass = evaluate_runtime_status(RuntimeStatusInput {
+            bypass_headroom: true,
+            headroom_state: "unavailable",
+            ..healthy_input()
+        });
+        assert_eq!(bypass.mode, RuntimeMode::Bypass);
+        assert_eq!(bypass.codex.path, ClientPath::Bypass);
+        assert_eq!(bypass.headroom.state, ComponentState::NotRequired);
+
+        let direct = evaluate_runtime_status(RuntimeStatusInput {
+            direct_codex: true,
+            direct_claude: true,
+            headroom_state: "unavailable",
+            ..healthy_input()
+        });
+        assert_eq!(direct.mode, RuntimeMode::Direct);
+        assert_eq!(direct.codex.path, ClientPath::Direct);
+        assert_eq!(direct.headroom.state, ComponentState::NotRequired);
+    }
+
+    #[test]
+    fn active_recovery_is_observable_without_changing_client_paths() {
+        let status = evaluate_runtime_status(RuntimeStatusInput {
+            restart_in_progress: true,
+            ..healthy_input()
+        });
+        assert_eq!(status.mode, RuntimeMode::Recovering);
+        assert_eq!(status.codex.path, ClientPath::Headroom);
+        assert_eq!(status.claude.path, ClientPath::Headroom);
+        assert!(status.reason.contains("重启"));
+    }
+
+    #[test]
+    fn missing_route_degrades_only_the_affected_client() {
+        let status = evaluate_runtime_status(RuntimeStatusInput {
+            codex_route_health: None,
+            ..healthy_input()
+        });
+        assert_eq!(status.mode, RuntimeMode::Degraded);
+        assert_eq!(status.codex.state, ComponentState::Unavailable);
+        assert_eq!(status.claude.state, ComponentState::Ready);
+        assert!(status.reason.starts_with("Codex"));
+    }
+
+    #[test]
+    fn bypass_mode_is_stable_before_routes_are_verified() {
+        let status = evaluate_runtime_status(RuntimeStatusInput {
+            bypass_headroom: true,
+            codex_route_health: Some(RouteHealth::Unknown),
+            claude_route_health: Some(RouteHealth::Unknown),
+            ..healthy_input()
+        });
+        assert_eq!(status.mode, RuntimeMode::Bypass);
+        assert_eq!(status.codex.path, ClientPath::Bypass);
+        assert_eq!(status.codex.state, ComponentState::Checking);
+    }
+
+    #[test]
+    fn direct_mode_is_stable_before_routes_are_verified() {
+        let status = evaluate_runtime_status(RuntimeStatusInput {
+            direct_codex: true,
+            direct_claude: true,
+            codex_route_health: Some(RouteHealth::Unknown),
+            claude_route_health: Some(RouteHealth::Unknown),
+            ..healthy_input()
+        });
+        assert_eq!(status.mode, RuntimeMode::Direct);
+        assert_eq!(status.codex.path, ClientPath::Direct);
+        assert_eq!(status.codex.state, ComponentState::Checking);
+    }
+
+    #[test]
+    fn real_route_failure_outranks_explicit_bypass_mode() {
+        let status = evaluate_runtime_status(RuntimeStatusInput {
+            bypass_headroom: true,
+            codex_route_health: Some(RouteHealth::Degraded),
+            ..healthy_input()
+        });
+        assert_eq!(status.mode, RuntimeMode::Degraded);
+        assert_eq!(status.codex.state, ComponentState::Degraded);
+    }
+
+    #[test]
+    fn mixed_direct_and_bypass_clients_show_direct_with_partial_reason() {
+        let status = evaluate_runtime_status(RuntimeStatusInput {
+            bypass_headroom: true,
+            direct_codex: true,
+            codex_route_health: Some(RouteHealth::Unknown),
+            ..healthy_input()
+        });
+        assert_eq!(status.mode, RuntimeMode::Direct);
+        assert_eq!(status.codex.path, ClientPath::Direct);
+        assert_eq!(status.claude.path, ClientPath::Bypass);
+        assert!(status.reason.contains("部分客户端直连上游"));
+    }
+
+    #[test]
+    fn sync_recovery_is_observable_without_changing_client_paths() {
+        let status = evaluate_runtime_status(RuntimeStatusInput {
+            sync_in_progress: true,
+            ..healthy_input()
+        });
+        assert_eq!(status.mode, RuntimeMode::Recovering);
+        assert_eq!(status.codex.path, ClientPath::Headroom);
+        assert_eq!(status.claude.path, ClientPath::Headroom);
+        assert!(status.reason.contains("同步"));
+    }
+
+    #[test]
+    fn recovery_exits_once_restart_and_sync_finish() {
+        let input = healthy_input();
+        assert_eq!(
+            evaluate_runtime_status(RuntimeStatusInput {
+                restart_in_progress: true,
+                ..input
+            })
+            .mode,
+            RuntimeMode::Recovering
+        );
+        assert_eq!(evaluate_runtime_status(input).mode, RuntimeMode::Normal);
+    }
+
+    #[test]
+    fn restart_and_sync_show_recovering_even_in_direct_mode() {
+        let restarting = evaluate_runtime_status(RuntimeStatusInput {
+            direct_codex: true,
+            direct_claude: true,
+            restart_in_progress: true,
+            ..healthy_input()
+        });
+        assert_eq!(restarting.mode, RuntimeMode::Recovering);
+        assert!(restarting.reason.contains("重启"));
+        assert_eq!(restarting.codex.path, ClientPath::Direct);
+
+        let syncing = evaluate_runtime_status(RuntimeStatusInput {
+            direct_codex: true,
+            direct_claude: true,
+            sync_in_progress: true,
+            ..healthy_input()
+        });
+        assert_eq!(syncing.mode, RuntimeMode::Recovering);
+        assert!(syncing.reason.contains("同步"));
+        assert_eq!(syncing.codex.path, ClientPath::Direct);
+    }
+
+    #[test]
+    fn restart_and_sync_show_recovering_even_in_bypass_mode() {
+        let restarting = evaluate_runtime_status(RuntimeStatusInput {
+            bypass_headroom: true,
+            restart_in_progress: true,
+            ..healthy_input()
+        });
+        assert_eq!(restarting.mode, RuntimeMode::Recovering);
+        assert!(restarting.reason.contains("重启"));
+        assert_eq!(restarting.codex.path, ClientPath::Bypass);
+
+        let syncing = evaluate_runtime_status(RuntimeStatusInput {
+            bypass_headroom: true,
+            sync_in_progress: true,
+            ..healthy_input()
+        });
+        assert_eq!(syncing.mode, RuntimeMode::Recovering);
+        assert!(syncing.reason.contains("同步"));
+        assert_eq!(syncing.codex.path, ClientPath::Bypass);
+    }
+
+    #[test]
+    fn real_failure_still_outranks_explicit_recovery_operations() {
+        // 真实路由失败在显式重启期间仍保持最高优先级。
+        let status = evaluate_runtime_status(RuntimeStatusInput {
+            direct_codex: true,
+            direct_claude: true,
+            codex_route_health: Some(RouteHealth::Degraded),
+            restart_in_progress: true,
+            ..healthy_input()
+        });
+        assert_eq!(status.mode, RuntimeMode::Degraded);
+        assert_eq!(status.codex.state, ComponentState::Degraded);
+    }
+
+    #[test]
+    fn headroom_starting_is_recovering_until_ready() {
+        let status = evaluate_runtime_status(RuntimeStatusInput {
+            headroom_state: "starting",
+            ..healthy_input()
+        });
+        assert_eq!(status.mode, RuntimeMode::Recovering);
+        assert_eq!(status.headroom.state, ComponentState::Checking);
+    }
+
+    #[test]
+    fn disabled_clients_are_normal_with_clear_reason() {
+        let status = evaluate_runtime_status(RuntimeStatusInput {
+            codex_enabled: false,
+            claude_enabled: false,
+            ..healthy_input()
+        });
+        assert_eq!(status.mode, RuntimeMode::Normal);
+        assert!(status.reason.contains("均未启用"));
+    }
+
+    #[test]
+    fn checking_route_in_normal_mode_is_recovering() {
+        let status = evaluate_runtime_status(RuntimeStatusInput {
+            codex_route_health: Some(RouteHealth::Unknown),
+            ..healthy_input()
+        });
+        assert_eq!(status.mode, RuntimeMode::Recovering);
+        assert_eq!(status.codex.state, ComponentState::Checking);
+    }
+
+    #[test]
+    fn headroom_unavailability_is_reasoned_by_headroom_not_the_client() {
+        let status = evaluate_runtime_status(RuntimeStatusInput {
+            headroom_state: "unavailable",
+            ..healthy_input()
+        });
+        assert_eq!(status.mode, RuntimeMode::Degraded);
+        assert_eq!(status.headroom.state, ComponentState::Unavailable);
+        assert!(status.reason.contains("Headroom"));
+        assert!(!status.reason.starts_with("Codex"));
+    }
 }

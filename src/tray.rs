@@ -1,23 +1,37 @@
 #![cfg(windows)]
+use crate::config::portability::{
+    BackupDescriptor, TakeoverPlan, apply_takeover_plan, create_config_backup,
+    create_diagnostic_bundle, decode_portable_config, export_portable_config,
+    import_portable_config, list_config_backups, prepare_takeover, restore_config_backup,
+};
 use crate::{
     approval::{self, ApprovalChoice, ApprovalRequest},
     config,
-    model::{FailoverPolicy, Protocol, Route, Snapshot},
-    notification, runtime,
+    model::{ComponentState, FailoverPolicy, Protocol, Route, RuntimeStatus, Snapshot},
+    notification, precheck,
+    precheck::{PrecheckAction, PrecheckReport},
+    runtime,
     state::AppState,
     updater,
 };
 use std::{
     cell::{Cell, RefCell},
     ffi::c_void,
+    fs,
     mem::size_of,
+    path::{Path, PathBuf},
     process::Command,
     ptr,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc,
     },
     thread,
+};
+use windows_sys::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, GetSaveFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT,
+    OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::{
@@ -33,7 +47,7 @@ use windows_sys::Win32::{
         FillRect, GetMonitorInfoW, GetStockObject, GetSysColorBrush, InvalidateRect,
         MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
         PS_SOLID, RoundRect, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
-        SetWindowRgn, TRANSPARENT,
+        SetWindowRgn, TRANSPARENT, UpdateWindow,
     },
     System::{
         DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
@@ -88,6 +102,13 @@ const ID_FAILOVER_EDITOR: usize = 121;
 const ID_APPROVAL_DEMO: usize = 122;
 const ID_DIRECT_CODEX: usize = 123;
 const ID_DIRECT_CLAUDE: usize = 124;
+const ID_PRECHECK: usize = 125;
+const ID_TAKEOVER: usize = 126;
+const ID_CREATE_BACKUP: usize = 127;
+const ID_RESTORE_BACKUP: usize = 128;
+const ID_EXPORT_PORTABLE: usize = 129;
+const ID_IMPORT_PORTABLE: usize = 130;
+const ID_DIAGNOSTIC_ZIP: usize = 131;
 const ID_ROUTE_BASE: usize = 1000;
 const ID_EDITOR_AUTO: usize = 200;
 const ID_EDITOR_PROTOCOL: usize = 201;
@@ -103,10 +124,62 @@ const ID_EDITOR_SAVE: usize = 210;
 const ID_EDITOR_CANCEL: usize = 211;
 const ID_EDITOR_STATUS: usize = 212;
 const ID_EDITOR_SOURCE_DETAIL: usize = 213;
+const ID_PRECHECK_SUMMARY: usize = 310;
+const ID_PRECHECK_REPORT: usize = 311;
+const ID_PRECHECK_RECHECK: usize = 312;
+const ID_PRECHECK_COPY: usize = 313;
+const ID_PRECHECK_CLOSE: usize = 314;
+const ID_PRECHECK_ACTION_BASE: usize = 400;
+const PRECHECK_TIMER: usize = 5;
+const PRECHECK_ACTION_SLOTS: [PrecheckAction; 3] = [
+    PrecheckAction::SelectPython,
+    PrecheckAction::SyncRoutes,
+    PrecheckAction::OpenConfig,
+];
+/// 预检窗口布局基线（96 DPI 客户区像素）。所有尺寸、间距与字体高度按 DPI 缩放。
+const PRECHECK_BASE_WIDTH: i32 = 780;
+const PRECHECK_BASE_HEIGHT: i32 = 600;
+const PRECHECK_MARGIN: i32 = 24;
+const PRECHECK_TOP_MARGIN: i32 = 16;
+const PRECHECK_BOTTOM_MARGIN: i32 = 24;
+const PRECHECK_TITLE_WIDTH: i32 = 400;
+const PRECHECK_TITLE_HEIGHT: i32 = 30;
+const PRECHECK_SUMMARY_HEIGHT: i32 = 24;
+const PRECHECK_VERTICAL_GAP: i32 = 8;
+const PRECHECK_ACTION_WIDTH: i32 = 232;
+const PRECHECK_ACTION_HEIGHT: i32 = 30;
+const PRECHECK_ACTION_GAP: i32 = 10;
+const PRECHECK_FOOTER_HEIGHT: i32 = 32;
+const PRECHECK_FOOTER_GAP: i32 = 14;
+const PRECHECK_RECHECK_WIDTH: i32 = 110;
+const PRECHECK_COPY_WIDTH: i32 = 110;
+const PRECHECK_CLOSE_WIDTH: i32 = 84;
+/// 紧凑布局基线（工作区放不下完整三列按钮或纵向内容时使用）：收紧边距、行距、
+/// 标题与按钮高度，动作按钮按可用宽度均分，底部按钮换更窄标签所需的最小宽度。
+/// 标签由 `precheck_action_compact_label` 提供，保证极小工作区内文本不被裁切。
+const PRECHECK_COMPACT_MARGIN: i32 = 12;
+const PRECHECK_COMPACT_TOP_MARGIN: i32 = 8;
+const PRECHECK_COMPACT_BOTTOM_MARGIN: i32 = 12;
+const PRECHECK_COMPACT_TITLE_HEIGHT: i32 = 22;
+const PRECHECK_COMPACT_SUMMARY_HEIGHT: i32 = 20;
+const PRECHECK_COMPACT_VERTICAL_GAP: i32 = 4;
+const PRECHECK_COMPACT_ACTION_HEIGHT: i32 = 26;
+const PRECHECK_COMPACT_FOOTER_GAP: i32 = 8;
+const PRECHECK_COMPACT_RECHECK_WIDTH: i32 = 72;
+const PRECHECK_COMPACT_COPY_WIDTH: i32 = 72;
+const PRECHECK_COMPACT_CLOSE_WIDTH: i32 = 48;
+/// 能完整容纳紧凑控件的最小客户区。低于这个物理尺寸时窗口采用此下限，避免
+/// 控件出现负坐标或相互覆盖；这类工作区无法保证窗口边框也完整落入工作区。
+const PRECHECK_MIN_CLIENT_WIDTH: i32 = 240;
+const PRECHECK_MIN_CLIENT_HEIGHT: i32 = 180;
+const PRECHECK_BODY_FONT_HEIGHT: i32 = 15;
+const PRECHECK_TITLE_FONT_HEIGHT: i32 = 22;
 const TRAY_ICON_GUID: GUID = GUID::from_u128(0x5bdb64d1_1bb9_4d6d_9cb3_496b8e5a6d53);
 const APPROVAL_HOST_MUTEX_NAME: &str = "Local\\HeadroomRouteApprovalHost-v1";
 static APP: OnceLock<Arc<AppState>> = OnceLock::new();
 static APPROVAL_HOST_PARENT_PID: AtomicU32 = AtomicU32::new(0);
+/// 预检向导同一时刻最多打开一个，防止托盘菜单与首次启动自动打开重复。
+static PRECHECK_ACTIVE: AtomicBool = AtomicBool::new(false);
 thread_local! { static URL_POPUP: Cell<HWND> = const { Cell::new(ptr::null_mut()) }; }
 thread_local! { static APPROVAL_POPUP: Cell<HWND> = const { Cell::new(ptr::null_mut()) }; }
 thread_local! { static APPROVAL_REQUEST: RefCell<Option<ApprovalRequest>> = const { RefCell::new(None) }; }
@@ -153,7 +226,7 @@ struct ApprovalVisual {
     small_font: usize,
 }
 
-pub fn run(app: Arc<AppState>) -> anyhow::Result<()> {
+pub fn run(app: Arc<AppState>, auto_open_precheck: bool) -> anyhow::Result<()> {
     let _ = APP.set(app);
     approval::start_server();
     unsafe {
@@ -179,6 +252,18 @@ pub fn run(app: Arc<AppState>) -> anyhow::Result<()> {
         };
         if RegisterClassW(&editor_class) == 0 {
             anyhow::bail!("无法注册故障转移配置窗口");
+        }
+        let precheck_class_name = wide("HeadroomRoutePrecheck");
+        let precheck_class = WNDCLASSW {
+            lpfnWndProc: Some(precheck_window_proc),
+            hInstance: instance,
+            lpszClassName: precheck_class_name.as_ptr(),
+            hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
+            hbrBackground: (COLOR_WINDOW + 1) as _,
+            ..std::mem::zeroed()
+        };
+        if RegisterClassW(&precheck_class) == 0 {
+            anyhow::bail!("无法注册启动预检窗口");
         }
         let approval_class_name = wide("HeadroomRouteApprovalWindow");
         let approval_class = WNDCLASSW {
@@ -212,8 +297,15 @@ pub fn run(app: Arc<AppState>) -> anyhow::Result<()> {
         approval::set_tray_hwnd(hwnd);
         add_icon(hwnd);
         SetTimer(hwnd, 1, 500, None);
+        if auto_open_precheck {
+            show_precheck(hwnd);
+        }
         if std::env::args().any(|arg| arg == "--approval-demo") {
             let _ = approval::enqueue_demo();
+        }
+        if std::env::args().any(|arg| arg == "--notification-demo") {
+            notification::success("AI 回复完成", "本地演示：AI 回复已完成");
+            notification::error("AI 接口错误", "本地演示：模拟上游接口报错");
         }
         let mut message: MSG = std::mem::zeroed();
         while GetMessageW(&mut message, ptr::null_mut(), 0, 0) > 0 {
@@ -349,6 +441,29 @@ unsafe extern "system" fn window_proc(
             unsafe { show_status(hwnd) };
             0
         }
+        WM_POWERBROADCAST
+            if matches!(
+                wparam as u32,
+                PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND | PBT_APMRESUMECRITICAL
+            ) =>
+        {
+            if let Some(app) = APP.get() {
+                crate::worker::trigger_environment_event(
+                    app,
+                    crate::environment_recovery::EnvironmentEvent::Resume,
+                );
+            }
+            1
+        }
+        WM_SETTINGCHANGE | WM_DEVICECHANGE => {
+            if let Some(app) = APP.get() {
+                crate::worker::trigger_environment_event(
+                    app,
+                    crate::environment_recovery::EnvironmentEvent::NetworkOrProxyChanged,
+                );
+            }
+            0
+        }
         WM_COMMAND => {
             unsafe { handle_command(hwnd, wparam & 0xffff) };
             0
@@ -377,6 +492,12 @@ unsafe extern "system" fn window_proc(
                 }
                 if let Some(message) = app.take_auto_switch_notice() {
                     notify(hwnd, "已自动切换上游", &message);
+                }
+                if let Some(message) = app.take_operation_notice() {
+                    notify(hwnd, "Provider 操作已记录", &message);
+                }
+                if let Some(message) = app.take_recovery_notice() {
+                    notify(hwnd, "环境恢复状态更新", &message);
                 }
                 if let Some((ok, message)) = app.take_runtime_result() {
                     notify(
@@ -448,27 +569,23 @@ unsafe fn show_menu(hwnd: HWND) {
             snapshot.active_anthropic_provider.as_deref(),
         )
     };
-    let service = format!(
-        "Codex：{}  ·  Claude：{}  ·  路由{}",
-        mode_cn(snapshot.direct_codex, snapshot.bypass_headroom),
-        mode_cn(snapshot.direct_claude, snapshot.bypass_headroom),
-        health_cn(snapshot.state)
-    );
+    let service = format!("状态中心：{}", snapshot.runtime_status.summary());
     let codex = format!(
-        "Codex：{}  ·  {}  ·  {} ms",
-        snapshot.codex_availability,
+        "Codex：{} · {} · {} ms",
+        snapshot.runtime_status.codex.summary(),
         snapshot.active_name.as_deref().unwrap_or("未配置"),
         latency_text(snapshot.latency_ms)
     );
     let claude = format!(
-        "Claude：{}  ·  {}  ·  {} ms",
-        snapshot.claude_availability,
+        "Claude：{} · {} · {} ms",
+        snapshot.runtime_status.claude.summary(),
         snapshot
             .active_anthropic_name
             .as_deref()
             .unwrap_or("未配置"),
         latency_text(snapshot.anthropic_latency_ms)
     );
+    let headroom = format!("Headroom：{}", snapshot.runtime_status.headroom.summary());
     let compression = format!(
         "Token：原始 {} → 优化 {} · 节省 {}（{:.1}%）",
         compact_number(snapshot.headroom_metrics.input_tokens_original),
@@ -492,6 +609,7 @@ unsafe fn show_menu(hwnd: HWND) {
         AppendMenuW(menu, MF_STRING, 0, wide(&service).as_ptr());
         AppendMenuW(menu, MF_STRING, 0, wide(&codex).as_ptr());
         AppendMenuW(menu, MF_STRING, 0, wide(&claude).as_ptr());
+        AppendMenuW(menu, MF_STRING, 0, wide(&headroom).as_ptr());
         AppendMenuW(menu, MF_STRING, 0, wide(&metrics_scope).as_ptr());
         AppendMenuW(menu, MF_STRING, 0, wide(&compression).as_ptr());
         AppendMenuW(menu, MF_STRING, 0, wide(&requests).as_ptr());
@@ -502,10 +620,8 @@ unsafe fn show_menu(hwnd: HWND) {
             wide("查看完整状态...").as_ptr(),
         );
         if let Some((command, label)) = recommended_action(
-            snapshot.bypass_headroom || (snapshot.direct_codex && snapshot.direct_claude),
+            &snapshot.runtime_status,
             &snapshot.headroom_state,
-            snapshot.codex_availability,
-            snapshot.claude_availability,
             snapshot.last_error.as_deref(),
         ) {
             AppendMenuW(menu, MF_STRING, command, wide(label).as_ptr());
@@ -645,6 +761,50 @@ unsafe fn show_menu(hwnd: HWND) {
             ID_CONFIG,
             wide("打开 config.json（高级配置）").as_ptr(),
         );
+        let portability_menu = CreatePopupMenu();
+        AppendMenuW(
+            portability_menu,
+            MF_STRING,
+            ID_TAKEOVER,
+            wide("预览并应用 CLI 接管...").as_ptr(),
+        );
+        AppendMenuW(
+            portability_menu,
+            MF_STRING,
+            ID_CREATE_BACKUP,
+            wide("创建配置备份").as_ptr(),
+        );
+        AppendMenuW(
+            portability_menu,
+            MF_STRING,
+            ID_RESTORE_BACKUP,
+            wide("恢复配置备份...").as_ptr(),
+        );
+        AppendMenuW(portability_menu, MF_SEPARATOR, 0, ptr::null());
+        AppendMenuW(
+            portability_menu,
+            MF_STRING,
+            ID_EXPORT_PORTABLE,
+            wide("导出可移植配置...").as_ptr(),
+        );
+        AppendMenuW(
+            portability_menu,
+            MF_STRING,
+            ID_IMPORT_PORTABLE,
+            wide("导入可移植配置...").as_ptr(),
+        );
+        AppendMenuW(
+            portability_menu,
+            MF_STRING,
+            ID_DIAGNOSTIC_ZIP,
+            wide("创建脱敏诊断 ZIP...").as_ptr(),
+        );
+        AppendMenuW(
+            settings_menu,
+            MF_POPUP,
+            portability_menu as usize,
+            wide("配置迁移与备份").as_ptr(),
+        );
         AppendMenuW(
             settings_menu,
             MF_STRING,
@@ -668,6 +828,12 @@ unsafe fn show_menu(hwnd: HWND) {
             MF_STRING,
             ID_DIAG,
             wide("复制脱敏诊断报告").as_ptr(),
+        );
+        AppendMenuW(
+            settings_menu,
+            MF_STRING,
+            ID_PRECHECK,
+            wide("运行启动预检...").as_ptr(),
         );
         AppendMenuW(
             settings_menu,
@@ -760,22 +926,19 @@ unsafe fn show_menu(hwnd: HWND) {
 }
 
 fn recommended_action(
-    bypass_headroom: bool,
+    status: &RuntimeStatus,
     headroom_state: &str,
-    codex: &str,
-    claude: &str,
     error: Option<&str>,
 ) -> Option<(usize, &'static str)> {
-    if !bypass_headroom && headroom_state == "runtime-unavailable" {
+    if status.headroom.state == ComponentState::Unavailable
+        && headroom_state == "runtime-unavailable"
+    {
         return Some((ID_SELECT_RUNTIME, "建议操作：选择 Headroom Python..."));
     }
-    if matches!(
-        headroom_state,
-        "检测中" | "运行环境就绪" | "starting" | "restarting"
-    ) {
+    if status.headroom.state == ComponentState::Checking {
         return None;
     }
-    if !bypass_headroom && !matches!(headroom_state, "healthy" | "external") {
+    if status.headroom.state == ComponentState::Unavailable {
         return Some((ID_RESTART, "建议操作：重启 Headroom"));
     }
     let error = error.unwrap_or_default().to_ascii_lowercase();
@@ -785,7 +948,15 @@ fn recommended_action(
     {
         return Some((ID_SYNC, "建议操作：重新同步配置"));
     }
-    if matches!(codex, "降级" | "不可用") || matches!(claude, "降级" | "不可用") {
+    if [status.codex.state, status.claude.state]
+        .into_iter()
+        .any(|state| {
+            matches!(
+                state,
+                ComponentState::Degraded | ComponentState::Unavailable
+            )
+        })
+    {
         return Some((ID_CHECK, "建议操作：立即检查上游"));
     }
     (!error.is_empty()).then_some((ID_DIAG, "建议操作：复制脱敏诊断报告"))
@@ -972,6 +1143,13 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
                 notify(hwnd, "诊断报告已复制", "报告不包含 API Key")
             };
         }
+        ID_TAKEOVER => show_takeover_preview(hwnd, app),
+        ID_CREATE_BACKUP => create_backup_from_tray(hwnd, app),
+        ID_RESTORE_BACKUP => restore_backup_from_tray(hwnd, app),
+        ID_EXPORT_PORTABLE => export_portable_from_tray(hwnd, app),
+        ID_IMPORT_PORTABLE => import_portable_from_tray(hwnd, app),
+        ID_DIAGNOSTIC_ZIP => create_diagnostic_zip_from_tray(hwnd, app),
+        ID_PRECHECK => unsafe { show_precheck(hwnd) },
         ID_RESET_METRICS => {
             if unsafe {
                 MessageBoxW(
@@ -1065,8 +1243,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             if unsafe {
                 MessageBoxW(
                     hwnd,
-                    wide("将退出程序并重新检测 config.json 中配置的 Headroom 环境，是否继续？")
-                        .as_ptr(),
+                    wide("将退出并重新检测 Headroom 环境后自动重启程序，是否继续？").as_ptr(),
                     wide("检测 Headroom 环境").as_ptr(),
                     MB_YESNO | MB_ICONWARNING,
                 )
@@ -1135,6 +1312,480 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         }
         _ => {}
     }
+}
+
+fn show_takeover_preview(hwnd: HWND, app: &AppState) {
+    let config = app.inner.lock().unwrap().config.clone();
+    let preferred_openai = app.active_url();
+    let preferred_anthropic = app.active_anthropic_url();
+    let plan = match prepare_takeover(
+        &config,
+        preferred_openai.as_deref(),
+        preferred_anthropic.as_deref(),
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            notify(hwnd, "配置接管预览失败", &error.to_string());
+            return;
+        }
+    };
+    if plan.preview.changes.is_empty() {
+        notify(hwnd, "配置接管", "Codex 和 Claude 已由 HeadroomRoute 管理");
+        return;
+    }
+    let confirmation_token = plan.preview.confirmation_token.clone();
+    let preview = limit_ui_text(&takeover_plan_text(&plan), 12_000);
+    let confirmed = unsafe {
+        MessageBoxW(
+            hwnd,
+            wide(&preview).as_ptr(),
+            wide("查看配置接管").as_ptr(),
+            MB_YESNO | MB_ICONWARNING,
+        ) == IDYES
+    };
+    if !confirmed {
+        return;
+    }
+    let result = {
+        let _config_guard = app.config_write_guard();
+        let backup = create_config_backup(&config);
+        match backup {
+            Ok(backup) => apply_takeover_plan(plan, &confirmation_token).map(|()| Some(backup.id)),
+            Err(error) => Err(error),
+        }
+    };
+    match result {
+        Ok(backup_id) => notify(
+            hwnd,
+            "配置接管 applied",
+            &format!(
+                "Codex/Claude 现在使用本地路由代理。备份：{}",
+                backup_id.unwrap_or_else(|| "无".into())
+            ),
+        ),
+        Err(error) => notify(hwnd, "配置接管 failed", &error.to_string()),
+    }
+}
+
+fn create_backup_from_tray(hwnd: HWND, app: &AppState) {
+    let config = app.inner.lock().unwrap().config.clone();
+    let result = {
+        let _config_guard = app.config_write_guard();
+        create_config_backup(&config)
+    };
+    match result {
+        Ok(backup) => notify(hwnd, "配置备份已创建", &backup_summary(&backup)),
+        Err(error) => notify(hwnd, "配置备份失败", &error.to_string()),
+    }
+}
+
+fn restore_backup_from_tray(hwnd: HWND, app: &AppState) {
+    let config = app.inner.lock().unwrap().config.clone();
+    let backups = match list_config_backups(&config) {
+        Ok(backups) => backups,
+        Err(error) => {
+            notify(hwnd, "无法列出配置备份", &error.to_string());
+            return;
+        }
+    };
+    if backups.is_empty() {
+        notify(hwnd, "没有配置备份", "恢复前请先创建备份");
+        return;
+    }
+    let root = config.state_dir.join("backups");
+    let Some(manifest) = choose_file(
+        hwnd,
+        false,
+        "选择 HeadroomRoute 备份清单",
+        "备份清单\0manifest.json\0所有文件\0*.*\0\0",
+        "json",
+        Some(&root),
+    ) else {
+        return;
+    };
+    let backup_id = match selected_backup_id(&config, &manifest, &backups) {
+        Ok(id) => id,
+        Err(error) => {
+            notify(hwnd, "配置备份无效", &error.to_string());
+            return;
+        }
+    };
+    let Some(descriptor) = backups.iter().find(|backup| backup.id == backup_id) else {
+        notify(hwnd, "未找到配置备份", "请选择列表中的备份");
+        return;
+    };
+    let prompt = limit_ui_text(
+        &format!(
+            "恢复备份 {}（创建于 {}）？\n\n{}\n\n当前配置文件可能会被替换。",
+            descriptor.id,
+            descriptor.created_at,
+            backup_summary(descriptor)
+        ),
+        8_000,
+    );
+    let confirmed = unsafe {
+        MessageBoxW(
+            hwnd,
+            wide(&prompt).as_ptr(),
+            wide("确认恢复配置").as_ptr(),
+            MB_YESNO | MB_ICONWARNING,
+        ) == IDYES
+    };
+    if !confirmed {
+        return;
+    }
+    let result = {
+        let _config_guard = app.config_write_guard();
+        restore_config_backup(&config, &backup_id)
+    };
+    match result {
+        Ok(restored) => match reload_config_after_external_write(app) {
+            Ok(()) => notify(hwnd, "配置已恢复", &backup_summary(&restored)),
+            Err(error) => notify(hwnd, "备份已恢复，但重新加载失败", &error.to_string()),
+        },
+        Err(error) => notify(hwnd, "配置恢复失败", &error.to_string()),
+    }
+}
+
+fn export_portable_from_tray(hwnd: HWND, app: &AppState) {
+    let config = app.inner.lock().unwrap().config.clone();
+    let default_path = config.state_dir.join("HeadroomRoute-portable.json");
+    let Some(destination) = choose_file(
+        hwnd,
+        true,
+        "导出 HeadroomRoute 可移植配置",
+        "可移植配置\0*.json\0所有文件\0*.*\0\0",
+        "json",
+        default_path.parent(),
+    ) else {
+        return;
+    };
+    match export_portable_config(&config, &destination) {
+        Ok(()) => notify(hwnd, "可移植配置已导出", &destination.display().to_string()),
+        Err(error) => notify(hwnd, "可移植配置导出失败", &error.to_string()),
+    }
+}
+
+fn import_portable_from_tray(hwnd: HWND, app: &AppState) {
+    let config = app.inner.lock().unwrap().config.clone();
+    let Some(source) = choose_file(
+        hwnd,
+        false,
+        "导入 HeadroomRoute 可移植配置",
+        "可移植配置\0*.json\0所有文件\0*.*\0\0",
+        "json",
+        Some(&config.state_dir),
+    ) else {
+        return;
+    };
+    let bytes = match fs::read(&source) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            notify(hwnd, "可移植配置导入失败", &error.to_string());
+            return;
+        }
+    };
+    let updated = match decode_portable_config(&bytes, &config) {
+        Ok(updated) => updated,
+        Err(error) => {
+            notify(hwnd, "可移植配置已拒绝", &error.to_string());
+            return;
+        }
+    };
+    let prompt = limit_ui_text(
+        &format!(
+            "导入这些非敏感配置？\n\n{}\n\n现有配置将先备份。",
+            portable_change_summary(&config, &updated)
+        ),
+        8_000,
+    );
+    let confirmed = unsafe {
+        MessageBoxW(
+            hwnd,
+            wide(&prompt).as_ptr(),
+            wide("确认导入可移植配置").as_ptr(),
+            MB_YESNO | MB_ICONQUESTION,
+        ) == IDYES
+    };
+    if !confirmed {
+        return;
+    }
+    let destination = config.state_dir.join("config.json");
+    let result = {
+        let _config_guard = app.config_write_guard();
+        create_config_backup(&config).and_then(|backup| {
+            import_portable_config(&source, &destination, &config).map(|_| backup)
+        })
+    };
+    match result {
+        Ok(backup) => match reload_config_after_external_write(app) {
+            Ok(()) => notify(hwnd, "可移植配置已导入", &format!("备份：{}", backup.id)),
+            Err(error) => notify(hwnd, "可移植配置已导入，但重新加载失败", &error.to_string()),
+        },
+        Err(error) => notify(hwnd, "可移植配置导入失败", &error.to_string()),
+    }
+}
+
+fn create_diagnostic_zip_from_tray(hwnd: HWND, app: &AppState) {
+    let config = app.inner.lock().unwrap().config.clone();
+    let default_path = config.state_dir.join("HeadroomRoute-diagnostic.zip");
+    let Some(destination) = choose_file(
+        hwnd,
+        true,
+        "创建脱敏 HeadroomRoute 诊断 ZIP",
+        "ZIP 压缩包\0*.zip\0所有文件\0*.*\0\0",
+        "zip",
+        default_path.parent(),
+    ) else {
+        return;
+    };
+    let report = app.diagnostic_text();
+    match create_diagnostic_bundle(&config, &destination, Some(&report)) {
+        Ok(descriptor) => notify(
+            hwnd,
+            "诊断 ZIP 已创建",
+            &format!(
+                "已写入 {} 项到 {}",
+                descriptor.entries.len(),
+                destination.display()
+            ),
+        ),
+        Err(error) => notify(hwnd, "诊断 ZIP 创建失败", &error.to_string()),
+    }
+}
+
+fn takeover_plan_text(plan: &TakeoverPlan) -> String {
+    let mut text = format!(
+        "Files to change: {}\nPreview token: {}\n",
+        plan.preview.changes.len(),
+        plan.preview.confirmation_token
+    );
+    for change in &plan.preview.changes {
+        text.push_str(&format!("\n{:?}: {}\n", change.kind, change.path));
+        for field in &change.fields {
+            text.push_str(&format!(
+                "  {}: {} -> {}\n",
+                field.field,
+                preview_value(field.before.as_ref()),
+                preview_value(field.after.as_ref())
+            ));
+        }
+    }
+    text.push_str("\n选择“是”以创建备份并应用这份精确预览。");
+    text
+}
+
+fn preview_value(value: Option<&serde_json::Value>) -> String {
+    value.map_or_else(
+        || "<missing>".into(),
+        |value| serde_json::to_string(value).unwrap_or_else(|_| "<unavailable>".into()),
+    )
+}
+
+fn backup_summary(backup: &BackupDescriptor) -> String {
+    let present = backup.files.iter().filter(|file| file.present).count();
+    format!(
+        "备份 {} 包含 {} 个受跟踪文件（当前存在 {} 个）",
+        backup.id,
+        backup.files.len(),
+        present
+    )
+}
+
+fn portable_change_summary(
+    current: &crate::model::AppConfig,
+    updated: &crate::model::AppConfig,
+) -> String {
+    let mut changes = Vec::new();
+    if current.agent_port != updated.agent_port {
+        changes.push(format!(
+            "agent_port: {} -> {}",
+            current.agent_port, updated.agent_port
+        ));
+    }
+    if current.headroom_port != updated.headroom_port {
+        changes.push(format!(
+            "headroom_port: {} -> {}",
+            current.headroom_port, updated.headroom_port
+        ));
+    }
+    if current.enable_codex != updated.enable_codex {
+        changes.push(format!(
+            "enable_codex: {} -> {}",
+            current.enable_codex, updated.enable_codex
+        ));
+    }
+    if current.enable_claude != updated.enable_claude {
+        changes.push(format!(
+            "enable_claude: {} -> {}",
+            current.enable_claude, updated.enable_claude
+        ));
+    }
+    if current.auto_failover != updated.auto_failover {
+        changes.push(format!(
+            "auto_failover: {} -> {}",
+            current.auto_failover, updated.auto_failover
+        ));
+    }
+    if current.failover_policy != updated.failover_policy {
+        changes.push("failover_policy".into());
+    }
+    if current.manage_headroom != updated.manage_headroom {
+        changes.push(format!(
+            "manage_headroom: {} -> {}",
+            current.manage_headroom, updated.manage_headroom
+        ));
+    }
+    if current.start_with_windows != updated.start_with_windows {
+        changes.push(format!(
+            "start_with_windows: {} -> {}",
+            current.start_with_windows, updated.start_with_windows
+        ));
+    }
+    if current.no_subscription_tracking != updated.no_subscription_tracking {
+        changes.push(format!(
+            "no_subscription_tracking: {} -> {}",
+            current.no_subscription_tracking, updated.no_subscription_tracking
+        ));
+    }
+    if current.use_system_proxy != updated.use_system_proxy {
+        changes.push(format!(
+            "use_system_proxy: {} -> {}",
+            current.use_system_proxy, updated.use_system_proxy
+        ));
+    }
+    if current.bypass_headroom != updated.bypass_headroom {
+        changes.push(format!(
+            "bypass_headroom: {} -> {}",
+            current.bypass_headroom, updated.bypass_headroom
+        ));
+    }
+    if current.direct_codex != updated.direct_codex {
+        changes.push(format!(
+            "direct_codex: {} -> {}",
+            current.direct_codex, updated.direct_codex
+        ));
+    }
+    if current.direct_claude != updated.direct_claude {
+        changes.push(format!(
+            "direct_claude: {} -> {}",
+            current.direct_claude, updated.direct_claude
+        ));
+    }
+    if current.auto_check_updates != updated.auto_check_updates {
+        changes.push(format!(
+            "auto_check_updates: {} -> {}",
+            current.auto_check_updates, updated.auto_check_updates
+        ));
+    }
+    if current.show_api_key_on_hover != updated.show_api_key_on_hover {
+        changes.push(format!(
+            "show_api_key_on_hover: {} -> {}",
+            current.show_api_key_on_hover, updated.show_api_key_on_hover
+        ));
+    }
+    if current.routing_strategy != updated.routing_strategy {
+        changes.push("routing_strategy".into());
+    }
+    if changes.is_empty() {
+        "No effective setting changes".into()
+    } else {
+        changes.join("\n")
+    }
+}
+
+fn reload_config_after_external_write(app: &AppState) -> anyhow::Result<()> {
+    let path = app
+        .inner
+        .lock()
+        .unwrap()
+        .config
+        .state_dir
+        .join("config.json");
+    let updated = config::load_or_create(&path)?;
+    app.inner.lock().unwrap().config = updated;
+    app.refresh_routes();
+    Ok(())
+}
+
+fn selected_backup_id(
+    config: &crate::model::AppConfig,
+    manifest: &Path,
+    backups: &[BackupDescriptor],
+) -> anyhow::Result<String> {
+    let root = config.state_dir.join("backups").canonicalize()?;
+    let manifest = manifest.canonicalize()?;
+    if manifest.file_name().and_then(|name| name.to_str()) != Some("manifest.json")
+        || manifest.parent().and_then(Path::parent) != Some(root.as_path())
+    {
+        anyhow::bail!("选择的文件不在 HeadroomRoute 备份目录中");
+    }
+    let id = manifest
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("无法读取备份 ID"))?;
+    if !backups.iter().any(|backup| backup.id == id) {
+        anyhow::bail!("备份清单未通过校验或已不存在");
+    }
+    Ok(id.to_owned())
+}
+
+fn choose_file(
+    parent: HWND,
+    save: bool,
+    title: &str,
+    filter: &str,
+    default_extension: &str,
+    initial_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    let mut buffer = vec![0u16; 32 * 1024];
+    let filter = wide(filter);
+    let title = wide(title);
+    let default_extension = wide(default_extension);
+    let initial = initial_dir.map(|path| wide(&path.to_string_lossy()));
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: parent,
+        lpstrFilter: filter.as_ptr(),
+        nFilterIndex: 1,
+        lpstrFile: buffer.as_mut_ptr(),
+        nMaxFile: buffer.len() as u32,
+        lpstrInitialDir: initial.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
+        lpstrTitle: title.as_ptr(),
+        lpstrDefExt: default_extension.as_ptr(),
+        Flags: if save {
+            OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT
+        } else {
+            OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST
+        },
+        ..OPENFILENAMEW::default()
+    };
+    let selected = unsafe {
+        if save {
+            GetSaveFileNameW(&mut dialog)
+        } else {
+            GetOpenFileNameW(&mut dialog)
+        }
+    };
+    if selected == 0 {
+        return None;
+    }
+    let length = buffer
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(buffer.len());
+    (length > 0).then(|| PathBuf::from(String::from_utf16_lossy(&buffer[..length])))
+}
+
+fn limit_ui_text(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    text.chars()
+        .take(limit.saturating_sub(32))
+        .collect::<String>()
+        + "\n... output truncated ..."
 }
 
 struct FailoverEditor {
@@ -2072,6 +2723,799 @@ unsafe fn editor_control(
     control
 }
 
+/// 预检报告只读编辑框专用：仅此处给 EDIT 加 `WS_EX_CLIENTEDGE` 边框，
+/// 不影响既有故障转移编辑器的控件外观。
+#[allow(clippy::too_many_arguments, unsafe_op_in_unsafe_fn)]
+unsafe fn precheck_report_edit(
+    parent: HWND,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    id: usize,
+    style: u32,
+    instance: windows_sys::Win32::Foundation::HINSTANCE,
+    font: usize,
+) -> HWND {
+    let control = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        wide("EDIT").as_ptr(),
+        wide("").as_ptr(),
+        style,
+        x,
+        y,
+        width,
+        height,
+        parent,
+        id as _,
+        instance,
+        ptr::null(),
+    );
+    SendMessageW(control, WM_SETFONT, font, 1);
+    control
+}
+
+enum PrecheckResult {
+    Report(PrecheckReport),
+    Failed,
+}
+
+struct PrecheckDialog {
+    parent: HWND,
+    app: Arc<AppState>,
+    report: Option<PrecheckReport>,
+    collecting: bool,
+    failed: bool,
+    receiver: Option<mpsc::Receiver<PrecheckResult>>,
+    body_font: usize,
+    title_font: usize,
+    layout: PrecheckLayout,
+}
+
+fn precheck_action_label(action: PrecheckAction) -> &'static str {
+    match action {
+        PrecheckAction::SelectPython => "选择 Headroom Python...",
+        PrecheckAction::SyncRoutes => "同步 Codex + Claude / CC-Switch",
+        PrecheckAction::OpenConfig => "打开 config.json",
+    }
+}
+
+/// 紧凑布局下的动作按钮短标签：只够放进极窄按钮（对应
+/// [`PRECHECK_COMPACT_*`] 宽度），保证极小工作区内文本不被裁切。
+fn precheck_action_compact_label(action: PrecheckAction) -> &'static str {
+    match action {
+        PrecheckAction::SelectPython => "选择",
+        PrecheckAction::SyncRoutes => "同步",
+        PrecheckAction::OpenConfig => "配置",
+    }
+}
+
+/// 预检动作按钮槽位到现有托盘命令的映射，动作必须经用户点击后才执行。
+fn precheck_action_command(slot: usize) -> Option<usize> {
+    match slot {
+        0 => Some(ID_SELECT_RUNTIME),
+        1 => Some(ID_SYNC),
+        2 => Some(ID_CONFIG),
+        _ => None,
+    }
+}
+
+/// 预检窗口内一个控件在客户区中的矩形（像素）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PrecheckRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+#[cfg(test)]
+impl PrecheckRect {
+    fn right(self) -> i32 {
+        self.x + self.width
+    }
+
+    fn bottom(self) -> i32 {
+        self.y + self.height
+    }
+}
+
+/// 预检窗口纯布局结果：完整窗口的位置与尺寸、各控件客户区矩形和字体像素高度。
+/// 由 [`precheck_layout`] 一次性算出，供窗口创建与控件摆放共用同一套坐标。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PrecheckLayout {
+    window_x: i32,
+    window_y: i32,
+    window_width: i32,
+    window_height: i32,
+    client_width: i32,
+    client_height: i32,
+    title: PrecheckRect,
+    summary: PrecheckRect,
+    report: PrecheckRect,
+    actions: [PrecheckRect; 3],
+    recheck: PrecheckRect,
+    copy: PrecheckRect,
+    close: PrecheckRect,
+    body_font: i32,
+    title_font: i32,
+    /// 工作区放不下完整布局时为真；此时使用更小的间距与按钮，动作按钮标签
+    /// 由 [`precheck_action_compact_label`] 提供。
+    compact: bool,
+}
+
+/// 96 DPI 基准值按给定 DPI 缩放，四舍五入到整像素。DPI 低于 96 时按 96 处理。
+fn precheck_scale(value: i32, dpi: u32) -> i32 {
+    ((value as i64 * dpi.max(96) as i64 + 48) / 96) as i32
+}
+
+/// 纯布局计算：按 DPI 缩放窗口与控件，并把窗口限制在 owner 显示器工作区内。
+///
+/// - 完整窗口尺寸 = 客户区 + `frame_width`/`frame_height`（由
+///   `AdjustWindowRectEx` 得到的标题栏与边框），窗口整体始终不超过工作区；
+/// - 报告编辑区吸收剩余高度；动作按钮与底部按钮保持完整尺寸、互不重叠；
+/// - 工作区放不下完整三列动作按钮或纵向内容时进入紧凑布局：收紧边距与行距、
+///   缩短按钮（配合 `precheck_action_compact_label` 的短标签）、动作按钮按可用
+///   宽度均分，保证控件仍互不重叠且不被裁切。
+fn precheck_layout(
+    dpi: u32,
+    work_area: RECT,
+    frame_width: i32,
+    frame_height: i32,
+) -> PrecheckLayout {
+    let scale = |value: i32| precheck_scale(value, dpi);
+    let margin = scale(PRECHECK_MARGIN);
+    let m_top = scale(PRECHECK_TOP_MARGIN);
+    let m_bottom = scale(PRECHECK_BOTTOM_MARGIN);
+    let gap = scale(PRECHECK_VERTICAL_GAP);
+    let title_h = scale(PRECHECK_TITLE_HEIGHT);
+    let summary_h = scale(PRECHECK_SUMMARY_HEIGHT);
+    let action_w = scale(PRECHECK_ACTION_WIDTH);
+    let action_h = scale(PRECHECK_ACTION_HEIGHT);
+    let action_gap = scale(PRECHECK_ACTION_GAP);
+    let footer_h = scale(PRECHECK_FOOTER_HEIGHT);
+    let footer_gap = scale(PRECHECK_FOOTER_GAP);
+
+    let desired_w = scale(PRECHECK_BASE_WIDTH);
+    let desired_h = scale(PRECHECK_BASE_HEIGHT);
+
+    let work_w = work_area.right - work_area.left;
+    let work_h = work_area.bottom - work_area.top;
+    // 客户区上限 = 工作区减去 frame。达到最小支持尺寸时，完整窗口（含 frame）
+    // 始终落在工作区内；物理工作区更小时采用明确的最小客户区，优先保证控件有效。
+    let available_w = (work_w - frame_width).max(1);
+    let available_h = (work_h - frame_height).max(1);
+    let min_client_w = scale(PRECHECK_MIN_CLIENT_WIDTH);
+    let min_client_h = scale(PRECHECK_MIN_CLIENT_HEIGHT);
+
+    let client_w = desired_w.min(available_w.max(min_client_w));
+    let client_h = desired_h.min(available_h.max(min_client_h));
+
+    let window_width = client_w + frame_width;
+    let window_height = client_h + frame_height;
+    // 窗口能放进工作区时居中，放不下时从工作区左上角开始（`.max(0)` 保证偏移不为负）。
+    let window_x = work_area.left + (work_w - window_width).max(0) / 2;
+    let window_y = work_area.top + (work_h - window_height).max(0) / 2;
+
+    // 完整三列动作按钮行所需的最小客户区宽度；放不下时进入紧凑布局。
+    let wide_min_w = margin * 2 + action_w * 3 + action_gap * 2;
+    // 完整纵向内容所需的最小客户区高度；放不下时进入紧凑布局。
+    let report_top = m_top + title_h + gap + summary_h + gap;
+    let wide_min_h = report_top + gap + action_h + footer_gap + footer_h + m_bottom;
+    let compact = client_w < wide_min_w || client_h < wide_min_h;
+
+    // 紧凑布局：收紧边距、行距、标题与按钮高度；动作按钮按可用宽度均分。
+    let (margin, m_top, m_bottom, gap, title_h, summary_h, action_h, footer_gap) = if compact {
+        (
+            scale(PRECHECK_COMPACT_MARGIN),
+            scale(PRECHECK_COMPACT_TOP_MARGIN),
+            scale(PRECHECK_COMPACT_BOTTOM_MARGIN),
+            scale(PRECHECK_COMPACT_VERTICAL_GAP),
+            scale(PRECHECK_COMPACT_TITLE_HEIGHT),
+            scale(PRECHECK_COMPACT_SUMMARY_HEIGHT),
+            scale(PRECHECK_COMPACT_ACTION_HEIGHT),
+            scale(PRECHECK_COMPACT_FOOTER_GAP),
+        )
+    } else {
+        (
+            margin, m_top, m_bottom, gap, title_h, summary_h, action_h, footer_gap,
+        )
+    };
+
+    let inner_width = client_w - margin * 2;
+    let report_top = m_top + title_h + gap + summary_h + gap;
+    let title = PrecheckRect {
+        x: margin,
+        y: m_top,
+        width: scale(PRECHECK_TITLE_WIDTH).min(inner_width.max(0)),
+        height: title_h,
+    };
+    let summary = PrecheckRect {
+        x: margin,
+        y: m_top + title_h + gap,
+        width: inner_width,
+        height: summary_h,
+    };
+    let content_bottom = client_h - m_bottom;
+    let footer_top = content_bottom - footer_h;
+    let action_top = footer_top - footer_gap - action_h;
+    let report_bottom = action_top - gap;
+    let report = PrecheckRect {
+        x: margin,
+        y: report_top,
+        width: inner_width,
+        height: report_bottom.saturating_sub(report_top),
+    };
+
+    // 动作按钮宽度：紧凑时按可用宽度均分（不超过完整布局宽度），普通布局用基准宽度。
+    let action_w = if compact {
+        (inner_width.saturating_sub(action_gap * 2) / 3)
+            .min(action_w)
+            .max(1)
+    } else {
+        action_w
+    };
+    let actions_total = action_w * 3 + action_gap * 2;
+    let actions_left = margin + (inner_width - actions_total).max(0) / 2;
+    let mut actions = [PrecheckRect {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+    }; 3];
+    for (slot, rect) in actions.iter_mut().enumerate() {
+        let x = actions_left + slot as i32 * (action_w + action_gap);
+        *rect = PrecheckRect {
+            x,
+            y: action_top,
+            width: action_w,
+            height: action_h,
+        };
+    }
+
+    let (recheck_w, copy_w, close_w) = if compact {
+        (
+            scale(PRECHECK_COMPACT_RECHECK_WIDTH),
+            scale(PRECHECK_COMPACT_COPY_WIDTH),
+            scale(PRECHECK_COMPACT_CLOSE_WIDTH),
+        )
+    } else {
+        (
+            scale(PRECHECK_RECHECK_WIDTH),
+            scale(PRECHECK_COPY_WIDTH),
+            scale(PRECHECK_CLOSE_WIDTH),
+        )
+    };
+    let recheck = PrecheckRect {
+        x: margin,
+        y: footer_top,
+        width: recheck_w,
+        height: footer_h,
+    };
+    let copy = PrecheckRect {
+        x: margin + recheck_w + gap,
+        y: footer_top,
+        width: copy_w,
+        height: footer_h,
+    };
+    let close = PrecheckRect {
+        x: margin + inner_width - close_w,
+        y: footer_top,
+        width: close_w,
+        height: footer_h,
+    };
+
+    PrecheckLayout {
+        window_x,
+        window_y,
+        window_width,
+        window_height,
+        client_width: client_w,
+        client_height: client_h,
+        title,
+        summary,
+        report,
+        actions,
+        recheck,
+        copy,
+        close,
+        body_font: -scale(PRECHECK_BODY_FONT_HEIGHT),
+        title_font: -scale(PRECHECK_TITLE_FONT_HEIGHT),
+        compact,
+    }
+}
+
+/// 预检窗口所在显示器：优先取 owner 窗口所在显示器的工作区，失败时回退到
+/// 主显示器工作区。
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn precheck_work_area(owner: HWND) -> RECT {
+    let monitor = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
+    if !monitor.is_null() {
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            rcMonitor: std::mem::zeroed(),
+            rcWork: std::mem::zeroed(),
+            dwFlags: 0,
+        };
+        if GetMonitorInfoW(monitor, &mut info) != 0 {
+            return info.rcWork;
+        }
+    }
+    let mut work_area = RECT {
+        left: 0,
+        top: 0,
+        right: GetSystemMetrics(SM_CXSCREEN),
+        bottom: GetSystemMetrics(SM_CYSCREEN),
+    };
+    SystemParametersInfoW(
+        SPI_GETWORKAREA,
+        0,
+        &mut work_area as *mut RECT as *mut c_void,
+        0,
+    );
+    work_area
+}
+
+/// 预检窗口所用 DPI：优先取 owner 窗口的 DPI，失败时回退到系统 DPI。
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn precheck_dpi(owner: HWND) -> u32 {
+    if !owner.is_null() {
+        let dpi = GetDpiForWindow(owner);
+        if dpi != 0 {
+            return dpi;
+        }
+    }
+    GetDpiForSystem().max(96)
+}
+
+/// 打开启动预检向导。收集在后台线程运行，模态消息循环保持托盘可响应；
+/// 关闭窗口不会修改任何配置。窗口按 owner 所在显示器工作区定位并 DPI 缩放。
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn show_precheck(parent: HWND) {
+    if PRECHECK_ACTIVE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Some(app) = APP.get().cloned() else {
+        PRECHECK_ACTIVE.store(false, Ordering::Release);
+        return;
+    };
+    let instance = GetModuleHandleW(ptr::null());
+    let ex_style = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT;
+    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
+    let mut frame = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    AdjustWindowRectEx(&mut frame, style, 0, ex_style);
+    let layout = precheck_layout(
+        precheck_dpi(parent),
+        precheck_work_area(parent),
+        frame.right - frame.left,
+        frame.bottom - frame.top,
+    );
+    let dialog = Box::new(PrecheckDialog {
+        parent,
+        app,
+        report: None,
+        collecting: true,
+        failed: false,
+        receiver: None,
+        body_font: 0,
+        title_font: 0,
+        layout,
+    });
+    EnableWindow(parent, 0);
+    let raw = Box::into_raw(dialog);
+    let class_name = wide("HeadroomRoutePrecheck");
+    let title = wide("启动预检");
+    let window = CreateWindowExW(
+        ex_style,
+        class_name.as_ptr(),
+        title.as_ptr(),
+        style,
+        layout.window_x,
+        layout.window_y,
+        layout.window_width,
+        layout.window_height,
+        parent,
+        ptr::null_mut(),
+        instance,
+        raw.cast(),
+    );
+    if window.is_null() {
+        // CreateWindowExW 返回空即 WM_NCCREATE 未成功安装对话框指针，Box 仍归本处所有，
+        // 释放一次；成功后由 WM_NCDESTROY 恰好释放一次，两条路径互斥。
+        drop(Box::from_raw(raw));
+        EnableWindow(parent, 1);
+        PRECHECK_ACTIVE.store(false, Ordering::Release);
+        notify(
+            parent,
+            "预检窗口创建失败",
+            "无法打开启动预检界面，请稍后重试",
+        );
+        return;
+    }
+    // 启动时自动打开时，本进程通常还不是前台线程（例如从终端启动时控制台窗口持有
+    // 前台），新建的预检窗口若不被激活会落到前台窗口之后，看起来就像“没有打开”。
+    // 这里先用 HWND_TOPMOST 越过普通窗口、随后取消置顶，再激活到前台并取得键盘焦点。
+    SetWindowPos(
+        window,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+    );
+    SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    SetForegroundWindow(window);
+    let mut message: MSG = std::mem::zeroed();
+    while IsWindow(window) != 0 && GetMessageW(&mut message, ptr::null_mut(), 0, 0) > 0 {
+        if IsDialogMessageW(window, &message) == 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    // 模态循环可能因 WM_QUIT 退出而窗口仍在；销毁它以保证 WM_NCDESTROY 一定执行，
+    // 使 `PRECHECK_ACTIVE` 复位且对话框 Box 恰好释放一次。
+    if IsWindow(window) != 0 {
+        DestroyWindow(window);
+    }
+}
+
+// The dialog Box is installed during WM_NCCREATE and released exactly once at WM_NCDESTROY.
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe extern "system" fn precheck_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_NCCREATE {
+        let create = &*(lparam as *const CREATESTRUCTW);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+    }
+    let dialog = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PrecheckDialog;
+    match message {
+        WM_CREATE => {
+            (*dialog).create_controls(hwnd);
+            (*dialog).start_collect(hwnd);
+            0
+        }
+        WM_CTLCOLORSTATIC => {
+            SetBkMode(wparam as _, TRANSPARENT as i32);
+            GetSysColorBrush(COLOR_WINDOW) as LRESULT
+        }
+        WM_TIMER if wparam == PRECHECK_TIMER => {
+            (*dialog).poll_result(hwnd);
+            0
+        }
+        WM_COMMAND => {
+            let id = wparam & 0xffff;
+            let code = (wparam >> 16) & 0xffff;
+            if code == BN_CLICKED as usize {
+                if id == ID_PRECHECK_RECHECK {
+                    (*dialog).start_collect(hwnd);
+                } else if id == ID_PRECHECK_COPY {
+                    (*dialog).copy_report(hwnd);
+                } else if id == ID_PRECHECK_CLOSE {
+                    DestroyWindow(hwnd);
+                } else if (ID_PRECHECK_ACTION_BASE..ID_PRECHECK_ACTION_BASE + 3).contains(&id) {
+                    let slot = id - ID_PRECHECK_ACTION_BASE;
+                    if let Some(command) = precheck_action_command(slot) {
+                        // 修复动作委托给 owner（托盘）窗口，避免以预检子窗口为宿主；
+                        // 预检窗口保持打开，用户可随后点击“重新检测”。
+                        unsafe { handle_command((*dialog).parent, command) };
+                    }
+                }
+            }
+            0
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            KillTimer(hwnd, PRECHECK_TIMER);
+            EnableWindow((*dialog).parent, 1);
+            SetForegroundWindow((*dialog).parent);
+            0
+        }
+        WM_NCDESTROY => {
+            if (*dialog).body_font != 0 {
+                DeleteObject((*dialog).body_font as _);
+            }
+            if (*dialog).title_font != 0 {
+                DeleteObject((*dialog).title_font as _);
+            }
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            drop(Box::from_raw(dialog));
+            PRECHECK_ACTIVE.store(false, Ordering::Release);
+            0
+        }
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+impl PrecheckDialog {
+    unsafe fn create_controls(&mut self, hwnd: HWND) {
+        let stock_font = GetStockObject(DEFAULT_GUI_FONT) as usize;
+        let instance = GetModuleHandleW(ptr::null());
+        self.body_font = CreateFontW(
+            self.layout.body_font,
+            0,
+            0,
+            0,
+            FW_NORMAL as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            CLEARTYPE_QUALITY as u32,
+            (DEFAULT_PITCH | FF_DONTCARE) as u32,
+            wide("Segoe UI").as_ptr(),
+        ) as usize;
+        let font = if self.body_font == 0 {
+            stock_font
+        } else {
+            self.body_font
+        };
+        self.title_font = CreateFontW(
+            self.layout.title_font,
+            0,
+            0,
+            0,
+            FW_SEMIBOLD as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            CLEARTYPE_QUALITY as u32,
+            (DEFAULT_PITCH | FF_DONTCARE) as u32,
+            wide("Segoe UI").as_ptr(),
+        ) as usize;
+        let title_font = if self.title_font == 0 {
+            font
+        } else {
+            self.title_font
+        };
+        let title = self.layout.title;
+        let summary = self.layout.summary;
+        let report = self.layout.report;
+        let recheck = self.layout.recheck;
+        let copy = self.layout.copy;
+        let close = self.layout.close;
+        editor_control(
+            hwnd,
+            "STATIC",
+            "启动预检",
+            title.x,
+            title.y,
+            title.width,
+            title.height,
+            0,
+            WS_CHILD | WS_VISIBLE,
+            instance,
+            title_font,
+        );
+        editor_control(
+            hwnd,
+            "STATIC",
+            "正在检测本地环境，请稍候...",
+            summary.x,
+            summary.y,
+            summary.width,
+            summary.height,
+            ID_PRECHECK_SUMMARY,
+            WS_CHILD | WS_VISIBLE,
+            instance,
+            font,
+        );
+        precheck_report_edit(
+            hwnd,
+            report.x,
+            report.y,
+            report.width,
+            report.height,
+            ID_PRECHECK_REPORT,
+            WS_CHILD
+                | WS_VISIBLE
+                | WS_TABSTOP
+                | ES_MULTILINE as u32
+                | ES_READONLY as u32
+                | ES_AUTOVSCROLL as u32
+                | WS_VSCROLL,
+            instance,
+            font,
+        );
+        for (slot, action) in PRECHECK_ACTION_SLOTS.into_iter().enumerate() {
+            let rect = self.layout.actions[slot];
+            let label = if self.layout.compact {
+                precheck_action_compact_label(action)
+            } else {
+                precheck_action_label(action)
+            };
+            editor_control(
+                hwnd,
+                "BUTTON",
+                label,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                ID_PRECHECK_ACTION_BASE + slot,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                instance,
+                font,
+            );
+        }
+        editor_control(
+            hwnd,
+            "BUTTON",
+            "重新检测",
+            recheck.x,
+            recheck.y,
+            recheck.width,
+            recheck.height,
+            ID_PRECHECK_RECHECK,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "BUTTON",
+            "复制报告",
+            copy.x,
+            copy.y,
+            copy.width,
+            copy.height,
+            ID_PRECHECK_COPY,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            instance,
+            font,
+        );
+        editor_control(
+            hwnd,
+            "BUTTON",
+            "关闭",
+            close.x,
+            close.y,
+            close.width,
+            close.height,
+            ID_PRECHECK_CLOSE,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
+            instance,
+            font,
+        );
+        SetTimer(hwnd, PRECHECK_TIMER, 100, None);
+        self.update_ui(hwnd);
+    }
+
+    unsafe fn start_collect(&mut self, hwnd: HWND) {
+        self.report = None;
+        self.failed = false;
+        self.collecting = true;
+        let (tx, rx) = mpsc::channel();
+        self.receiver = Some(rx);
+        let config = self.app.inner.lock().unwrap().config.clone();
+        self.update_ui(hwnd);
+        // 后台线程只持有克隆的 config 与发送端 tx，不持有任何窗口句柄；窗口提前
+        // 关闭时接收端随 Box 一起释放，tx.send 静默失败后线程自行退出，无悬挂指针。
+        let _ = thread::Builder::new()
+            .name("headroom-precheck".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    precheck::collect(&config)
+                }));
+                let outcome = match result {
+                    Ok(report) => PrecheckResult::Report(report),
+                    Err(_) => PrecheckResult::Failed,
+                };
+                let _ = tx.send(outcome);
+            });
+    }
+
+    unsafe fn poll_result(&mut self, hwnd: HWND) {
+        if !self.collecting {
+            return;
+        }
+        let outcome = match self.receiver.as_ref() {
+            Some(rx) => match rx.try_recv() {
+                Ok(value) => Some(value),
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => Some(PrecheckResult::Failed),
+            },
+            None => return,
+        };
+        self.receiver = None;
+        self.collecting = false;
+        match outcome {
+            Some(PrecheckResult::Report(report)) => {
+                self.report = Some(report);
+                self.failed = false;
+            }
+            Some(PrecheckResult::Failed) => {
+                self.failed = true;
+                notify(hwnd, "预检失败", "后台检测未完成，请点击“重新检测”重试");
+            }
+            None => {}
+        }
+        self.update_ui(hwnd);
+    }
+
+    unsafe fn update_ui(&mut self, hwnd: HWND) {
+        let summary = if self.collecting {
+            "正在检测本地环境，请稍候...".to_owned()
+        } else if self.failed {
+            "预检未完成，请点击“重新检测”重试。".to_owned()
+        } else {
+            self.report.as_ref().map_or_else(
+                || "暂无预检结果。".to_owned(),
+                |report| report.summary_line(),
+            )
+        };
+        SetWindowTextW(
+            GetDlgItem(hwnd, ID_PRECHECK_SUMMARY as i32),
+            wide(&summary).as_ptr(),
+        );
+        let summary_control = GetDlgItem(hwnd, ID_PRECHECK_SUMMARY as i32);
+        if !summary_control.is_null() {
+            InvalidateRect(summary_control, ptr::null(), 1);
+            UpdateWindow(summary_control);
+        }
+        let report_text = if self.collecting {
+            "正在收集运行环境事实（读取本地配置并进行只读的 Headroom 版本验证），不会修改任何配置，也不会读取 API Key。".to_owned()
+        } else {
+            self.report
+                .as_ref()
+                .map_or_else(String::new, |report| report.to_text())
+        };
+        SetWindowTextW(
+            GetDlgItem(hwnd, ID_PRECHECK_REPORT as i32),
+            wide(&report_text).as_ptr(),
+        );
+        let report_control = GetDlgItem(hwnd, ID_PRECHECK_REPORT as i32);
+        if !report_control.is_null() {
+            InvalidateRect(report_control, ptr::null(), 1);
+            UpdateWindow(report_control);
+        }
+        let actions = self
+            .report
+            .as_ref()
+            .map_or_else(Vec::new, |report| report.actions());
+        for (slot, action) in PRECHECK_ACTION_SLOTS.into_iter().enumerate() {
+            let show = !self.collecting && !self.failed && actions.contains(&action);
+            ShowWindow(
+                GetDlgItem(hwnd, (ID_PRECHECK_ACTION_BASE + slot) as i32),
+                if show { SW_SHOW } else { SW_HIDE },
+            );
+        }
+        EnableWindow(
+            GetDlgItem(hwnd, ID_PRECHECK_RECHECK as i32),
+            if self.collecting { 0 } else { 1 },
+        );
+    }
+
+    unsafe fn copy_report(&self, hwnd: HWND) {
+        let Some(report) = self.report.as_ref() else {
+            notify(hwnd, "预检报告不可用", "请等待检测完成后再复制");
+            return;
+        };
+        match copy_clipboard(hwnd, &report.to_text()) {
+            Ok(()) => notify(hwnd, "预检报告已复制", "报告不包含 API Key"),
+            Err(error) => notify(hwnd, "复制预检报告失败", &error.to_string()),
+        }
+    }
+}
+
 fn move_target(targets: &mut [String], selected: usize, direction: isize) -> Option<usize> {
     let next = selected.checked_add_signed(direction)?;
     if next >= targets.len() {
@@ -2098,25 +3542,22 @@ fn failover_sources(routes: &[Route], policy: &FailoverPolicy, protocol: Protoco
 unsafe fn show_status(hwnd: HWND) {
     let Some(app) = APP.get() else { return };
     let s = app.snapshot();
-    let mode = format!(
-        "Codex {}；Claude {}",
-        mode_cn(s.direct_codex, s.bypass_headroom),
-        mode_cn(s.direct_claude, s.bypass_headroom)
-    );
     let text = format!(
-        "【当前路由】\r\n模式：{}\r\nCodex：{} · {}\r\nClaude：{} · {}\r\n\r\n【服务状态】\r\n整体路由：{}\r\n自动切换：{}\r\nHeadroom：{}\r\n配置同步：{}\r\n重启任务：{}\r\n\r\n【Headroom 指标】\r\n统计范围：{}\r\n压缩 Token：{} → {}\r\n节省 Token：{}（{:.1}%）\r\n完成请求：{}\r\n失败请求：{}（{:.1}%）\r\n\r\n【最近活动】\r\n可用路由：{}\r\n最近切换：{}\r\n最近错误：{}\r\n\r\n【恢复建议】\r\n{}",
-        mode,
+        "【状态中心】\r\n当前模式：{}\r\n原因：{}\r\nCodex：{}\r\nClaude：{}\r\nHeadroom：{}\r\n\r\n【当前路由】\r\nCodex：{} · {}\r\nClaude：{} · {}\r\n\r\n【服务状态】\r\n自动切换：{}\r\n配置同步：{}\r\n重启任务：{}\r\n\r\n【Headroom 指标】\r\n统计范围：{}\r\n压缩 Token：{} → {}\r\n节省 Token：{}（{:.1}%）\r\n完成请求：{}\r\n失败请求：{}（{:.1}%）\r\n\r\n【最近活动】\r\n可用路由：{}\r\n最近切换：{}\r\n最近错误：{}\r\n\r\n【恢复建议】\r\n{}",
+        s.runtime_status.mode.label(),
+        s.runtime_status.reason,
+        s.runtime_status.codex.summary(),
+        s.runtime_status.claude.summary(),
+        s.runtime_status.headroom.summary(),
         s.codex_availability,
         app.route_summary(Protocol::OpenAi),
         s.claude_availability,
         app.route_summary(Protocol::Anthropic),
-        health_cn(s.state),
         if s.auto_enabled {
             "已启用"
         } else {
             "未启用"
         },
-        headroom_cn(&s.headroom_state),
         s.sync_status,
         s.restart_status,
         s.headroom_metrics_since.map_or_else(
@@ -2294,12 +3735,13 @@ fn notify_data(hwnd: HWND) -> NOTIFYICONDATAW {
                 .collect::<String>();
             (
                 format!(
-                    "Headroom Route\r\nCodex：{codex}\r\nClaude：{claude}\r\n{} · {} · {}",
-                    health_cn(s.state),
-                    s.sync_status,
-                    s.restart_status
+                    "Headroom Route：{}\r\nCodex：{} · {codex}\r\nClaude：{} · {claude}\r\nHeadroom：{}",
+                    s.runtime_status.mode.label(),
+                    s.runtime_status.codex.state.label(),
+                    s.runtime_status.claude.state.label(),
+                    s.runtime_status.headroom.state.label()
                 ),
-                s.state,
+                s.runtime_status.mode.health_key(),
             )
         })
         .unwrap_or(("Headroom Route".into(), "unknown"));
@@ -3438,33 +4880,6 @@ fn copy_clipboard(hwnd: HWND, text: &str) -> anyhow::Result<()> {
         Ok(())
     }
 }
-fn health_cn(state: &str) -> &'static str {
-    match state {
-        "healthy" => "健康",
-        "degraded" => "降级",
-        "unavailable" => "不可用",
-        _ => "检测中",
-    }
-}
-fn mode_cn(direct: bool, bypass: bool) -> &'static str {
-    if direct {
-        "直连上游"
-    } else if bypass {
-        "旁路 Headroom"
-    } else {
-        "经过 Headroom"
-    }
-}
-fn headroom_cn(state: &str) -> &str {
-    match state {
-        "healthy" => "运行正常",
-        "external" => "外部实例",
-        "starting" => "正在启动",
-        "restarting" => "正在重启",
-        "unavailable" | "runtime-unavailable" => "不可用",
-        _ => state,
-    }
-}
 fn latency_text(value: Option<u64>) -> String {
     value.map(|v| v.to_string()).unwrap_or_else(|| "--".into())
 }
@@ -3488,11 +4903,353 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ID_RESTART, ID_SELECT_RUNTIME, approval_allow_rect, approval_deny_rect, approval_ease,
-        approval_lerp, approval_scale, compact_number, failover_sources, hover_popup_size,
-        move_target, recommended_action, route_hover_text, route_is_selected,
+        ID_CONFIG, ID_RESTART, ID_SELECT_RUNTIME, ID_SYNC, approval_allow_rect, approval_deny_rect,
+        approval_ease, approval_lerp, approval_scale, compact_number, failover_sources,
+        hover_popup_size, move_target, precheck_action_command, precheck_action_compact_label,
+        precheck_action_label, precheck_layout, precheck_scale, recommended_action,
+        route_hover_text, route_is_selected,
     };
-    use crate::model::{AuthStyle, FailoverPolicy, Protocol, Route};
+    use crate::model::{
+        AuthStyle, FailoverPolicy, Protocol, Route, RouteHealth, RuntimeStatusInput,
+        evaluate_runtime_status,
+    };
+    use crate::precheck::PrecheckAction;
+    use windows_sys::Win32::Foundation::RECT;
+
+    #[test]
+    fn precheck_layout_scales_with_dpi() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 4096,
+            bottom: 2160,
+        };
+        for dpi in [96, 144, 192] {
+            let layout = precheck_layout(dpi, work, 0, 0);
+            let n = dpi as i32;
+            assert_eq!(
+                layout.client_width,
+                780 * n / 96,
+                "DPI {dpi}: 客户区宽度应按比例缩放"
+            );
+            assert_eq!(
+                layout.client_height,
+                600 * n / 96,
+                "DPI {dpi}: 客户区高度应按比例缩放"
+            );
+            assert_eq!(layout.title.x, precheck_scale(24, dpi));
+            assert_eq!(layout.title.y, precheck_scale(16, dpi));
+            assert_eq!(layout.title.width, precheck_scale(400, dpi));
+            assert_eq!(layout.title.height, precheck_scale(30, dpi));
+            assert_eq!(layout.body_font, -precheck_scale(15, dpi));
+            assert_eq!(layout.title_font, -precheck_scale(22, dpi));
+        }
+    }
+
+    #[test]
+    fn precheck_layout_centers_window_in_work_area() {
+        let work = RECT {
+            left: 100,
+            top: 50,
+            right: 1100,
+            bottom: 750,
+        };
+        let layout = precheck_layout(96, work, 0, 0);
+        assert_eq!(layout.window_x, 100 + (1000 - 780) / 2);
+        assert_eq!(layout.window_y, 50 + (700 - 600) / 2);
+        assert!(layout.window_x >= work.left);
+        assert!(layout.window_y >= work.top);
+        assert!(layout.window_x + layout.window_width <= work.right);
+        assert!(layout.window_y + layout.window_height <= work.bottom);
+    }
+
+    #[test]
+    fn precheck_layout_fits_window_including_frame() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1024,
+            bottom: 768,
+        };
+        let layout = precheck_layout(96, work, 8, 39);
+        assert!(layout.window_x + layout.window_width <= work.right);
+        assert!(layout.window_y + layout.window_height <= work.bottom);
+        assert!(layout.window_width >= 780);
+    }
+
+    #[test]
+    fn precheck_report_adapts_to_smaller_work_area() {
+        let large = precheck_layout(
+            96,
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            0,
+            0,
+        );
+        let small = precheck_layout(
+            96,
+            RECT {
+                left: 0,
+                top: 0,
+                right: 800,
+                bottom: 500,
+            },
+            0,
+            0,
+        );
+        assert!(large.report.height > small.report.height);
+        assert!(small.report.height > 0);
+        assert_eq!(small.client_width, 780);
+        assert_eq!(small.client_height, 500);
+    }
+
+    #[test]
+    fn precheck_buttons_never_overlap_or_clip() {
+        let cases = [
+            (
+                96,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1080,
+                },
+            ),
+            (
+                144,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 2560,
+                    bottom: 1440,
+                },
+            ),
+            (
+                192,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 3840,
+                    bottom: 2160,
+                },
+            ),
+            (
+                96,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 800,
+                    bottom: 600,
+                },
+            ),
+            (
+                96,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 500,
+                    bottom: 400,
+                },
+            ),
+            (
+                144,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 640,
+                    bottom: 480,
+                },
+            ),
+        ];
+        for (dpi, work) in cases {
+            let layout = precheck_layout(dpi, work, 0, 0);
+            // 完整窗口必须落在工作区内。
+            assert!(
+                layout.window_x >= work.left && layout.window_y >= work.top,
+                "DPI {dpi} 窗口超出工作区左上边界"
+            );
+            assert!(
+                layout.window_x + layout.window_width <= work.right,
+                "DPI {dpi} 窗口超出工作区右边界"
+            );
+            assert!(
+                layout.window_y + layout.window_height <= work.bottom,
+                "DPI {dpi} 窗口超出工作区下边界"
+            );
+            // 文本控件必须完整可见。
+            assert!(
+                layout.title.right() <= layout.client_width
+                    && layout.summary.right() <= layout.client_width
+                    && layout.report.right() <= layout.client_width,
+                "DPI {dpi} 文本控件超出右边界"
+            );
+            for (index, rect) in layout.actions.iter().enumerate() {
+                assert!(rect.x >= 0, "DPI {dpi} 动作按钮 {index} 越界左");
+                assert!(rect.y >= 0, "DPI {dpi} 动作按钮 {index} 越界上");
+                assert!(
+                    rect.right() <= layout.client_width,
+                    "DPI {dpi} 动作按钮 {index} 超出右边界"
+                );
+                assert!(
+                    rect.bottom() <= layout.client_height,
+                    "DPI {dpi} 动作按钮 {index} 超出下边界"
+                );
+                assert!(rect.width > 0 && rect.height > 0);
+            }
+            for index in 0..2 {
+                assert!(
+                    layout.actions[index].right() <= layout.actions[index + 1].x,
+                    "DPI {dpi} 动作按钮 {index} 与 {} 重叠",
+                    index + 1
+                );
+            }
+            for (name, rect) in [
+                ("recheck", layout.recheck),
+                ("copy", layout.copy),
+                ("close", layout.close),
+            ] {
+                assert!(
+                    rect.right() <= layout.client_width,
+                    "DPI {dpi} 底部按钮 {name} 超出右边界"
+                );
+                assert!(
+                    rect.bottom() <= layout.client_height,
+                    "DPI {dpi} 底部按钮 {name} 超出下边界"
+                );
+            }
+            assert!(
+                layout.copy.x >= layout.recheck.right(),
+                "DPI {dpi} 底部按钮互相重叠"
+            );
+            assert!(
+                layout.close.x >= layout.copy.right(),
+                "DPI {dpi} 底部按钮互相重叠"
+            );
+        }
+    }
+
+    #[test]
+    fn precheck_layout_fits_tiny_work_area_including_frame() {
+        let tiny = RECT {
+            left: 10,
+            top: 20,
+            right: 310,
+            bottom: 270,
+        };
+        let layout = precheck_layout(96, tiny, 8, 39);
+        // 完整窗口（含 frame）必须始终不超过工作区。
+        assert!(
+            layout.window_x >= tiny.left && layout.window_y >= tiny.top,
+            "窗口不能超出工作区左上边界"
+        );
+        assert!(
+            layout.window_x + layout.window_width <= tiny.right,
+            "窗口不能超出工作区右边界"
+        );
+        assert!(
+            layout.window_y + layout.window_height <= tiny.bottom,
+            "窗口不能超出工作区下边界"
+        );
+        assert!(layout.compact, "极小工作区应使用紧凑布局");
+        // 动作按钮与底部按钮必须完整可见、尺寸有效且互不重叠。
+        for (index, rect) in layout.actions.iter().enumerate() {
+            assert!(
+                rect.width > 0 && rect.height > 0,
+                "动作按钮 {index} 尺寸无效"
+            );
+            assert!(rect.x >= 0 && rect.y >= 0, "动作按钮 {index} 越界");
+            assert!(
+                rect.right() <= layout.client_width,
+                "动作按钮 {index} 超出右边界"
+            );
+            assert!(
+                rect.bottom() <= layout.client_height,
+                "动作按钮 {index} 超出下边界"
+            );
+        }
+        for index in 0..2 {
+            assert!(
+                layout.actions[index].right() <= layout.actions[index + 1].x,
+                "动作按钮 {index} 与 {} 重叠",
+                index + 1
+            );
+        }
+        for (name, rect) in [
+            ("recheck", layout.recheck),
+            ("copy", layout.copy),
+            ("close", layout.close),
+        ] {
+            assert!(
+                rect.width > 0 && rect.height > 0,
+                "底部按钮 {name} 尺寸无效"
+            );
+            assert!(
+                rect.right() <= layout.client_width,
+                "底部按钮 {name} 超出右边界"
+            );
+            assert!(
+                rect.bottom() <= layout.client_height,
+                "底部按钮 {name} 超出下边界"
+            );
+        }
+        assert!(layout.copy.x >= layout.recheck.right(), "底部按钮互相重叠");
+        assert!(layout.close.x >= layout.copy.right(), "底部按钮互相重叠");
+        // 文本控件必须完整可见。
+        assert!(layout.title.width > 0 && layout.summary.width > 0);
+        assert!(layout.title.right() <= layout.client_width, "标题被裁切");
+        assert!(layout.summary.right() <= layout.client_width, "摘要被裁切");
+        assert!(layout.report.height >= 0, "报告区高度无效");
+    }
+
+    #[test]
+    fn precheck_action_compact_labels_are_short() {
+        assert_eq!(
+            precheck_action_compact_label(PrecheckAction::SelectPython),
+            "选择"
+        );
+        assert_eq!(
+            precheck_action_compact_label(PrecheckAction::SyncRoutes),
+            "同步"
+        );
+        assert_eq!(
+            precheck_action_compact_label(PrecheckAction::OpenConfig),
+            "配置"
+        );
+    }
+
+    #[test]
+    fn precheck_scale_rounds_to_integer_pixels() {
+        assert_eq!(precheck_scale(15, 96), 15);
+        assert_eq!(precheck_scale(15, 144), 23);
+        assert_eq!(precheck_scale(15, 192), 30);
+        assert_eq!(precheck_scale(24, 96), 24);
+        assert_eq!(precheck_scale(0, 144), 0);
+    }
+
+    #[test]
+    fn precheck_action_buttons_route_to_existing_tray_commands() {
+        assert_eq!(precheck_action_command(0), Some(ID_SELECT_RUNTIME));
+        assert_eq!(precheck_action_command(1), Some(ID_SYNC));
+        assert_eq!(precheck_action_command(2), Some(ID_CONFIG));
+        assert_eq!(precheck_action_command(3), None);
+        assert_eq!(precheck_action_command(99), None);
+        assert_eq!(
+            precheck_action_label(PrecheckAction::SelectPython),
+            "选择 Headroom Python..."
+        );
+        assert_eq!(
+            precheck_action_label(PrecheckAction::SyncRoutes),
+            "同步 Codex + Claude / CC-Switch"
+        );
+        assert_eq!(
+            precheck_action_label(PrecheckAction::OpenConfig),
+            "打开 config.json"
+        );
+    }
 
     #[test]
     fn duplicate_urls_select_only_the_active_provider() {
@@ -3552,14 +5309,30 @@ mod tests {
 
     #[test]
     fn recommends_the_action_closest_to_the_fault() {
+        let input = RuntimeStatusInput {
+            codex_enabled: true,
+            claude_enabled: true,
+            direct_codex: false,
+            direct_claude: false,
+            bypass_headroom: false,
+            codex_route_health: Some(RouteHealth::Healthy),
+            claude_route_health: Some(RouteHealth::Healthy),
+            headroom_state: "runtime-unavailable",
+            sync_in_progress: false,
+            restart_in_progress: false,
+            recovery_in_progress: false,
+        };
+        let status = evaluate_runtime_status(input);
         assert_eq!(
-            recommended_action(false, "runtime-unavailable", "不可用", "不可用", None)
-                .map(|action| action.0),
+            recommended_action(&status, "runtime-unavailable", None).map(|action| action.0),
             Some(ID_SELECT_RUNTIME)
         );
+        let status = evaluate_runtime_status(RuntimeStatusInput {
+            headroom_state: "unavailable",
+            ..input
+        });
         assert_eq!(
-            recommended_action(false, "unavailable", "不可用", "不可用", None)
-                .map(|action| action.0),
+            recommended_action(&status, "unavailable", None).map(|action| action.0),
             Some(ID_RESTART)
         );
     }

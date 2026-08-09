@@ -1,5 +1,6 @@
 use crate::{
     config,
+    environment_recovery::{EnvironmentEvent, RecoveryAction},
     model::{AppConfig, HeadroomMetrics},
     runtime,
     sqlite::{self, ProviderRow},
@@ -86,6 +87,13 @@ fn probe_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
                     ),
                 }
             }
+            if app.recovery_in_progress.load(Ordering::Acquire)
+                && app.recovery_state() == crate::environment_recovery::RecoveryState::InProgress
+                && !app.restart_in_progress.load(Ordering::Acquire)
+                && !app.sync_in_progress.load(Ordering::Acquire)
+            {
+                app.process_recovery_event(EnvironmentEvent::RecoverySucceeded);
+            }
             wait_for_next_probe(&app);
         }
     })
@@ -114,6 +122,7 @@ fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
                 || runtime::find_valid_python(&config).is_some()
         };
         let watcher_config = app.inner.lock().unwrap().config.clone();
+        let mut outbound_proxy = config::outbound_proxy_url(&watcher_config);
         let mut cc_switch_modified = watcher_config
             .cc_switch_db
             .metadata()
@@ -121,7 +130,18 @@ fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
             .ok();
         let mut cc_switch_providers = cc_switch_provider_snapshot(&watcher_config).ok();
         let mut routing_drift_active = false;
+        let mut last_heartbeat = Instant::now();
         while !should_stop(&app) {
+            if last_heartbeat.elapsed() >= Duration::from_secs(10) {
+                if let Err(error) = app.heartbeat_session() {
+                    app.inner.lock().unwrap().last_error =
+                        Some(format!("保存会话心跳失败: {error}"));
+                }
+                last_heartbeat = Instant::now();
+            }
+            if let Some(event) = app.take_recovery_retry() {
+                execute_recovery_action(&app, recovery_action_for_event(&event));
+            }
             if app.reset_metrics.swap(false, Ordering::Acquire) {
                 let state = app.inner.lock().unwrap();
                 log_offset = state.config.metrics_log_offset;
@@ -171,6 +191,11 @@ fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
                 }
             }
             let config = app.inner.lock().unwrap().config.clone();
+            let current_proxy = config::outbound_proxy_url(&config);
+            if current_proxy != outbound_proxy {
+                outbound_proxy = current_proxy;
+                execute_recovery_event(&app, EnvironmentEvent::NetworkOrProxyChanged);
+            }
             let current_modified = config
                 .cc_switch_db
                 .metadata()
@@ -183,6 +208,7 @@ fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
                 cc_switch_modified = current_modified;
                 if provider_snapshot_changed(&mut cc_switch_providers, current) {
                     app.refresh_routes();
+                    execute_recovery_event(&app, EnvironmentEvent::NetworkOrProxyChanged);
                     let mut notice = app.config_change_notice.lock().unwrap();
                     if notice.is_none() {
                         *notice = Some(
@@ -196,6 +222,70 @@ fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
             sleep_interruptible(&app, Duration::from_secs(2));
         }
     })
+}
+
+fn execute_recovery_event(app: &AppState, event: EnvironmentEvent) {
+    let action = app.process_recovery_event(event);
+    execute_recovery_action(app, action);
+}
+
+/// Dispatch an environment event from UI/system message sources through the
+/// same recovery state machine used by the polling workers.
+pub fn trigger_environment_event(app: &AppState, event: EnvironmentEvent) {
+    execute_recovery_event(app, event);
+}
+
+fn recovery_action_for_event(event: &EnvironmentEvent) -> RecoveryAction {
+    match event {
+        EnvironmentEvent::Resume => RecoveryAction::Probe,
+        EnvironmentEvent::NetworkOrProxyChanged => RecoveryAction::SyncConfig,
+        EnvironmentEvent::PortConflict => RecoveryAction::TakeOverPort,
+        EnvironmentEvent::PreviousSessionUnclean => RecoveryAction::StopStart,
+        EnvironmentEvent::RecoverySucceeded | EnvironmentEvent::RecoveryFailed => {
+            RecoveryAction::NoOp
+        }
+    }
+}
+
+fn execute_recovery_action(app: &AppState, action: RecoveryAction) {
+    match action {
+        RecoveryAction::Probe => {
+            app.force_probe.store(true, Ordering::Release);
+        }
+        RecoveryAction::SyncConfig => {
+            if !app.begin_sync() {
+                return;
+            }
+            let result = {
+                let config = app.inner.lock().unwrap().config.clone();
+                let openai = app.active_url();
+                let anthropic = app.active_anthropic_url();
+                config::sync_all_with_targets(&config, openai.as_deref(), anthropic.as_deref())
+            };
+            match result {
+                Ok(_) => {
+                    app.refresh_routes();
+                    app.finish_sync(true, "环境变化后的客户端路由同步完成".into());
+                    app.process_recovery_event(EnvironmentEvent::RecoverySucceeded);
+                }
+                Err(error) => {
+                    app.finish_sync(false, error.to_string());
+                    app.inner.lock().unwrap().last_error =
+                        Some(format!("环境变化后的路由同步失败: {error}"));
+                    app.process_recovery_event(EnvironmentEvent::RecoveryFailed);
+                }
+            }
+        }
+        RecoveryAction::RestartHeadroom
+        | RecoveryAction::TakeOverPort
+        | RecoveryAction::StopStart => {
+            if app.begin_restart() {
+                app.restart_headroom.store(true, Ordering::Release);
+            }
+        }
+        RecoveryAction::KeepExisting | RecoveryAction::CleanSession => {}
+        RecoveryAction::Notify | RecoveryAction::NoOp => {}
+    }
 }
 
 fn should_repair_drift(active: &mut bool, drifted: bool) -> bool {
@@ -379,6 +469,9 @@ fn headroom_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
                 if restart_deadline.take().is_some() {
                     app.finish_restart(false, message);
                 }
+            }
+            if child_dead {
+                app.process_recovery_event(EnvironmentEvent::RecoveryFailed);
             }
             if verified && !restart {
                 spawn_failures = 0;
