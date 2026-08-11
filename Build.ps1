@@ -16,6 +16,14 @@ function Get-Sha256([string]$Path) {
     finally { $sha256.Dispose(); $stream.Dispose() }
 }
 
+function Copy-VersionedArtifact([string]$Source, [string]$Destination) {
+    if ((Test-Path -LiteralPath $Destination) -and
+        ((Get-Sha256 $Source) -ne (Get-Sha256 $Destination))) {
+        throw "拒绝覆盖同版本的不同发布产物：$Destination。请先确认并更新 Cargo.toml 版本号。"
+    }
+    Copy-Item -LiteralPath $Source -Destination $Destination -Force
+}
+
 function Get-CodeSigningCertificate([string]$Thumbprint, [string]$StoreLocation) {
     $normalized = [string]($Thumbprint -replace '[^0-9A-Fa-f]', '')
     if (!$normalized) { return $null }
@@ -85,12 +93,12 @@ try {
     $cliShim = Join-Path $project 'hr.cmd'
     if (!(Test-Path $cliShim)) { throw '找不到 CLI 快捷命令 shim：hr.cmd' }
     try {
-        Copy-Item $releaseExe $versionedExe -Force
+        Copy-VersionedArtifact $releaseExe $versionedExe
     } catch [System.IO.IOException] {
         if (!(Test-Path $versionedExe) -or (Get-Sha256 $releaseExe) -ne (Get-Sha256 $versionedExe)) { throw }
         Write-Warning "dist\HeadroomRoute-$version.exe is locked but already matches this build."
     }
-    Copy-Item $releaseCliExe $versionedCliExe -Force
+    Copy-VersionedArtifact $releaseCliExe $versionedCliExe
 
     if ($signingCertificate) {
         if ([string]::IsNullOrWhiteSpace($TimestampServer)) {

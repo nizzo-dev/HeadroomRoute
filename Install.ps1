@@ -59,6 +59,14 @@ function Get-FileSha256([string]$Path) {
 
 function Test-PackageSignature([string]$Path, [string]$Policy, [string]$PinnedThumbprint) {
     if ($Policy -eq 'Skip') { return }
+    $authenticodeCommand = Get-Command Get-AuthenticodeSignature -ErrorAction SilentlyContinue
+    if (!$authenticodeCommand) {
+        if ($Policy -eq 'Require' -or ![string]::IsNullOrWhiteSpace($PinnedThumbprint)) {
+            throw '当前 PowerShell 环境缺少 Get-AuthenticodeSignature，无法执行要求的签名策略验证。'
+        }
+        Write-Warning '当前 PowerShell 环境缺少 Get-AuthenticodeSignature，无法验证未签名状态；开发构建按 Warn 策略继续。'
+        return
+    }
     $signature = Get-AuthenticodeSignature -LiteralPath $Path
     if ($signature.Status -eq [System.Management.Automation.SignatureStatus]::NotSigned) {
         if ($Policy -eq 'Require' -or ![string]::IsNullOrWhiteSpace($PinnedThumbprint)) {

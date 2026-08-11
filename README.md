@@ -266,7 +266,7 @@ PowerShell 也可以直接调用完整入口：
 & "$env:LOCALAPPDATA\HeadroomRoute\HeadroomRouteCLI.exe" codex --help
 ```
 
-等待悬浮窗决定期间，也可以返回对应终端标签页使用 CLI 原生选项；弹窗会隐藏并撤销重复写入。CLI 退出会立即撤销其未处理请求。无法可靠识别的提示仍保留 CLI 原生交互。
+等待悬浮窗决定期间，也可以返回对应终端标签页使用 CLI 原生选项；弹窗会隐藏并撤销重复写入。CLI 退出会立即撤销其未处理请求。AI 完成通知在每轮任务返回可继续输入的提示符时显示；任务内部的多次模型请求只显示一次，不会逐次弹出。无法可靠识别的提示仍保留 CLI 原生交互。
 
 `Ctrl+C` 会转发给 Codex 或 Claude。无论子 CLI 正常退出还是因中断返回非零状态，wrapper 都会先排空 ConPTY 输出，并恢复 CMD/PowerShell 的代码页、输入模式、光标及 VT 私有模式，再将退出码交还给终端。
 

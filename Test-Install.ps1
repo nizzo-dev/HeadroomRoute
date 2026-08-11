@@ -82,7 +82,9 @@ try {
     $warnPolicyOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $package 'Install.ps1') -InstallDir $warnInstall -SkipPathUpdate 2>&1
     $warnPolicyExit = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
-    if ($warnPolicyExit -ne 0) { throw 'Default Warn policy rejected an unsigned dev package' }
+    if ($warnPolicyExit -ne 0) {
+        throw "Default Warn policy rejected an unsigned dev package: $($warnPolicyOutput | Out-String)"
+    }
     if (($warnPolicyOutput | Out-String) -notmatch '未签名') { throw 'Default Warn policy did not warn about the unsigned package' }
     if ((File-Hash (Join-Path $warnInstall 'HeadroomRoute.exe')) -ne $newHash) { throw 'Warn-policy install did not install the package' }
     if ([Environment]::GetEnvironmentVariable('Path', 'User') -ne $pathBeforeWarnPolicy) { throw 'Warn-policy install unexpectedly modified the user PATH' }

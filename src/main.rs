@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod approval;
+mod cli_identity;
 pub mod config;
 pub mod environment_recovery;
 mod model;
@@ -349,6 +350,21 @@ fn run() -> Result<()> {
         }
     }
 
+    let cli_compatibility = app.snapshot().cli_compatibility;
+    if !cli_compatibility.compatible {
+        notification::warning(
+            "CLI wrapper 版本不匹配",
+            format!(
+                "AI 回复完成通知不可用。期望 v{} / 协议 {}，当前 v{}。请运行当前版本的 Install.ps1 成套安装。",
+                cli_compatibility.expected_version,
+                crate::cli_identity::CLI_PROTOCOL_VERSION,
+                cli_compatibility
+                    .detected_version
+                    .as_deref()
+                    .unwrap_or("未检测到")
+            ),
+        );
+    }
     match app.begin_session() {
         Ok(true) if precheck::mode_needs_headroom(&startup_config) => {
             // The previous process did not mark a clean exit. Let the
