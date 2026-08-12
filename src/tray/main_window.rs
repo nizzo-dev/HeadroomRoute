@@ -1,10 +1,35 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use super::*;
+use raw_window_handle::{
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
+    RawWindowHandle, Win32WindowHandle, WindowHandle, WindowsDisplayHandle,
+};
+use std::num::NonZeroIsize;
 use windows_sys::Win32::UI::Controls::{
     ICC_TAB_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, NMHDR, TCIF_TEXT, TCITEMW,
     TCM_ADJUSTRECT, TCM_GETCURSEL, TCM_INSERTITEMW, TCN_SELCHANGE, TCS_FIXEDWIDTH, WC_TABCONTROL,
 };
+
+/// HWND wrapper so wry can attach a WebView to the existing shell window.
+#[allow(dead_code)]
+pub(super) struct ShellWindow(pub HWND);
+
+impl HasWindowHandle for ShellWindow {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        let hwnd = NonZeroIsize::new(self.0 as isize).ok_or(HandleError::Unavailable)?;
+        let handle = Win32WindowHandle::new(hwnd);
+        // SAFETY: handle is only borrowed while the shell HWND is alive on the UI thread.
+        Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::Win32(handle)) })
+    }
+}
+
+impl HasDisplayHandle for ShellWindow {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        let handle = WindowsDisplayHandle::new();
+        Ok(unsafe { DisplayHandle::borrow_raw(RawDisplayHandle::Windows(handle)) })
+    }
+}
 
 const ID_MAIN_TAB: i32 = 300;
 const ID_MAIN_STATUS_BODY: i32 = 301;

@@ -48,6 +48,10 @@ windows-sys = { version = "0.61", features = [
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }
+# Windows-only WebView2 host for the main console. os-webview is enough on Windows;
+# Linux gtk features are target-gated inside wry and unused for this package.
+wry = { version = "0.56", default-features = false, features = ["os-webview"] }
+raw-window-handle = { version = "0.6", features = ["std"] }
 
 [profile.release]
 opt-level = "z"
