@@ -132,8 +132,9 @@ const ID_PROVIDER_IDS: usize = 119;
 const ID_RELOAD_FAILOVER: usize = 120;
 const ID_FAILOVER_EDITOR: usize = 121;
 const ID_APPROVAL_DEMO: usize = 122;
-const ID_DIRECT_CODEX: usize = 123;
-const ID_DIRECT_CLAUDE: usize = 124;
+const ID_MANAGE_UPSTREAM: usize = 123;
+#[allow(dead_code)]
+const ID_DIRECT_CLAUDE: usize = 124; // reserved (legacy dual-direct removed)
 const ID_PRECHECK: usize = 125;
 const ID_TAKEOVER: usize = 126;
 const ID_CREATE_BACKUP: usize = 127;

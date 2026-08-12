@@ -125,6 +125,14 @@ struct PendingRequest {
 struct BrokerState {
     pending: HashMap<u64, PendingRequest>,
     queue: VecDeque<u64>,
+    sessions: HashMap<u32, CliSession>,
+}
+
+#[derive(Clone, Copy)]
+struct CliSession {
+    source_window: u64,
+    focus_known: bool,
+    focused: bool,
 }
 
 struct Broker {
@@ -146,6 +154,7 @@ fn broker() -> &'static Arc<Broker> {
             state: Mutex::new(BrokerState {
                 pending: HashMap::new(),
                 queue: VecDeque::new(),
+                sessions: HashMap::new(),
             }),
         })
     })
@@ -371,11 +380,76 @@ fn update_pid_focus(pid: u32, focused: bool) -> usize {
             count += 1;
         }
     }
+    if let Some(session) = state.sessions.get_mut(&pid) {
+        session.focus_known = true;
+        session.focused = focused;
+    }
     drop(state);
     if count > 0 {
         broker.notify_ui();
     }
     count
+}
+
+fn register_cli_session(pid: u32, source_window: u64, focus_known: bool, focused: bool) {
+    broker().state.lock().unwrap().sessions.insert(
+        pid,
+        CliSession {
+            source_window,
+            focus_known,
+            focused,
+        },
+    );
+}
+
+fn close_cli_session(pid: u32) {
+    broker().state.lock().unwrap().sessions.remove(&pid);
+}
+
+fn should_show_turn_notice(pid: u32) -> bool {
+    let session = broker().state.lock().unwrap().sessions.get(&pid).copied();
+    let Some(session) = session else {
+        return true;
+    };
+    let foreground = unsafe { GetForegroundWindow() };
+    let foreground_root = if foreground.is_null() {
+        0
+    } else {
+        unsafe { GetAncestor(foreground, GA_ROOT) as u64 }
+    };
+    turn_notice_visible(session, foreground_root)
+}
+
+fn turn_notice_visible(session: CliSession, foreground_root: u64) -> bool {
+    session.source_window == 0
+        || foreground_root != session.source_window
+        || !session.focus_known
+        || !session.focused
+}
+
+#[cfg(test)]
+mod turn_notice_tests {
+    use super::{CliSession, turn_notice_visible};
+
+    #[test]
+    fn suppresses_notice_while_cli_terminal_is_foreground() {
+        let session = CliSession {
+            source_window: 42,
+            focus_known: true,
+            focused: true,
+        };
+        assert!(!turn_notice_visible(session, 42));
+    }
+
+    #[test]
+    fn shows_notice_after_cli_terminal_moves_to_background() {
+        let session = CliSession {
+            source_window: 42,
+            focus_known: true,
+            focused: false,
+        };
+        assert!(turn_notice_visible(session, 99));
+    }
 }
 
 pub fn enqueue_demo() -> bool {
@@ -734,7 +808,26 @@ fn handle_pipe(pipe: isize) {
         let _ = write_reason(&mut stream, false, "focus_updated");
         return;
     }
+    if request.kind == "session_register" {
+        register_cli_session(
+            request.pid,
+            request.source_window,
+            request.focus_known,
+            request.focused,
+        );
+        let _ = write_reason(&mut stream, false, "session_registered");
+        return;
+    }
+    if request.kind == "session_close" {
+        close_cli_session(request.pid);
+        let _ = write_reason(&mut stream, false, "session_closed");
+        return;
+    }
     if request.kind == "turn_completed" || request.kind == "turn_failed" {
+        if !should_show_turn_notice(request.pid) {
+            let _ = write_reason(&mut stream, false, &request.kind);
+            return;
+        }
         let cli = if request.cli == "codex" {
             "Codex"
         } else {
@@ -926,6 +1019,7 @@ mod tests {
             next_approval_token: AtomicU64::new(1),
             active_approval_token: AtomicU64::new(0),
             pid: 1,
+            session_pid: 1,
             source_window: 0,
             focus_known: AtomicBool::new(false),
             focused: AtomicBool::new(false),

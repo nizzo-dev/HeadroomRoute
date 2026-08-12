@@ -152,6 +152,7 @@ mod tests {
             cc_switch_db: dir.join("missing.db"),
             enable_codex: true,
             enable_claude: true,
+            manage_upstream: false,
             direct_codex: false,
             direct_claude: false,
             ..AppConfig::default()
@@ -197,7 +198,9 @@ mod tests {
     #[test]
     fn takeover_preview_is_redacted_and_requires_fresh_confirmation() {
         let dir = test_dir("preview");
-        let config = fixture_config(&dir);
+        let mut config = fixture_config(&dir);
+        config.manage_upstream = true;
+        config.sync_deprecated_direct_flags();
         let secret = "sk-test-preview-secret-0123456789";
         write_fixture(&config, secret);
 

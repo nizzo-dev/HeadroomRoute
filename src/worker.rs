@@ -117,8 +117,7 @@ fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
         let routing_available = {
             let config = app.inner.lock().unwrap().config.clone();
             config.bypass_headroom
-                || config.direct_codex
-                || config.direct_claude
+                || !config.manage_upstream
                 || runtime::find_valid_python(&config).is_some()
         };
         let watcher_config = app.inner.lock().unwrap().config.clone();

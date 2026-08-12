@@ -18,7 +18,7 @@ impl AppState {
                 &serde_json::to_vec_pretty(&snapshot)?,
             )?;
             let ini = format!(
-                "[status]\r\nstate={}\r\nactive_provider={}\r\nactive_host={}\r\nclaude_provider={}\r\nclaude_host={}\r\nlatency_ms={}\r\nscore={}\r\nauto_enabled={}\r\nbypass_headroom={}\r\ndirect_codex={}\r\ndirect_claude={}\r\nheadroom_state={}\r\ninflight=0\r\nroute_count={}\r\nlast_error={}\r\n",
+                "[status]\r\nstate={}\r\nactive_provider={}\r\nactive_host={}\r\nclaude_provider={}\r\nclaude_host={}\r\nlatency_ms={}\r\nscore={}\r\nauto_enabled={}\r\nbypass_headroom={}\r\nmanage_upstream={}\r\ndirect_codex={}\r\ndirect_claude={}\r\nheadroom_state={}\r\ninflight=0\r\nroute_count={}\r\nlast_error={}\r\n",
                 snapshot.state,
                 snapshot.active_name.as_deref().unwrap_or("--"),
                 snapshot.active_host.as_deref().unwrap_or("--"),
@@ -31,6 +31,7 @@ impl AppState {
                 snapshot.active_score,
                 snapshot.auto_enabled,
                 snapshot.bypass_headroom,
+                snapshot.manage_upstream,
                 snapshot.direct_codex,
                 snapshot.direct_claude,
                 snapshot.headroom_state,

@@ -58,8 +58,8 @@ pub fn prepare_takeover(
     preferred_openai: Option<&str>,
     preferred_anthropic: Option<&str>,
 ) -> Result<TakeoverPlan> {
-    if config.direct_codex || config.direct_claude {
-        bail!("直连 Provider 切换不属于本地路由接管预览");
+    if !config.manage_upstream {
+        bail!("观测模式（未接管上游）不属于本地路由接管预览");
     }
     let mut staged = Vec::new();
     if let Some(change) = prepare_codex_takeover(config, preferred_openai)? {

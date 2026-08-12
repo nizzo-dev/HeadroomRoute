@@ -5,6 +5,7 @@ pub(super) struct InputSink {
     pub(super) next_approval_token: AtomicU64,
     pub(super) active_approval_token: AtomicU64,
     pub(super) pid: u32,
+    pub(super) session_pid: u32,
     pub(super) source_window: u64,
     pub(super) focus_known: AtomicBool,
     pub(super) focused: AtomicBool,
@@ -128,9 +129,15 @@ impl InputSink {
         self.focus_known.store(true, Ordering::Release);
         self.focused.store(focused, Ordering::Release);
         let pid = self.pid;
+        let session_pid = self.session_pid;
         let _ = thread::Builder::new()
             .name("headroom-focus-update".into())
-            .spawn(move || update_remote_focus(pid, focused));
+            .spawn(move || {
+                update_remote_focus(pid, focused);
+                if session_pid != pid {
+                    update_remote_focus(session_pid, focused);
+                }
+            });
         Some(focused)
     }
 
@@ -335,6 +342,7 @@ mod input_tests {
             next_approval_token: AtomicU64::new(1),
             active_approval_token: AtomicU64::new(0),
             pid: 1,
+            session_pid: 1,
             source_window: 0,
             focus_known: AtomicBool::new(false),
             focused: AtomicBool::new(false),
@@ -396,12 +404,20 @@ pub fn run_cli_command(args: &[String]) -> Result<i32> {
         eprintln!("HeadroomRoute：确认托盘未能启动，确认请求将自动取消");
     }
     let source_window = foreground_root_window();
+    let session_pid = std::process::id();
     let cwd = std::env::current_dir().context("无法读取当前工作目录")?;
     let mut forwarded_args = args[1..].to_vec();
-    let codex_notify_config = (cli == "codex")
-        .then(|| std::env::current_exe().ok())
-        .flatten()
-        .and_then(|executable| codex_notify_config(&executable, std::process::id()));
+    let codex_notify_config = if cli == "codex" {
+        // Do not silently disable the hook when Windows returns a path that
+        // cannot be represented as UTF-8. `to_string_lossy` keeps the hook
+        // enabled; the executable path is only used as a child-process argv.
+        Some(codex_notify_config(
+            &std::env::current_exe().context("无法定位 HeadroomRouteCLI 可执行文件")?,
+            session_pid,
+        ))
+    } else {
+        None
+    };
     let codex_notify_hook = codex_notify_config.is_some();
     if let Some(config) = codex_notify_config {
         forwarded_args.insert(0, config);
@@ -415,6 +431,7 @@ pub fn run_cli_command(args: &[String]) -> Result<i32> {
         next_approval_token: AtomicU64::new(1),
         active_approval_token: AtomicU64::new(0),
         pid: child_pid,
+        session_pid,
         source_window,
         focus_known: AtomicBool::new(source_window != 0),
         focused: AtomicBool::new(source_window != 0),
@@ -425,6 +442,13 @@ pub fn run_cli_command(args: &[String]) -> Result<i32> {
         turn_completion_armed: AtomicBool::new(false),
         turn_input_has_text: AtomicBool::new(false),
     });
+    update_remote_session(
+        "session_register",
+        session_pid,
+        source_window,
+        source_window != 0,
+        source_window != 0,
+    );
     let reader_input = input.clone();
     let reader_cli = cli.clone();
     let reader_cwd = cwd.to_string_lossy().into_owned();
@@ -464,6 +488,7 @@ pub fn run_cli_command(args: &[String]) -> Result<i32> {
     }
     cancel_remote_requests(child_pid);
     input.close();
+    update_remote_session("session_close", session_pid, 0, false, false);
     let mut exit_code = 1u32;
     unsafe {
         let _ = GetExitCodeProcess(spawned.process, &mut exit_code);
@@ -478,7 +503,7 @@ pub fn run_cli_command(args: &[String]) -> Result<i32> {
         Err(_) => Some(anyhow::anyhow!("CLI 输出线程异常退出")),
     };
     if !codex_notify_hook && input.take_completed_turn() {
-        notify_turn_result(&cli, child_pid, TurnResult::Completed);
+        notify_turn_result(&cli, session_pid, TurnResult::Completed);
     }
     if let Some(error) = output_error {
         let _ = write_cli_output(b"\x1b[?1004l");
@@ -984,15 +1009,13 @@ pub(super) fn build_command_line(cli: &str, args: &[String]) -> String {
     format!("cmd.exe /d /s /c \"{command}\"")
 }
 
-fn codex_notify_config(executable: &std::path::Path, pid: u32) -> Option<String> {
-    let executable = executable.to_str()?;
+fn codex_notify_config(executable: &std::path::Path, pid: u32) -> String {
+    let executable = executable.to_string_lossy();
     // Use TOML basic strings so an apostrophe in a Windows user/profile path
     // is harmless.  Backslashes must be escaped for TOML, then Codex receives
     // the original Windows path after parsing the `-c` value.
     let executable = executable.replace('\\', "\\\\").replace('"', "\\\"");
-    Some(format!(
-        "notify=[\"{executable}\",\"--codex-notify\",\"{pid}\"]"
-    ))
+    format!("notify=[\"{executable}\",\"--codex-notify\",\"{pid}\"]")
 }
 
 #[cfg(test)]
@@ -1004,8 +1027,8 @@ mod codex_notify_config_tests {
     fn builds_a_process_local_codex_notify_command() {
         assert_eq!(
             codex_notify_config(Path::new(r"C:\Apps\HeadroomRouteCLI.exe"), 42),
-            Some(
-                "notify=[\"C:\\\\Apps\\\\HeadroomRouteCLI.exe\",\"--codex-notify\",\"42\"]".into()
+            String::from(
+                "notify=[\"C:\\\\Apps\\\\HeadroomRouteCLI.exe\",\"--codex-notify\",\"42\"]"
             )
         );
     }
@@ -1014,7 +1037,7 @@ mod codex_notify_config_tests {
     fn escapes_paths_that_contain_an_apostrophe() {
         assert_eq!(
             codex_notify_config(Path::new(r"C:\O'Brien\cli.exe"), 42),
-            Some("notify=[\"C:\\\\O'Brien\\\\cli.exe\",\"--codex-notify\",\"42\"]".into())
+            String::from("notify=[\"C:\\\\O'Brien\\\\cli.exe\",\"--codex-notify\",\"42\"]")
         );
     }
 }
@@ -1044,6 +1067,38 @@ pub(super) fn update_remote_focus(pid: u32, focused: bool) {
         feedback: false,
         source_window: 0,
         focus_known: true,
+        focused,
+        demo: false,
+    };
+    let Ok(mut body) = serde_json::to_vec(&payload) else {
+        return;
+    };
+    body.push(b'\n');
+    let _ = stream.write_all(&body);
+    let _ = stream.flush();
+}
+
+fn update_remote_session(
+    kind: &str,
+    pid: u32,
+    source_window: u64,
+    focus_known: bool,
+    focused: bool,
+) {
+    let Ok(mut stream) = connect_pipe() else {
+        return;
+    };
+    let payload = WireRequest {
+        kind: kind.into(),
+        cli: String::new(),
+        pid,
+        cwd: String::new(),
+        action: String::new(),
+        summary: String::new(),
+        allow_rule: false,
+        feedback: false,
+        source_window,
+        focus_known,
         focused,
         demo: false,
     };

@@ -106,7 +106,10 @@ pub(super) fn valid_wire_request(request: &WireRequest) -> bool {
             && matches!(request.cli.as_str(), "codex" | "claude")
             && (request.kind == "turn_completed" || !request.summary.trim().is_empty());
     }
-    ((request.kind == "cancel_pid" || request.kind == "focus_update") && request.pid > 0)
+    (matches!(
+        request.kind.as_str(),
+        "cancel_pid" | "focus_update" | "session_register" | "session_close"
+    ) && request.pid > 0)
         || (request.kind == "approval_request"
             && !request.cli.trim().is_empty()
             && request.pid > 0

@@ -346,6 +346,12 @@ fn portable_change_summary(
             current.bypass_headroom, updated.bypass_headroom
         ));
     }
+    if current.manage_upstream != updated.manage_upstream {
+        changes.push(format!(
+            "manage_upstream: {} -> {}",
+            current.manage_upstream, updated.manage_upstream
+        ));
+    }
     if current.direct_codex != updated.direct_codex {
         changes.push(format!(
             "direct_codex: {} -> {}",

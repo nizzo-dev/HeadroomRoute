@@ -186,13 +186,12 @@ pub struct PrecheckFacts {
     pub headroom_port: u16,
 }
 
-/// 旁路、已启用协议全部直连或全部禁用时不需要 Headroom；只要存在一个已启用且
-/// 未直连的协议就需要本地 Headroom 运行环境。
+/// 观测模式 / 旁路 / 协议全禁用时不需要 Headroom；接管上游且至少启用一个协议时需要。
 pub fn mode_needs_headroom(config: &AppConfig) -> bool {
-    if config.bypass_headroom {
+    if config.bypass_headroom || !config.manage_upstream {
         return false;
     }
-    (config.enable_codex && !config.direct_codex) || (config.enable_claude && !config.direct_claude)
+    config.enable_codex || config.enable_claude
 }
 
 fn collect_facts(config: &AppConfig, python_found: bool) -> PrecheckFacts {
@@ -490,38 +489,26 @@ mod tests {
     }
 
     #[test]
-    fn headroom_needed_only_when_an_enabled_protocol_is_not_direct() {
-        assert!(mode_needs_headroom(&AppConfig::default()));
+    fn headroom_needed_only_when_managing_upstream() {
+        assert!(!mode_needs_headroom(&AppConfig::default()));
+        assert!(mode_needs_headroom(&AppConfig {
+            manage_upstream: true,
+            ..AppConfig::default()
+        }));
         assert!(!mode_needs_headroom(&AppConfig {
+            manage_upstream: true,
             bypass_headroom: true,
             ..AppConfig::default()
         }));
         assert!(!mode_needs_headroom(&AppConfig {
-            direct_codex: true,
-            direct_claude: true,
-            ..AppConfig::default()
-        }));
-        assert!(!mode_needs_headroom(&AppConfig {
-            enable_claude: false,
-            direct_codex: true,
-            ..AppConfig::default()
-        }));
-        assert!(!mode_needs_headroom(&AppConfig {
-            enable_codex: false,
-            direct_claude: true,
-            ..AppConfig::default()
-        }));
-        assert!(!mode_needs_headroom(&AppConfig {
+            manage_upstream: true,
             enable_codex: false,
             enable_claude: false,
             ..AppConfig::default()
         }));
         assert!(mode_needs_headroom(&AppConfig {
-            direct_codex: true,
-            ..AppConfig::default()
-        }));
-        assert!(mode_needs_headroom(&AppConfig {
-            direct_claude: true,
+            manage_upstream: true,
+            enable_claude: false,
             ..AppConfig::default()
         }));
     }

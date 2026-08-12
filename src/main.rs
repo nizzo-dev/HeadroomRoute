@@ -414,8 +414,10 @@ fn run() -> Result<()> {
     let maintenance_action = app.maintenance_action.lock().unwrap().take();
     if !matches!(maintenance_action.as_deref(), Some("restore" | "uninstall")) {
         let cfg = app.inner.lock().unwrap().config.clone();
-        if (cfg.direct_codex || cfg.direct_claude)
-            && let Err(error) = config::handoff_direct_to_cc_switch(&cfg)
+        // Always release managed clients back to CC-Switch current upstream so
+        // Codex/Claude keep working after HeadroomRoute exits.
+        if cfg.manage_upstream
+            && let Err(error) = config::release_to_cc_switch(&cfg)
         {
             let message = format!("退出时交还 CC-Switch Provider 失败: {error}");
             app.inner.lock().unwrap().last_error = Some(message.clone());
@@ -468,22 +470,26 @@ fn adopt_cc_switch_startup_selection(config: &mut crate::model::AppConfig) {
     if !config.cc_switch_db.exists() {
         return;
     }
-    if config.enable_codex && config.direct_codex {
+    // In observe mode, align selection with CC-Switch current providers.
+    if config.manage_upstream {
+        return;
+    }
+    if config.enable_codex {
         match sqlite::current_provider(&config.cc_switch_db, "codex") {
             Ok(Some(provider)) => config.selected_openai_provider = Some(provider.id),
             Ok(None) => {}
             Err(error) => notification::warning(
-                "CC-Switch 启动接管",
+                "CC-Switch 启动同步",
                 format!("无法读取 Codex 当前 Provider，继续使用 HeadroomRoute 历史选择：{error}"),
             ),
         }
     }
-    if config.enable_claude && config.direct_claude {
+    if config.enable_claude {
         match sqlite::current_provider(&config.cc_switch_db, "claude") {
             Ok(Some(provider)) => config.selected_anthropic_provider = Some(provider.id),
             Ok(None) => {}
             Err(error) => notification::warning(
-                "CC-Switch 启动接管",
+                "CC-Switch 启动同步",
                 format!("无法读取 Claude 当前 Provider，继续使用 HeadroomRoute 历史选择：{error}"),
             ),
         }
@@ -510,15 +516,13 @@ fn should_auto_open_precheck(first_run: bool, args: &[String]) -> bool {
 }
 
 /// 启动门禁：是否把 Headroom 运行环境标记为不可用。只有模式确实需要 Headroom
-/// （`precheck::mode_needs_headroom`）且找不到可用 Python 时才为真；单协议直连而
-/// 另一启用协议未直连时仍需要 Headroom。复用 P0.1 的判定，避免语义分叉。
+/// （`precheck::mode_needs_headroom` / 接管上游开启）且找不到可用 Python 时才为真。
 fn should_mark_runtime_unavailable(config: &crate::model::AppConfig, python_found: bool) -> bool {
     precheck::mode_needs_headroom(config) && !python_found
 }
 
-/// 启动阶段是否需要探测 Headroom 运行环境：仅在模式确实需要 Headroom 时才启动
-/// 只读子进程探测。旁路、已启用协议全部直连或全部禁用时短路返回 `false`，
-/// 调用方据此跳过 `runtime::find_valid_python`，避免无意义的子进程启动与等待。
+/// 启动阶段是否需要探测 Headroom 运行环境：仅在接管上游且未旁路时才启动
+/// 只读子进程探测。观测模式、旁路或协议全禁用时短路返回 `false`。
 fn should_probe_python_at_startup(config: &crate::model::AppConfig) -> bool {
     precheck::mode_needs_headroom(config)
 }
@@ -619,33 +623,21 @@ mod tests {
     #[test]
     fn startup_probe_short_circuits_when_headroom_not_needed() {
         let defaults = crate::model::AppConfig::default();
-        assert!(should_probe_python_at_startup(&defaults));
+        // Default is observe mode: no Headroom required.
+        assert!(!should_probe_python_at_startup(&defaults));
+        assert!(should_probe_python_at_startup(&crate::model::AppConfig {
+            manage_upstream: true,
+            ..defaults.clone()
+        }));
         assert!(!should_probe_python_at_startup(&crate::model::AppConfig {
+            manage_upstream: true,
             bypass_headroom: true,
             ..defaults.clone()
         }));
         assert!(!should_probe_python_at_startup(&crate::model::AppConfig {
-            direct_codex: true,
-            direct_claude: true,
-            ..defaults.clone()
-        }));
-        assert!(!should_probe_python_at_startup(&crate::model::AppConfig {
+            manage_upstream: true,
             enable_codex: false,
             enable_claude: false,
-            ..defaults.clone()
-        }));
-        assert!(!should_probe_python_at_startup(&crate::model::AppConfig {
-            enable_codex: false,
-            direct_codex: true,
-            enable_claude: false,
-            ..defaults.clone()
-        }));
-        assert!(should_probe_python_at_startup(&crate::model::AppConfig {
-            direct_codex: true,
-            ..defaults.clone()
-        }));
-        assert!(should_probe_python_at_startup(&crate::model::AppConfig {
-            direct_claude: true,
             ..defaults.clone()
         }));
     }
@@ -653,10 +645,24 @@ mod tests {
     #[test]
     fn startup_gate_reuses_mode_needs_headroom() {
         let defaults = crate::model::AppConfig::default();
-        assert!(should_mark_runtime_unavailable(&defaults, false));
-        assert!(!should_mark_runtime_unavailable(&defaults, true));
+        assert!(!should_mark_runtime_unavailable(&defaults, false));
+        assert!(should_mark_runtime_unavailable(
+            &crate::model::AppConfig {
+                manage_upstream: true,
+                ..defaults.clone()
+            },
+            false
+        ));
         assert!(!should_mark_runtime_unavailable(
             &crate::model::AppConfig {
+                manage_upstream: true,
+                ..defaults.clone()
+            },
+            true
+        ));
+        assert!(!should_mark_runtime_unavailable(
+            &crate::model::AppConfig {
+                manage_upstream: true,
                 bypass_headroom: true,
                 ..defaults.clone()
             },
@@ -664,23 +670,7 @@ mod tests {
         ));
         assert!(!should_mark_runtime_unavailable(
             &crate::model::AppConfig {
-                direct_codex: true,
-                direct_claude: true,
-                ..defaults.clone()
-            },
-            false
-        ));
-        assert!(should_mark_runtime_unavailable(
-            &crate::model::AppConfig {
-                direct_codex: true,
-                ..defaults.clone()
-            },
-            false
-        ));
-        assert!(!should_mark_runtime_unavailable(
-            &crate::model::AppConfig {
-                direct_codex: true,
-                direct_claude: true,
+                manage_upstream: true,
                 enable_codex: false,
                 enable_claude: false,
                 ..defaults

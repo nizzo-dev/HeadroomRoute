@@ -29,31 +29,18 @@ pub(super) unsafe fn handle_command(hwnd: HWND, id: usize) {
             Err(error) => notify(hwnd, "自动切换设置失败", &error.to_string()),
         },
         ID_FAILOVER_EDITOR => unsafe { show_failover_editor(hwnd) },
-        ID_DIRECT_CODEX => match app.toggle_direct(Protocol::OpenAi) {
+        ID_MANAGE_UPSTREAM => match app.toggle_manage_upstream() {
             Ok(true) => notify(
                 hwnd,
-                "Codex 已直连上游",
-                "已应用当前 Provider 的地址、模型和凭据；切换 Provider 后重启 Codex，退出时可交还 CC-Switch",
+                "已接管上游",
+                "Codex / Claude 已指向本地 HeadroomRoute；托盘可切换 Provider。退出时交还 CC-Switch。",
             ),
             Ok(false) => notify(
                 hwnd,
-                "Codex 已恢复路由",
-                "Codex 将重新使用当前 Headroom 模式",
+                "已交还 CC-Switch",
+                "观测模式：客户端使用 CC-Switch 当前上游；请在 CC-Switch 切换 Provider。",
             ),
-            Err(error) => notify(hwnd, "Codex 直连切换失败", &error.to_string()),
-        },
-        ID_DIRECT_CLAUDE => match app.toggle_direct(Protocol::Anthropic) {
-            Ok(true) => notify(
-                hwnd,
-                "Claude 已直连上游",
-                "已应用当前 Provider 的地址、模型和凭据；切换 Provider 后重启 Claude Code，退出时可交还 CC-Switch",
-            ),
-            Ok(false) => notify(
-                hwnd,
-                "Claude 已恢复路由",
-                "Claude Code 将重新使用当前 Headroom 模式",
-            ),
-            Err(error) => notify(hwnd, "Claude 直连切换失败", &error.to_string()),
+            Err(error) => notify(hwnd, "切换上游接管失败", &error.to_string()),
         },
         ID_BYPASS => match app.toggle_headroom_bypass() {
             Ok(true) => notify(

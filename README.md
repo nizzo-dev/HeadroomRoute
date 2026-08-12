@@ -28,7 +28,7 @@ HeadroomRoute 是一个轻量、原生的 Windows 托盘路由器，面向同时
 | 复用 CC-Switch | 从其数据库只读导入 Provider、鉴权和模型配置，无需维护第二份账号 |
 | 自动故障切换 | 当前路由连续失败 3 次后，只切换到同协议且已验证健康的 Provider |
 | 一键旁路 | Headroom 故障时可让两套 CLI 直接经过本地路由，保留 Provider 切换能力 |
-| CLI 直连 | Codex 与 Claude 可分别跳过 HeadroomRoute，直接使用当前上游地址 |
+| 接管上游 | 总开关：关闭=观测（CLI 用 CC-Switch 当前上游）；打开=HR 接管客户端与切换 |
 | 外部 Headroom | 使用用户自行维护的 Python / Headroom 环境，不下载额外运行时 |
 | 安全接管配置 | 修改 Codex、Claude 配置前创建备份，不在自身配置中保存 API Key |
 | 可诊断 | 分别显示 Codex、Claude 的健康、延迟、HTTP 状态与恢复建议 |
@@ -78,7 +78,7 @@ python -m venv "$env:USERPROFILE\.headroom\venv"
 - 从 Codex、Claude Code 和 CC-Switch 自动发现可用 Provider。
 - 一键同步配置、立即检查上游或重启 Headroom。
 - Headroom 异常时可一键旁路压缩层；CLI 仍通过 HeadroomRoute 使用当前 Provider。
-- 开发调试时可分别让 Codex 或 Claude 直连当前上游；切换 Provider 时同步其标准地址、模型和凭据，退出后可由 CC-Switch 接管。
+- 默认不接管上游（观测模式），CLI 保持 CC-Switch 当前上游，启停 HeadroomRoute 不影响对话；需要时打开「接管上游」再由本工具改写客户端并切换 Provider，关闭或退出时交还 CC-Switch。
 - CC-Switch Provider 或 CLI 路由配置变化时主动提醒，不静默切换 Provider。
 
 ### CC-Switch 在 HeadroomRoute 中的作用
@@ -170,7 +170,7 @@ flowchart LR
 
 HeadroomRoute 从 CC-Switch 或现有 CLI 配置发现 Provider，把 Codex 与 Claude 的客户端地址指向本机 Headroom；Headroom 再把请求交给本地路由代理。路由代理根据协议选择对应 Provider，并持续记录真实请求与健康探测结果。
 
-开发调试时，托盘可分别开启 Codex 或 Claude 的“直连当前上游”。直连会把对应 CLI 配置切换为所选 CC-Switch Provider 的标准配置、HTTPS 地址、模型和凭据，不经过 HeadroomRoute Agent；Codex 凭据写入 Codex 自己的 `auth.json`，Claude 凭据写入 Claude 的 `settings.json`，HeadroomRoute 的 `config.json` 和诊断报告不会保存凭据。直连模式下该协议不执行自动故障切换，切换 Provider 后需重启对应 CLI。正常退出时，直连协议会交还给 CC-Switch 当前 Provider；没有可用当前 Provider 时保留最近一次 HTTPS 直连配置。
+托盘「接管上游」为总开关（默认关闭）。关闭时为观测模式：不改写 Codex/Claude 客户端，Provider 请在 CC-Switch 切换，本工具只同步展示路由与状态。打开后立即把 CLI 指到本地 HeadroomRoute，并由本工具拥有上游切换；CC-Switch 数据库仍只读。关闭开关或正常退出时，会按 CC-Switch 当前 Provider 写回客户端（地址/模型/凭据按 CLI 自身格式；凭据不进 `config.json`）。没有可用当前 Provider 时保留现有客户端配置。
 
 默认端口：
 
@@ -210,8 +210,7 @@ HeadroomRoute 从 CC-Switch 或现有 CLI 配置发现 Provider，把 Codex 与 
 - **复制 Provider ID 清单**：复制名称与稳定 ID 的对照表。
 - **重新加载故障转移规则**：保存配置后热加载，不重启代理。
 - **旁路 Headroom（保留路由）**：临时跳过压缩层，直接使用本地路由代理。
-- **Codex 直连当前上游**：Codex 跳过 Headroom 与 HeadroomRoute，使用当前 Provider 的标准配置和凭据。
-- **Claude 直连当前上游**：Claude Code 跳过 Headroom 与 HeadroomRoute，使用当前 Provider 的标准配置和凭据。
+- **接管上游**：打开后 Codex/Claude 经 HeadroomRoute；关闭后恢复 CC-Switch 当前上游（观测模式）。
 - **同步 Codex + Claude / CC-Switch**：重新发现并写入路由配置。
 - **重新检测 Headroom 环境**：验证 `headroom_python` 指向的外部环境。
 - **选择 Headroom Python**：选择并验证自定义 `python.exe`，无需手改 JSON。
@@ -287,7 +286,7 @@ PowerShell 也可以直接调用完整入口：
 | 旧版本程序 | `HeadroomRoute.previous.exe` |
 
 - HeadroomRoute 的配置文件不保存 Provider API Key。
-- CC-Switch 数据库始终以只读方式打开；Provider 凭据不会复制进 HeadroomRoute 配置。直连模式会按 CLI 自身格式写入客户端配置，以便切换后独立运行并在退出时交还 CC-Switch。
+- CC-Switch 数据库始终以只读方式打开；Provider 凭据不会复制进 HeadroomRoute 配置。关闭「接管上游」或退出时，会按 CLI 自身格式写回 CC-Switch 当前上游，以便独立运行。
 - 诊断报告会脱敏敏感数据。
 - 程序不会下载、安装或升级 Python 与 Headroom。
 - 软件更新只在用户手动点击检查时访问 GitHub Releases。

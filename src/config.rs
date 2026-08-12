@@ -72,15 +72,20 @@ struct InstallManifest {
 
 pub fn load_or_create(path: &Path) -> Result<AppConfig> {
     if path.exists() {
-        return serde_json::from_str(&fs::read_to_string(path)?)
-            .with_context(|| format!("配置文件无法解析: {}", path.display()));
+        let mut config: AppConfig = serde_json::from_str(&fs::read_to_string(path)?)
+            .with_context(|| format!("配置文件无法解析: {}", path.display()))?;
+        config.migrate_manage_upstream();
+        return Ok(config);
     }
-    let config = AppConfig::default();
+    let mut config = AppConfig::default();
+    config.migrate_manage_upstream();
     save(path, &config)?;
     Ok(config)
 }
 
 pub fn save(path: &Path, config: &AppConfig) -> Result<()> {
+    let mut config = config.clone();
+    config.sync_deprecated_direct_flags();
     config
         .routing_strategy
         .validate()
@@ -88,7 +93,7 @@ pub fn save(path: &Path, config: &AppConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    atomic_write(path, &serde_json::to_vec_pretty(config)?)
+    atomic_write(path, &serde_json::to_vec_pretty(&config)?)
 }
 
 fn table_string(item: &Item, key: &str) -> Option<String> {
@@ -254,6 +259,28 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn manage_upstream_defaults_off_and_mirrors_direct() {
+        let mut config = AppConfig::default();
+        assert!(!config.manage_upstream);
+        config.migrate_manage_upstream();
+        assert!(!config.manage_upstream);
+        assert!(config.direct_codex);
+        assert!(config.direct_claude);
+
+        let mut legacy: AppConfig =
+            serde_json::from_str(r#"{"direct_codex":true,"direct_claude":false}"#).unwrap();
+        legacy.migrate_manage_upstream();
+        assert!(!legacy.manage_upstream);
+        assert!(legacy.direct_codex && legacy.direct_claude);
+
+        let mut managed = AppConfig::default();
+        managed.manage_upstream = true;
+        managed.migrate_manage_upstream();
+        assert!(managed.manage_upstream);
+        assert!(!managed.direct_codex && !managed.direct_claude);
+    }
+
+    #[test]
     fn legacy_config_defaults_api_key_hover_to_off() {
         let mut value = serde_json::to_value(AppConfig::default()).unwrap();
         value
@@ -315,6 +342,8 @@ mod tests {
         config.claude_settings = path.clone();
         config.headroom_port = 8787;
         config.enable_codex = false;
+        config.manage_upstream = true;
+        config.sync_deprecated_direct_flags();
         sync_claude_with_target(&config, None).unwrap();
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["theme"], "dark");
@@ -380,6 +409,8 @@ mod tests {
         config.codex_config = dir.join("config.toml");
         config.claude_settings = dir.join("settings.json");
         config.bypass_headroom = true;
+        config.manage_upstream = true;
+        config.sync_deprecated_direct_flags();
         fs::write(
             &config.codex_config,
             "model_provider = \"upstream\"\n[model_providers.upstream]\nname = \"Upstream\"\nbase_url = \"https://api.example.com/v1\"\n",
@@ -418,6 +449,7 @@ mod tests {
         config.codex_config = dir.join("config.toml");
         config.state_dir = dir.join("state");
         config.enable_claude = false;
+        config.manage_upstream = false;
         config.direct_codex = true;
         fs::write(
             &config.codex_config,
@@ -463,6 +495,7 @@ mod tests {
         config.claude_settings = dir.join("settings.json");
         config.state_dir = dir.join("state");
         config.enable_codex = false;
+        config.manage_upstream = false;
         config.direct_claude = true;
         fs::write(
             &config.claude_settings,

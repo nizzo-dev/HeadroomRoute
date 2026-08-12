@@ -101,20 +101,14 @@ pub(super) unsafe fn show_menu(hwnd: HWND) {
         );
         AppendMenuW(
             menu,
-            MF_STRING | if snapshot.direct_codex { MF_CHECKED } else { 0 },
-            ID_DIRECT_CODEX,
-            wide("Codex 直连当前上游").as_ptr(),
-        );
-        AppendMenuW(
-            menu,
             MF_STRING
-                | if snapshot.direct_claude {
+                | if snapshot.manage_upstream {
                     MF_CHECKED
                 } else {
                     0
                 },
-            ID_DIRECT_CLAUDE,
-            wide("Claude 直连当前上游").as_ptr(),
+            ID_MANAGE_UPSTREAM,
+            wide("接管上游").as_ptr(),
         );
     }
     unsafe {
@@ -351,7 +345,7 @@ pub(super) unsafe fn show_menu(hwnd: HWND) {
             menu,
             MF_STRING,
             ID_EXIT,
-            wide(if snapshot.direct_codex || snapshot.direct_claude {
+            wide(if snapshot.manage_upstream {
                 "退出并交还 CC-Switch"
             } else {
                 "退出 HeadroomRoute"

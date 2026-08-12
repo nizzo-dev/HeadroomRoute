@@ -65,7 +65,9 @@ try {
 
     Push-Location $package
     try {
-        & $env:ComSpec /d /s /c 'hr codex --flag "hello world"'
+        # Prefer explicit package-local shim: NoDefaultCurrentDirectoryInExePath=1
+        # disables bare "hr" lookup in the current directory on this machine.
+        & $env:ComSpec /d /s /c '".\hr.cmd" codex --flag "hello world"'
         if ($LASTEXITCODE -ne 0) { throw 'Packaged CLI shim failed from CMD' }
     } finally {
         Pop-Location

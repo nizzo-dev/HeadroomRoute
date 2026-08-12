@@ -93,7 +93,7 @@ impl AppState {
         Ok(enabled)
     }
 
-    pub fn toggle_direct(&self, protocol: Protocol) -> Result<bool> {
+    pub fn toggle_manage_upstream(&self) -> Result<bool> {
         let _config_guard = self.config_write_guard();
         let (current, mut updated, path, preferred_openai, preferred_anthropic) = {
             let state = self.inner.lock().unwrap();
@@ -105,38 +105,34 @@ impl AppState {
                 active_route(&state, Protocol::Anthropic).map(|route| route.base_url.clone()),
             )
         };
-        let enabled = match protocol {
-            Protocol::OpenAi => {
-                updated.direct_codex = !updated.direct_codex;
-                updated.direct_codex
-            }
-            Protocol::Anthropic => {
-                updated.direct_claude = !updated.direct_claude;
-                updated.direct_claude
-            }
-        };
-        let preferred = if protocol == Protocol::OpenAi {
-            preferred_openai.as_deref()
+        updated.manage_upstream = !updated.manage_upstream;
+        updated.sync_deprecated_direct_flags();
+        let enabled = updated.manage_upstream;
+        let apply = if enabled {
+            config::sync_all_with_targets(
+                &updated,
+                preferred_openai.as_deref(),
+                preferred_anthropic.as_deref(),
+            )
         } else {
-            preferred_anthropic.as_deref()
+            config::release_to_cc_switch(&updated)
         };
-        if let Err(error) = config::sync_protocol_with_target(&updated, protocol, preferred)
-            .and_then(|_| config::save(&path, &updated))
-        {
-            let current_preferred = if protocol == Protocol::OpenAi {
-                preferred_openai.as_deref()
+        if let Err(error) = apply.and_then(|_| config::save(&path, &updated)) {
+            let _ = if current.manage_upstream {
+                config::sync_all_with_targets(
+                    &current,
+                    preferred_openai.as_deref(),
+                    preferred_anthropic.as_deref(),
+                )
             } else {
-                preferred_anthropic.as_deref()
+                config::release_to_cc_switch(&current)
             };
-            let _ = config::sync_protocol_with_target(&current, protocol, current_preferred);
-            self.inner.lock().unwrap().last_error =
-                Some(format!("切换{}直连模式失败: {error}", protocol.label()));
+            self.inner.lock().unwrap().last_error = Some(format!("切换上游接管失败: {error}"));
             return Err(error);
         }
         self.inner.lock().unwrap().config = updated;
         Ok(enabled)
     }
-
     pub fn reset_headroom_metrics(&self) -> Result<()> {
         let _config_guard = self.config_write_guard();
         let (mut updated, path, log_file) = {

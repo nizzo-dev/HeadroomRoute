@@ -133,7 +133,7 @@ pub fn sync_codex(config: &AppConfig, preferred: Option<&str>) -> Result<String>
     if !config.enable_codex || !config.codex_config.exists() {
         return Ok("未启用".into());
     }
-    if config.direct_codex {
+    if !config.manage_upstream {
         return sync_codex_direct_provider(
             config,
             config.selected_openai_provider.as_deref(),
@@ -311,20 +311,23 @@ pub fn sync_direct_provider(
     }
 }
 
-pub fn handoff_direct_to_cc_switch(config: &AppConfig) -> Result<String> {
+/// Release enabled clients to the CC-Switch current upstream (observe mode).
+/// Used when turning manage_upstream off, on clean exit after manage, and to
+/// heal sticky local URLs after an unclean shutdown.
+pub fn release_to_cc_switch(config: &AppConfig) -> Result<String> {
     if !config.cc_switch_db.exists() {
-        return Ok("未发现 CC-Switch 数据库，保留当前直连配置".into());
+        return Ok("未发现 CC-Switch 数据库，保留当前客户端配置".into());
     }
     let mut updated = config.clone();
     let mut handed_off = Vec::new();
-    if config.direct_codex
+    if config.enable_codex
         && let Some(provider) = sqlite::current_provider(&config.cc_switch_db, "codex")?
     {
         sync_direct_provider(config, Protocol::OpenAi, &provider.id)?;
         updated.selected_openai_provider = Some(provider.id.clone());
         handed_off.push(format!("Codex={}", provider.name));
     }
-    if config.direct_claude
+    if config.enable_claude
         && let Some(provider) = sqlite::current_provider(&config.cc_switch_db, "claude")?
     {
         sync_direct_provider(config, Protocol::Anthropic, &provider.id)?;
@@ -334,20 +337,29 @@ pub fn handoff_direct_to_cc_switch(config: &AppConfig) -> Result<String> {
     if updated.selected_openai_provider != config.selected_openai_provider
         || updated.selected_anthropic_provider != config.selected_anthropic_provider
     {
-        save(&config.state_dir.join("config.json"), &updated)?;
+        // Persist selection only; manage_upstream flag is owned by caller.
+        let mut to_save = updated.clone();
+        to_save.manage_upstream = config.manage_upstream;
+        to_save.sync_deprecated_direct_flags();
+        save(&config.state_dir.join("config.json"), &to_save)?;
     }
     if handed_off.is_empty() {
-        Ok("CC-Switch 没有当前 Provider，保留当前直连配置".into())
+        Ok("CC-Switch 没有当前 Provider，保留当前客户端配置".into())
     } else {
         Ok(handed_off.join(", "))
     }
+}
+
+/// Backward-compatible alias used by older call sites.
+pub fn handoff_direct_to_cc_switch(config: &AppConfig) -> Result<String> {
+    release_to_cc_switch(config)
 }
 
 pub fn sync_claude_with_target(config: &AppConfig, preferred: Option<&str>) -> Result<String> {
     if !config.enable_claude {
         return Ok("未启用".into());
     }
-    if config.direct_claude {
+    if !config.manage_upstream {
         return sync_claude_direct_provider(
             config,
             config.selected_anthropic_provider.as_deref(),
@@ -391,6 +403,11 @@ pub fn sync_all_with_targets(
     preferred_anthropic: Option<&str>,
 ) -> Result<String> {
     capture_baseline(config)?;
+    if !config.manage_upstream {
+        // Observe mode: keep/restore real upstreams, never point at local agent.
+        let _ = (preferred_openai, preferred_anthropic);
+        return release_to_cc_switch(config);
+    }
     let codex = sync_codex(config, preferred_openai)?;
     let claude = sync_claude_with_target(config, preferred_anthropic)?;
     Ok(format!("Codex={codex}, Claude={claude}"))

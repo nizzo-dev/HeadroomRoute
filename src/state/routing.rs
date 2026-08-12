@@ -12,7 +12,7 @@ impl AppState {
         history_kind: Option<OperationKind>,
     ) -> bool {
         let _config_guard = self.config_write_guard();
-        let (protocol, provider, from_provider, direct, app_config) = {
+        let (protocol, provider, from_provider, managing, app_config) = {
             let state = self.inner.lock().unwrap();
             let Some(route) = state.routes.get(index) else {
                 return false;
@@ -23,30 +23,22 @@ impl AppState {
                 route.protocol,
                 route.provider.clone(),
                 from_provider,
-                match route.protocol {
-                    Protocol::OpenAi => state.config.direct_codex,
-                    Protocol::Anthropic => state.config.direct_claude,
-                },
+                state.config.manage_upstream,
                 state.config.clone(),
             )
         };
-        let model_notice = if direct {
-            if let Err(error) = config::sync_direct_provider(&app_config, protocol, &provider) {
-                self.inner.lock().unwrap().last_error = Some(format!(
-                    "同步{}直连 Provider 失败: {error}",
-                    protocol.label()
-                ));
+        if !managing {
+            self.inner.lock().unwrap().last_error =
+                Some("当前为观测模式：请在 CC-Switch 切换上游，或打开「接管上游」".into());
+            return false;
+        }
+        // Managing: point clients at local Headroom and sync model metadata.
+        let model_notice = match config::sync_provider_models(&app_config, protocol, &provider) {
+            Ok(notice) => notice,
+            Err(error) => {
+                self.inner.lock().unwrap().last_error =
+                    Some(format!("同步目标模型配置失败: {error}"));
                 return false;
-            }
-            None
-        } else {
-            match config::sync_provider_models(&app_config, protocol, &provider) {
-                Ok(notice) => notice,
-                Err(error) => {
-                    self.inner.lock().unwrap().last_error =
-                        Some(format!("同步目标模型配置失败: {error}"));
-                    return false;
-                }
             }
         };
         let mut state = self.inner.lock().unwrap();
@@ -281,7 +273,7 @@ impl AppState {
                 state.last_error = None;
                 let path = state.config.state_dir.join("config.json");
                 let saved = state.config.clone();
-                let direct_sync = saved.direct_codex || saved.direct_claude;
+                let manage_sync = saved.manage_upstream;
                 drop(state);
                 if !retained_deleted.is_empty() {
                     *self.config_change_notice.lock().unwrap() = Some(format!(
@@ -293,7 +285,8 @@ impl AppState {
                     self.inner.lock().unwrap().last_error =
                         Some(format!("修复上游选择失败: {error}"));
                 }
-                if direct_sync
+                // Only rewrite clients when managing; observe mode leaves CLI alone.
+                if manage_sync
                     && let Err(error) = config::sync_all_with_targets(
                         &saved,
                         preferred_openai.as_deref(),
@@ -301,7 +294,7 @@ impl AppState {
                     )
                 {
                     self.inner.lock().unwrap().last_error =
-                        Some(format!("同步直连上游失败: {error}"));
+                        Some(format!("同步接管上游失败: {error}"));
                 }
             }
             Err(error) => self.inner.lock().unwrap().last_error = Some(error.to_string()),
@@ -334,11 +327,8 @@ impl AppState {
             } else {
                 state.active_anthropic
             };
-            let direct = match protocol {
-                Protocol::OpenAi => state.config.direct_codex,
-                Protocol::Anthropic => state.config.direct_claude,
-            };
-            if direct
+            // Auto-failover only while managing upstream (own the switch).
+            if !state.config.manage_upstream
                 || !state.config.auto_failover
                 || active != Some(failed)
                 || state.routes[failed].state != RouteHealth::Unavailable

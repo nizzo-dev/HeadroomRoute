@@ -277,7 +277,7 @@ pub fn routing_drifted_with_targets(
     _preferred_anthropic: Option<&str>,
 ) -> bool {
     let codex_local = format!("http://127.0.0.1:{}/v1", client_port(config));
-    let codex_drifted = !config.direct_codex
+    let codex_drifted = config.manage_upstream
         && config.enable_codex
         && config.codex_config.exists()
         && fs::read_to_string(&config.codex_config)
@@ -295,7 +295,7 @@ pub fn routing_drifted_with_targets(
                         != Some(codex_local.as_str())
             });
     let local = format!("http://127.0.0.1:{}", client_port(config));
-    let claude_drifted = !config.direct_claude
+    let claude_drifted = config.manage_upstream
         && config.enable_claude
         && fs::read_to_string(&config.claude_settings)
             .ok()

@@ -101,9 +101,7 @@ impl AppState {
     }
     pub fn recovery_hint(&self) -> &'static str {
         let state = self.inner.lock().unwrap();
-        let headroom_state = if state.config.bypass_headroom
-            || (state.config.direct_codex && state.config.direct_claude)
-        {
+        let headroom_state = if state.config.bypass_headroom || !state.config.manage_upstream {
             "external"
         } else {
             &state.headroom_state
