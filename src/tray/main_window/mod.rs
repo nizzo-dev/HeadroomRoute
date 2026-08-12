@@ -89,6 +89,7 @@ pub(super) unsafe fn register_main_window_class(
         lpszClassName: class_name.as_ptr(),
         hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
         hbrBackground: (COLOR_WINDOW + 1) as _,
+        hIcon: crate::branding::window_icon_big(),
         style: CS_HREDRAW | CS_VREDRAW,
         ..std::mem::zeroed()
     };
@@ -134,6 +135,15 @@ pub(super) unsafe fn create_main_window(tray_hwnd: HWND) -> anyhow::Result<HWND>
         anyhow::bail!("无法创建主控制台窗口");
     }
     MAIN_HWND.with(|slot| slot.set(hwnd));
+    // Title-bar small icon (class hIcon covers big/taskbar).
+    let small = crate::branding::window_icon_small();
+    if !small.is_null() {
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as LPARAM);
+    }
+    let big = crate::branding::window_icon_big();
+    if !big.is_null() {
+        SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, big as LPARAM);
+    }
     Ok(hwnd)
 }
 

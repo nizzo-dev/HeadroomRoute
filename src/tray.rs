@@ -632,8 +632,13 @@ fn failover_sources(routes: &[Route], policy: &FailoverPolicy, protocol: Protoco
     sources
 }
 
-fn make_icon(health: &str) -> *mut c_void {
-    let color = match health {
+fn make_icon(_health: &str) -> *mut c_void {
+    // Prefer branded logo; fall back to procedural glyph if ICO decode fails.
+    let branded = crate::branding::tray_icon();
+    if !branded.is_null() {
+        return branded;
+    }
+    let color = match _health {
         "healthy" => 0x00_3c_b3_71u32,
         "degraded" => 0x00_00_a5_ff,
         "unavailable" => 0x00_43_43_dc,

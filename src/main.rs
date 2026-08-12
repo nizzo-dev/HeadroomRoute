@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod approval;
+mod branding;
 mod cli_identity;
 pub mod config;
 pub mod environment_recovery;

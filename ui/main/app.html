@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:;" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAEQElEQVR42s1XPY8bVRQ95707znqdD1ZE0a4lKClQQOnpEYr4AVDyF5CQiIQoqeA3IAFdilQUUFKQjiqKUESKJFp7EcuiTbIknvdxKPzGGXvHXpsPiSc9zdi6c+e+e8+59wyxsCQRHYuksMH6t/z854sdkbslkecNT7/d9n94eMgYY97b2ztp21rzAEk9fPiwH2P8zsx2Y4ypOGCxuU7yviS3LJjGz/Hx8UuDweBH59xOzjlBwOXLl32McSTpLZLPGtu5eknqhzr8pu51dVWGFvy8HEJ4sugghPCrpO22rXUU5U8AOcaYIDmQAMCc86bgmQAYhBAySZmZB1AvGnWdxjVb5UrSAb213/wYj8Fp5CTZlLHcrg6AEDrp01v//biIi626oPt+WQbIDjOt5nYHDiRIizzT1JFWBqDT1BQdMZlMUkHtqiAcST19+tQI9tbBzVwABwcHsxIUmgCCnHOqquoLSedIpi4mFPskaavf73/tvLuQU8oLAXPxAHOOdnd3BSIAiCQDhAgixxBr59z1lNLNpg+0y1HuKelCSumW9/7tGGMC6Tbq25K2QwgnWrFijLePjo4uSfKt5wwA6rr+pPD9eQght3aUpBjio/39/dN9oDUgAsVPAVyKMc7q55wTcoamJ9/e2dlJrVLM7Lz35wFkCK4LKYI4HA5xqhW3Vnw2efbN+eq8N7N5ALlZNhOAVyTdJ1m3S5FzlnPOgUjrUnZuFgDob21t/QRgmGLMnTWUkvfmU07fS3q3BORmmZpmRB0dQF2dwHVMxx0A8GbOe49T28xnZRSgfVUGE0sGGh/mvXdm5mzqx8r/vc4MtDAwAfA+gK2UUsN5tWwHALykjyG8ambvpZTGJD+U5HPOofioc8pOUCaYBUUzI8GDxSywQwtcA7DVGIYQUFWVA/AHybvF7lpO+QdBfe+9pZQ+MrPPGyYByO29Sku0m44KDQ+qqrqwaJhS+tl7/wYAT3ISQnjHOfetpAzBQNyU9ARABMTS1Ilpa6eZ+RjjkZndaMDbpQe2QwgPJMVQhzqEEEIdJlP6x9uNraQKAGKMH5TekLXGKhrhDD0AeAC+FKfhs5fkW/IsSDKSX9Z1vVdV1Y2UUi3Bc1q6cwBMsykGWWWO5O9n64E1ZQfJKMn1er3PTk5OXvPeXw2hfvP55Pnrgm5589UMvIQHYOUQWtqIRqMRrly5ogYcas2+LjHRzASS4/b/IYQn3T3/jGE0HA4xm4YlCoJnZUIFF5RUldr6eaTzhdw5Sw/8LW1PqiB6dl1S19UZGI1GWOSwlDW9bqJJ3Yv2O+Xp0lZsiyWIIfYBODNzLVaA5AaqMFeAo3Ou56ZDzC3zMRfAIzzSkMNfAJy0PkyymRmABxuk4BDAOOccim6Qc85LGp/JswKkXrlWd+7c6TW/1337vXv3zkkaSNpu9ng8HjRi5H//ccpVaP8nn+ZdPv4CLlNGIJXQjKIAAAAASUVORK5CYII=" />
   <title>Headroom Route</title>
   <style>
 /* ===== Headroom Route console ===== */
@@ -39,7 +40,8 @@ body { display: flex; flex-direction: column; min-height: 100%; }
   border-bottom: 1px solid var(--border);
   background: linear-gradient(180deg, #171a22, var(--bg));
 }
-.brand { font-weight: 600; letter-spacing: 0.02em; }
+.brand { font-weight: 600; letter-spacing: 0.02em; display: inline-flex; align-items: center; gap: 8px; }
+.brand-logo { display: block; border-radius: 4px; }
 .pill {
   font-size: 12px;
   padding: 4px 10px;
@@ -168,7 +170,7 @@ label.check input { accent-color: var(--accent); }
 </head>
 <body>
   <header class="top">
-    <div class="brand">Headroom Route</div>
+    <div class="brand"><img class="brand-logo" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAEQElEQVR42s1XPY8bVRQ95707znqdD1ZE0a4lKClQQOnpEYr4AVDyF5CQiIQoqeA3IAFdilQUUFKQjiqKUESKJFp7EcuiTbIknvdxKPzGGXvHXpsPiSc9zdi6c+e+e8+59wyxsCQRHYuksMH6t/z854sdkbslkecNT7/d9n94eMgYY97b2ztp21rzAEk9fPiwH2P8zsx2Y4ypOGCxuU7yviS3LJjGz/Hx8UuDweBH59xOzjlBwOXLl32McSTpLZLPGtu5eknqhzr8pu51dVWGFvy8HEJ4sugghPCrpO22rXUU5U8AOcaYIDmQAMCc86bgmQAYhBAySZmZB1AvGnWdxjVb5UrSAb213/wYj8Fp5CTZlLHcrg6AEDrp01v//biIi626oPt+WQbIDjOt5nYHDiRIizzT1JFWBqDT1BQdMZlMUkHtqiAcST19+tQI9tbBzVwABwcHsxIUmgCCnHOqquoLSedIpi4mFPskaavf73/tvLuQU8oLAXPxAHOOdnd3BSIAiCQDhAgixxBr59z1lNLNpg+0y1HuKelCSumW9/7tGGMC6Tbq25K2QwgnWrFijLePjo4uSfKt5wwA6rr+pPD9eQght3aUpBjio/39/dN9oDUgAsVPAVyKMc7q55wTcoamJ9/e2dlJrVLM7Lz35wFkCK4LKYI4HA5xqhW3Vnw2efbN+eq8N7N5ALlZNhOAVyTdJ1m3S5FzlnPOgUjrUnZuFgDob21t/QRgmGLMnTWUkvfmU07fS3q3BORmmZpmRB0dQF2dwHVMxx0A8GbOe49T28xnZRSgfVUGE0sGGh/mvXdm5mzqx8r/vc4MtDAwAfA+gK2UUsN5tWwHALykjyG8ambvpZTGJD+U5HPOofioc8pOUCaYBUUzI8GDxSywQwtcA7DVGIYQUFWVA/AHybvF7lpO+QdBfe+9pZQ+MrPPGyYByO29Sku0m44KDQ+qqrqwaJhS+tl7/wYAT3ISQnjHOfetpAzBQNyU9ARABMTS1Ilpa6eZ+RjjkZndaMDbpQe2QwgPJMVQhzqEEEIdJlP6x9uNraQKAGKMH5TekLXGKhrhDD0AeAC+FKfhs5fkW/IsSDKSX9Z1vVdV1Y2UUi3Bc1q6cwBMsykGWWWO5O9n64E1ZQfJKMn1er3PTk5OXvPeXw2hfvP55Pnrgm5589UMvIQHYOUQWtqIRqMRrly5ogYcas2+LjHRzASS4/b/IYQn3T3/jGE0HA4xm4YlCoJnZUIFF5RUldr6eaTzhdw5Sw/8LW1PqiB6dl1S19UZGI1GWOSwlDW9bqJJ3Yv2O+Xp0lZsiyWIIfYBODNzLVaA5AaqMFeAo3Ou56ZDzC3zMRfAIzzSkMNfAJy0PkyymRmABxuk4BDAOOccim6Qc85LGp/JswKkXrlWd+7c6TW/1337vXv3zkkaSNpu9ng8HjRi5H//ccpVaP8nn+ZdPv4CLlNGIJXQjKIAAAAASUVORK5CYII=" alt="" width="20" height="20" /> Headroom Route</div>
     <div id="mode-pill" class="pill">—</div>
   </header>
   <nav class="tabs" role="tablist">
