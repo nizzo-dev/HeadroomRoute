@@ -309,6 +309,7 @@ pub fn is_pending(id: u64) -> bool {
     broker().state.lock().unwrap().pending.contains_key(&id)
 }
 
+#[allow(dead_code)]
 pub fn pending_count() -> usize {
     broker().state.lock().unwrap().pending.len()
 }

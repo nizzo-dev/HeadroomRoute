@@ -2,8 +2,10 @@ use super::*;
 
 pub(super) unsafe fn handle_command(hwnd: HWND, id: usize) {
     let Some(app) = APP.get() else { return };
+    // Maintenance/exit must destroy the tray host, never the main console.
+    let host = tray_host_hwnd(hwnd);
     match id {
-        ID_OPEN_STATUS => unsafe { show_status(hwnd) },
+        ID_OPEN_STATUS => unsafe { show_main_window() },
         ID_CHECK => {
             app.force_probe.store(true, Ordering::Relaxed);
             notify(hwnd, "正在检查上游", "检查结果会自动更新到托盘状态");
@@ -28,7 +30,7 @@ pub(super) unsafe fn handle_command(hwnd: HWND, id: usize) {
             Ok(false) => notify(hwnd, "自动切换已关闭", "上游故障时将保留当前路由"),
             Err(error) => notify(hwnd, "自动切换设置失败", &error.to_string()),
         },
-        ID_FAILOVER_EDITOR => unsafe { show_failover_editor(hwnd) },
+        ID_FAILOVER_EDITOR => unsafe { show_failover_editor(dialog_owner(hwnd)) },
         ID_MANAGE_UPSTREAM => match app.toggle_manage_upstream() {
             Ok(true) => notify(
                 hwnd,
@@ -131,7 +133,7 @@ pub(super) unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_EXPORT_PORTABLE => export_portable_from_tray(hwnd, app),
         ID_IMPORT_PORTABLE => import_portable_from_tray(hwnd, app),
         ID_DIAGNOSTIC_ZIP => create_diagnostic_zip_from_tray(hwnd, app),
-        ID_PRECHECK => unsafe { show_precheck(hwnd) },
+        ID_PRECHECK => unsafe { show_precheck(dialog_owner(hwnd)) },
         ID_RESET_METRICS => {
             if unsafe {
                 MessageBoxW(
@@ -217,7 +219,7 @@ pub(super) unsafe fn handle_command(hwnd: HWND, id: usize) {
             {
                 *app.maintenance_action.lock().unwrap() = Some("restore".into());
                 unsafe {
-                    DestroyWindow(hwnd);
+                    DestroyWindow(host);
                 }
             }
         }
@@ -233,7 +235,7 @@ pub(super) unsafe fn handle_command(hwnd: HWND, id: usize) {
             {
                 *app.maintenance_action.lock().unwrap() = Some("check-runtime".into());
                 unsafe {
-                    DestroyWindow(hwnd);
+                    DestroyWindow(host);
                 }
             }
         }
@@ -279,18 +281,19 @@ pub(super) unsafe fn handle_command(hwnd: HWND, id: usize) {
             {
                 *app.maintenance_action.lock().unwrap() = Some("uninstall".into());
                 unsafe {
-                    DestroyWindow(hwnd);
+                    DestroyWindow(host);
                 }
             }
         }
         ID_EXIT => unsafe {
-            DestroyWindow(hwnd);
+            DestroyWindow(host);
         },
         value
             if value >= ID_ROUTE_BASE
                 && app.switch_index(value - ID_ROUTE_BASE, "托盘手动切换") =>
         {
             let _ = app.write_status();
+            unsafe { refresh_main_window_if_visible() };
         }
         _ => {}
     }

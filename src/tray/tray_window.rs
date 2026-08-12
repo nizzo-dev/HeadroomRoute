@@ -1,46 +1,5 @@
 use super::*;
 
-pub(super) unsafe fn show_status(hwnd: HWND) {
-    let Some(app) = APP.get() else { return };
-    let s = app.snapshot();
-    let text = format!(
-        "【状态中心】\r\n当前模式：{}\r\n原因：{}\r\nCodex：{}\r\nClaude：{}\r\nHeadroom：{}\r\n\r\n【当前路由】\r\nCodex：{} · {}\r\nClaude：{} · {}\r\n\r\n【服务状态】\r\n自动切换：{}\r\n配置同步：{}\r\n重启任务：{}\r\n\r\n【Headroom 指标】\r\n统计范围：{}\r\n压缩 Token：{} → {}\r\n节省 Token：{}（{:.1}%）\r\n完成请求：{}\r\n失败请求：{}（{:.1}%）\r\n\r\n【最近活动】\r\n可用路由：{}\r\n最近切换：{}\r\n最近错误：{}\r\n\r\n【恢复建议】\r\n{}",
-        s.runtime_status.mode.label(),
-        s.runtime_status.reason,
-        s.runtime_status.codex.summary(),
-        s.runtime_status.claude.summary(),
-        s.runtime_status.headroom.summary(),
-        s.codex_availability,
-        app.route_summary(Protocol::OpenAi),
-        s.claude_availability,
-        app.route_summary(Protocol::Anthropic),
-        if s.auto_enabled {
-            "已启用"
-        } else {
-            "未启用"
-        },
-        s.sync_status,
-        s.restart_status,
-        s.headroom_metrics_since.map_or_else(
-            || "当前日志文件累计".into(),
-            |since| format!("自 {} UTC", since.format("%Y-%m-%d %H:%M:%S")),
-        ),
-        s.headroom_metrics.input_tokens_original,
-        s.headroom_metrics.input_tokens_optimized,
-        s.headroom_metrics.tokens_saved,
-        s.headroom_metrics.compression_percent(),
-        s.headroom_metrics.completed_requests,
-        s.headroom_metrics.failed_requests,
-        s.headroom_metrics.failure_percent(),
-        s.routes.len(),
-        s.last_switch_reason.as_deref().unwrap_or("无"),
-        s.last_error.as_deref().unwrap_or("无"),
-        app.recovery_hint()
-    );
-    let _ = hwnd;
-    notification::info("Headroom Route 状态", text);
-}
-
 pub(super) unsafe fn show_hovered_route_url(hwnd: HWND, wparam: WPARAM) {
     let id = wparam & 0xffff;
     let Some((route, show_key)) = APP.get().and_then(|app| {

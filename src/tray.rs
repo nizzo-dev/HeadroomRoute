@@ -7,6 +7,7 @@ mod commands;
 mod failover_editor;
 use failover_editor::*;
 mod icon_bitmap;
+mod main_window;
 mod menu;
 mod portability_actions;
 mod precheck_dialog;
@@ -17,6 +18,10 @@ mod tray_window;
 
 use approval_dialog::*;
 use commands::*;
+use main_window::{
+    create_main_window, destroy_main_window, dialog_owner, refresh_main_window_if_visible,
+    register_main_window_class, set_tray_host_hwnd, show_main_window, tray_host_hwnd,
+};
 use menu::*;
 use portability_actions::*;
 #[cfg(test)]
@@ -27,8 +32,7 @@ use precheck_dialog::{precheck_window_proc, show_precheck};
 #[cfg(test)]
 use precheck_layout::{precheck_layout, precheck_scale};
 use tray_window::{
-    add_icon, destroy_route_url, hide_route_url, remove_icon, show_hovered_route_url, show_status,
-    update_icon,
+    add_icon, destroy_route_url, hide_route_url, remove_icon, show_hovered_route_url, update_icon,
 };
 mod route_text;
 
@@ -97,7 +101,7 @@ use windows_sys::Win32::{
         Controls::{BST_CHECKED, BST_UNCHECKED, WM_MOUSELEAVE},
         Input::KeyboardAndMouse::{EnableWindow, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
         Shell::{
-            NIF_GUID, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+            NIF_GUID, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIN_SELECT, NIM_ADD, NIM_DELETE, NIM_MODIFY,
             NOTIFYICONDATAW, Shell_NotifyIconW,
         },
         WindowsAndMessaging::*,
@@ -106,6 +110,8 @@ use windows_sys::Win32::{
 use windows_sys::core::GUID;
 
 const WM_TRAY: u32 = WM_APP + 1;
+/// Keyboard activation of the tray icon (NIN_SELECT | 1). Not always exported by windows-sys.
+const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const SS_CENTERIMAGE_STYLE: u32 = 0x0000_0200;
 const SS_NOPREFIX_STYLE: u32 = 0x0000_0080;
 const SS_ETCHEDHORZ_STYLE: u32 = 0x0000_0010;
@@ -259,6 +265,7 @@ pub fn run(app: Arc<AppState>, auto_open_precheck: bool) -> anyhow::Result<()> {
         if RegisterClassW(&approval_class) == 0 {
             anyhow::bail!("无法注册确认悬浮窗");
         }
+        register_main_window_class(instance)?;
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),
@@ -276,11 +283,13 @@ pub fn run(app: Arc<AppState>, auto_open_precheck: bool) -> anyhow::Result<()> {
         if hwnd.is_null() {
             anyhow::bail!("无法创建托盘窗口");
         }
+        set_tray_host_hwnd(hwnd);
         approval::set_tray_hwnd(hwnd);
+        create_main_window(hwnd)?;
         add_icon(hwnd);
         SetTimer(hwnd, 1, 500, None);
         if auto_open_precheck {
-            show_precheck(hwnd);
+            show_precheck(dialog_owner(hwnd));
         }
         if std::env::args().any(|arg| arg == "--approval-demo") {
             let _ = approval::enqueue_demo();
@@ -294,8 +303,10 @@ pub fn run(app: Arc<AppState>, auto_open_precheck: bool) -> anyhow::Result<()> {
             DispatchMessageW(&message);
         }
         hide_approval_popup();
+        destroy_main_window();
         approval::clear_tray_hwnd(hwnd);
         remove_icon(hwnd);
+        set_tray_host_hwnd(ptr::null_mut());
     }
     Ok(())
 }
@@ -430,8 +441,13 @@ unsafe extern "system" fn window_proc(
             unsafe { show_menu(hwnd) };
             0
         }
-        WM_TRAY if lparam as u32 == WM_LBUTTONDBLCLK => {
-            unsafe { show_status(hwnd) };
+        WM_TRAY
+            if lparam as u32 == WM_LBUTTONUP
+                || lparam as u32 == WM_LBUTTONDBLCLK
+                || lparam as u32 == NIN_SELECT
+                || lparam as u32 == NIN_KEYSELECT =>
+        {
+            unsafe { show_main_window() };
             0
         }
         WM_POWERBROADCAST
@@ -472,6 +488,7 @@ unsafe extern "system" fn window_proc(
         WM_TIMER => {
             unsafe { update_icon(hwnd) };
             unsafe { refresh_approval_popup() };
+            unsafe { refresh_main_window_if_visible() };
             if let Some(app) = APP.get() {
                 if let Some((ok, message)) = app.take_sync_result() {
                     if ok {
@@ -533,7 +550,9 @@ unsafe extern "system" fn window_proc(
         WM_DESTROY => {
             unsafe { destroy_route_url() };
             unsafe { hide_approval_popup() };
+            unsafe { destroy_main_window() };
             approval::clear_tray_hwnd(hwnd);
+            set_tray_host_hwnd(ptr::null_mut());
             if let Some(app) = APP.get() {
                 app.stop.store(true, Ordering::Relaxed);
             }
@@ -544,6 +563,7 @@ unsafe extern "system" fn window_proc(
     }
 }
 
+#[allow(dead_code)]
 unsafe fn route_menu(
     snapshot: &Snapshot,
     protocol: Protocol,
