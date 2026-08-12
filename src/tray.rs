@@ -603,7 +603,7 @@ unsafe fn route_menu(
     menu
 }
 
-fn route_is_selected(route: &Route, active_provider: Option<&str>) -> bool {
+pub(super) fn route_is_selected(route: &Route, active_provider: Option<&str>) -> bool {
     active_provider == Some(route.provider.as_str())
 }
 
