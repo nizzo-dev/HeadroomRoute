@@ -47,7 +47,9 @@ python -m venv "$env:USERPROFILE\.headroom\venv"
 & "$env:USERPROFILE\.headroom\venv\Scripts\python.exe" -m pip install "headroom-ai[code]==0.34.0"
 ```
 
-如需使用其他虚拟环境，可从托盘选择 **维护与还原 → 选择 Headroom Python...**，验证通过后重新启动 HeadroomRoute。程序只检测该环境，不会安装或升级其中的任何内容。
+如需使用其他虚拟环境，可从主窗口 **设置** 页或历史托盘入口选择 Headroom Python，验证通过后重新启动 HeadroomRoute。程序只检测该环境，不会安装或升级其中的任何内容。
+
+主控制台（任务栏窗口）需要本机已安装 **Microsoft Edge WebView2 Runtime**（Evergreen；Windows 11 通常已具备）。仅托盘可在无 Runtime 时运行；打开主窗口若缺失会提示安装，不会捆绑 Fixed Version 运行时。
 
 ### 推荐：正式安装
 
@@ -76,7 +78,7 @@ python -m venv "$env:USERPROFILE\.headroom\venv"
 - 分别查看 Codex、Claude 的当前 Provider、健康状态和延迟。
 - 独立切换 OpenAI 与 Anthropic 上游。
 - 从 Codex、Claude Code 和 CC-Switch 自动发现可用 Provider。
-- 一键同步配置、立即检查上游或重启 Headroom。
+- 主窗口（WebView 控制台）一键同步配置、立即检查上游或重启 Headroom；托盘菜单保留打开主窗口 / 检查 / 退出。
 - Headroom 异常时可一键旁路压缩层；CLI 仍通过 HeadroomRoute 使用当前 Provider。
 - 默认不接管上游（观测模式），CLI 保持 CC-Switch 当前上游，启停 HeadroomRoute 不影响对话；需要时打开「接管上游」再由本工具改写客户端并切换 Provider，关闭或退出时交还 CC-Switch。
 - CC-Switch Provider 或 CLI 路由配置变化时主动提醒，不静默切换 Provider。
