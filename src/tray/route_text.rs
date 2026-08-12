@@ -43,6 +43,7 @@ pub(super) fn latency_text(value: Option<u64>) -> String {
     value.map(|v| v.to_string()).unwrap_or_else(|| "--".into())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn compact_number(value: u64) -> String {
     let (divisor, suffix) = if value >= 1_000_000_000 {
         (1_000_000_000, "B")

@@ -36,7 +36,9 @@ use tray_window::{
 };
 mod route_text;
 
-use self::route_text::{compact_number, hover_popup_size, latency_text, route_hover_text};
+#[cfg(test)]
+use self::route_text::compact_number;
+use self::route_text::{hover_popup_size, latency_text, route_hover_text};
 use crate::config::portability::{
     BackupDescriptor, TakeoverPlan, apply_takeover_plan, create_config_backup,
     create_diagnostic_bundle, decode_portable_config, export_portable_config,
