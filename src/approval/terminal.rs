@@ -10,6 +10,8 @@ pub(super) struct InputSink {
     pub(super) focused: AtomicBool,
     pub(super) turn_pending: AtomicBool,
     pub(super) turn_activity_seen: AtomicBool,
+    pub(super) turn_prompt_left: AtomicBool,
+    pub(super) turn_prompt_returned: AtomicBool,
     /// After submit, ignore a stale `• 已完成` until it leaves the region once
     /// (or non-prompt activity is seen). Prevents instant false completes.
     pub(super) turn_completion_armed: AtomicBool,
@@ -80,13 +82,19 @@ impl InputSink {
     }
 
     fn mark_turn_submitted(&self, bytes: &[u8]) {
-        let submitted = bytes.iter().any(|byte| *byte == b'\r' || *byte == b'\n');
-        let has_text = bytes.iter().any(|byte| *byte >= b' ');
+        let submitted = input_contains_submit(bytes);
+        let has_text = input_has_user_text(bytes);
         if has_text {
             self.turn_input_has_text.store(true, Ordering::Release);
         }
-        if submitted && (has_text || self.turn_input_has_text.swap(false, Ordering::AcqRel)) {
+        // Always consume the accumulated-text flag on submit.  Using
+        // `has_text || swap(false)` leaves the flag set when text and Enter
+        // arrive in the same read because `||` short-circuits.  The next bare
+        // Enter would then be mistaken for a newly submitted turn.
+        if submitted && self.turn_input_has_text.swap(false, Ordering::AcqRel) {
             self.turn_activity_seen.store(false, Ordering::Release);
+            self.turn_prompt_left.store(false, Ordering::Release);
+            self.turn_prompt_returned.store(false, Ordering::Release);
             self.turn_completion_armed.store(false, Ordering::Release);
             self.turn_pending.store(true, Ordering::Release);
         }
@@ -95,6 +103,7 @@ impl InputSink {
     fn take_completed_turn(&self) -> bool {
         if !self.turn_pending.load(Ordering::Acquire)
             || !self.turn_activity_seen.load(Ordering::Acquire)
+            || !self.turn_prompt_returned.load(Ordering::Acquire)
         {
             return false;
         }
@@ -105,6 +114,8 @@ impl InputSink {
     fn clear_turn(&self) {
         self.turn_pending.store(false, Ordering::Release);
         self.turn_activity_seen.store(false, Ordering::Release);
+        self.turn_prompt_left.store(false, Ordering::Release);
+        self.turn_prompt_returned.store(false, Ordering::Release);
         self.turn_completion_armed.store(false, Ordering::Release);
     }
 
@@ -125,6 +136,243 @@ impl InputSink {
 
     fn close(&self) {
         self.file.lock().unwrap().take();
+    }
+}
+
+/// Windows Terminal can encode Enter as a Win32 input record (`CSI ... _`)
+/// or CSI-u key event instead of a literal CR/LF after Codex enables mode 9001.
+fn input_contains_submit(bytes: &[u8]) -> bool {
+    if bytes.iter().any(|byte| *byte == b'\r' || *byte == b'\n') {
+        return true;
+    }
+    let mut index = 0;
+    while index + 2 < bytes.len() {
+        if bytes[index] != 0x1b || bytes[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let Some((parameters, terminator, next)) = csi_sequence(bytes, index) else {
+            break;
+        };
+        let enter = match terminator {
+            b'u' => csi_parameter(parameters, 0) == Some(13),
+            b'_' => {
+                csi_parameter(parameters, 0) == Some(13) && csi_parameter(parameters, 3) != Some(0)
+            }
+            _ => false,
+        };
+        if enter {
+            return true;
+        }
+        index = next;
+    }
+    false
+}
+
+fn csi_sequence(bytes: &[u8], start: usize) -> Option<(&[u8], u8, usize)> {
+    if bytes.get(start).copied() != Some(0x1b) || bytes.get(start + 1).copied() != Some(b'[') {
+        return None;
+    }
+    let parameters_start = start + 2;
+    let end = bytes[parameters_start..]
+        .iter()
+        .position(|byte| (0x40..=0x7e).contains(byte))?
+        + parameters_start;
+    Some((&bytes[parameters_start..end], bytes[end], end + 1))
+}
+
+fn csi_parameter(parameters: &[u8], index: usize) -> Option<u32> {
+    std::str::from_utf8(parameters)
+        .ok()?
+        .split(';')
+        .nth(index)?
+        .split(':')
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn csi_text_codepoint(parameters: &[u8], terminator: u8) -> Option<u32> {
+    match terminator {
+        // CSI-u stores the Unicode code point in the first parameter.
+        b'u' => csi_parameter(parameters, 0),
+        // Windows Terminal's Win32 input record stores UnicodeChar third.
+        b'_' => csi_parameter(parameters, 2),
+        _ => None,
+    }
+}
+
+fn is_user_text_codepoint(value: u32) -> bool {
+    let Some(character) = char::from_u32(value) else {
+        return false;
+    };
+    !character.is_control()
+        && !matches!(
+            value,
+            0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd
+        )
+}
+
+/// Returns whether an input chunk contains actual user text.
+///
+/// ConPTY/Windows Terminal keyboard protocols encode a single Enter key as an
+/// ANSI control sequence (for example `CSI 13;1u` or a Win32 input record
+/// ending in `_`). Those sequences contain ASCII punctuation and digits, so a
+/// raw `byte >= b' '` check incorrectly treats a bare Enter as typed text.
+/// Skip escape/control sequences and count only bytes outside them.
+fn input_has_user_text(bytes: &[u8]) -> bool {
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == 0x1b {
+            index += 1;
+            if index >= bytes.len() {
+                continue;
+            }
+            match bytes[index] {
+                b'[' => {
+                    let sequence_start = index - 1;
+                    let Some((parameters, terminator, next)) = csi_sequence(bytes, sequence_start)
+                    else {
+                        break;
+                    };
+                    if csi_text_codepoint(parameters, terminator)
+                        .is_some_and(is_user_text_codepoint)
+                    {
+                        return true;
+                    }
+                    index = next;
+                }
+                b']' => {
+                    // OSC: consume until BEL or the ST sequence (ESC \\).
+                    index += 1;
+                    while index < bytes.len() {
+                        if bytes[index] == 0x07 {
+                            index += 1;
+                            break;
+                        }
+                        if bytes[index] == 0x1b && bytes.get(index + 1).copied() == Some(b'\\') {
+                            index += 2;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                _ => {
+                    // Two-byte escape (arrows, focus, etc.).
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        index += 1;
+        if byte < 0x20 || byte == 0x7f {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::{
+        InputSink, advance_prompt_cycle, codex_response_added, input_contains_submit,
+        input_has_user_text,
+    };
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+
+    #[test]
+    fn detects_raw_enter() {
+        assert!(input_contains_submit(b"hello\r"));
+        assert!(input_contains_submit(b"hello\n"));
+    }
+
+    #[test]
+    fn detects_windows_terminal_enter_record() {
+        assert!(input_contains_submit(b"\x1b[13;28;13;1;0;1_"));
+        assert!(!input_contains_submit(b"\x1b[13;28;13;0;0;1_"));
+    }
+
+    #[test]
+    fn detects_csi_u_enter() {
+        assert!(input_contains_submit(b"\x1b[13;1u"));
+    }
+
+    #[test]
+    fn bare_enter_sequences_are_not_user_text() {
+        assert!(!input_has_user_text(b"\r"));
+        assert!(!input_has_user_text(b"\n"));
+        assert!(!input_has_user_text(b"\x1b[13;1u"));
+        assert!(!input_has_user_text(b"\x1b[13;28;13;1;0;1_"));
+        assert!(!input_has_user_text(b"\x1b[13;28;13;0;0;1_"));
+        assert!(!input_has_user_text(b"\x1b[I"));
+        assert!(!input_has_user_text(b"\x1b[200~\x1b[201~"));
+    }
+
+    #[test]
+    fn text_with_protocol_enter_is_user_text() {
+        assert!(input_has_user_text(b"hello\x1b[13;1u"));
+        assert!(input_has_user_text(b"hello\x1b[13;28;13;1;0;1_"));
+        assert!(input_has_user_text("你好\r".as_bytes()));
+    }
+
+    #[test]
+    fn recognizes_printable_keyboard_protocol_records() {
+        assert!(input_has_user_text(b"\x1b[97;1u"));
+        assert!(input_has_user_text(b"\x1b[65;30;65;1;0;1_"));
+        assert!(!input_has_user_text(b"\x1b[57361;1u"));
+        assert!(!input_has_user_text(b"\x1b[A"));
+    }
+
+    #[test]
+    fn text_and_enter_in_one_read_do_not_leak_into_next_enter() {
+        let sink = InputSink {
+            file: Mutex::new(None),
+            next_approval_token: AtomicU64::new(1),
+            active_approval_token: AtomicU64::new(0),
+            pid: 1,
+            source_window: 0,
+            focus_known: AtomicBool::new(false),
+            focused: AtomicBool::new(false),
+            turn_pending: AtomicBool::new(false),
+            turn_activity_seen: AtomicBool::new(false),
+            turn_prompt_left: AtomicBool::new(false),
+            turn_prompt_returned: AtomicBool::new(false),
+            turn_completion_armed: AtomicBool::new(false),
+            turn_input_has_text: AtomicBool::new(false),
+        };
+
+        sink.mark_turn_submitted(b"hello\r");
+        assert!(sink.turn_pending.load(Ordering::Acquire));
+        sink.clear_turn();
+        sink.mark_turn_submitted(b"\r");
+        assert!(!sink.turn_pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn ignores_prompt_redraw_with_only_stale_bullets() {
+        let before = "• previous answer\n› old prompt\n";
+        let after = "• previous answer\n› new prompt\n";
+        assert!(!codex_response_added(before, after));
+    }
+
+    #[test]
+    fn detects_new_codex_response_bullet() {
+        let before = "• previous answer\n› old prompt\n";
+        let after = "• previous answer\n• new answer\n› new prompt\n";
+        assert!(codex_response_added(before, after));
+    }
+
+    #[test]
+    fn prompt_must_leave_before_it_can_return() {
+        assert_eq!(advance_prompt_cycle(false, true), (false, false));
+        assert_eq!(advance_prompt_cycle(false, false), (true, false));
+        assert_eq!(advance_prompt_cycle(true, false), (true, false));
+        assert_eq!(advance_prompt_cycle(true, true), (true, true));
     }
 }
 
@@ -149,7 +397,17 @@ pub fn run_cli_command(args: &[String]) -> Result<i32> {
     }
     let source_window = foreground_root_window();
     let cwd = std::env::current_dir().context("无法读取当前工作目录")?;
-    let command_line = build_command_line(&cli, &args[1..]);
+    let mut forwarded_args = args[1..].to_vec();
+    let codex_notify_config = (cli == "codex")
+        .then(|| std::env::current_exe().ok())
+        .flatten()
+        .and_then(|executable| codex_notify_config(&executable, std::process::id()));
+    let codex_notify_hook = codex_notify_config.is_some();
+    if let Some(config) = codex_notify_config {
+        forwarded_args.insert(0, config);
+        forwarded_args.insert(0, "-c".into());
+    }
+    let command_line = build_command_line(&cli, &forwarded_args);
     let spawned = SpawnedConsole::spawn(&command_line, cwd.to_string_lossy().as_ref())?;
     let child_pid = spawned.pid;
     let input = Arc::new(InputSink {
@@ -162,6 +420,8 @@ pub fn run_cli_command(args: &[String]) -> Result<i32> {
         focused: AtomicBool::new(source_window != 0),
         turn_pending: AtomicBool::new(false),
         turn_activity_seen: AtomicBool::new(false),
+        turn_prompt_left: AtomicBool::new(false),
+        turn_prompt_returned: AtomicBool::new(false),
         turn_completion_armed: AtomicBool::new(false),
         turn_input_has_text: AtomicBool::new(false),
     });
@@ -177,6 +437,7 @@ pub fn run_cli_command(args: &[String]) -> Result<i32> {
                 reader_cli,
                 child_pid,
                 reader_cwd,
+                codex_notify_hook,
             )
         })
         .context("无法启动 CLI 输出线程")?;
@@ -216,7 +477,7 @@ pub fn run_cli_command(args: &[String]) -> Result<i32> {
         Ok(Err(error)) => Some(error),
         Err(_) => Some(anyhow::anyhow!("CLI 输出线程异常退出")),
     };
-    if input.take_completed_turn() {
+    if !codex_notify_hook && input.take_completed_turn() {
         notify_turn_result(&cli, child_pid, TurnResult::Completed);
     }
     if let Some(error) = output_error {
@@ -233,14 +494,20 @@ pub(super) fn read_cli_output(
     cli: String,
     pid: u32,
     cwd: String,
+    codex_notify_hook: bool,
 ) -> Result<()> {
     let mut buffer = [0u8; 4096];
     let mut terminal = TerminalScreen::new(parent_console_size());
+    let mut turn_screen_baseline: Option<String> = None;
     loop {
         terminal.resize_if_needed();
         let read = output.read(&mut buffer).context("读取 CLI 输出失败")?;
         if read == 0 {
             break;
+        }
+        let pending_before_output = input.turn_pending.load(Ordering::Acquire);
+        if pending_before_output && turn_screen_baseline.is_none() {
+            turn_screen_baseline = Some(terminal.contents());
         }
         write_cli_output(&buffer[..read])?;
         terminal.process(&buffer[..read]);
@@ -249,20 +516,32 @@ pub(super) fn read_cli_output(
         // completion detection must look at the cursor neighborhood—not only the
         // single cursor line—otherwise idle turns never fire turn_completed.
         let prompt_region = terminal.prompt_region_text();
+        let prompt_ready = cli_input_prompt_ready(&cli, &prompt_region);
+        let output_activity = cli == "codex"
+            && turn_screen_baseline
+                .as_deref()
+                .is_some_and(|baseline| codex_response_added(baseline, &screen));
+        if output_activity {
+            input.turn_activity_seen.store(true, Ordering::Release);
+        }
+        if pending_before_output {
+            let (prompt_left, prompt_returned) =
+                advance_prompt_cycle(input.turn_prompt_left.load(Ordering::Acquire), prompt_ready);
+            if prompt_left {
+                input.turn_prompt_left.store(true, Ordering::Release);
+            }
+            if prompt_returned {
+                input.turn_prompt_returned.store(true, Ordering::Release);
+            }
+        }
         // End-of-turn chrome ("Worked for", "tokens used") often sits a few rows
         // above the caret; scan the bottom of the screen as well as the region.
         let completion_scan = terminal.completion_scan_text();
-        if input.turn_pending.load(Ordering::Acquire) {
-            let prompt_ready = cli_input_prompt_ready(&cli, &prompt_region);
-            let completion_bullet =
-                cli == "codex" && completion_bullet_visible(&completion_scan);
+        if !codex_notify_hook && input.turn_pending.load(Ordering::Acquire) {
+            let completion_bullet = cli == "codex" && completion_bullet_visible(&completion_scan);
             // Arm bullet fallback only after the stale completion marker leaves
             // (or after non-prompt activity). Avoids firing on the previous turn's •.
-            if !completion_bullet
-                && !input
-                    .turn_completion_armed
-                    .swap(true, Ordering::AcqRel)
-            {
+            if !completion_bullet && !input.turn_completion_armed.swap(true, Ordering::AcqRel) {
                 approval_trace(&format!(
                     "turn completion armed ({cli}); region={}",
                     clamp_trace(&prompt_region)
@@ -271,13 +550,11 @@ pub(super) fn read_cli_output(
             if prompt_ready {
                 // Preferred: left prompt then returned. Codex often keeps › near
                 // the caret all turn, so also accept a freshly armed completion bullet.
-                let completed = input.take_completed_turn()
-                    || (completion_bullet
-                        && input.turn_completion_armed.load(Ordering::Acquire)
-                        && {
-                            input.clear_turn();
-                            true
-                        });
+                let completed = if cli == "codex" {
+                    completion_bullet && input.take_completed_turn()
+                } else {
+                    input.take_completed_turn()
+                };
                 if completed {
                     let result = classify_turn_result(&cli, &screen);
                     approval_trace(&format!(
@@ -293,6 +570,9 @@ pub(super) fn read_cli_output(
                     clamp_trace(&prompt_region)
                 ));
             }
+        }
+        if !input.turn_pending.load(Ordering::Acquire) {
+            turn_screen_baseline = None;
         }
         if let Some(prompt) = confirmation_prompt(&cli, &screen) {
             let dedupe_key = prompt.dedupe_key().to_owned();
@@ -346,10 +626,32 @@ pub(super) fn approval_trace(message: &str) {
 fn clamp_trace(value: &str) -> String {
     let flat: String = value
         .chars()
-        .map(|character| if character.is_control() { ' ' } else { character })
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
         .collect();
     let trimmed = flat.split_whitespace().collect::<Vec<_>>().join(" ");
     trimmed.chars().take(160).collect()
+}
+
+fn advance_prompt_cycle(prompt_left: bool, prompt_ready: bool) -> (bool, bool) {
+    (prompt_left || !prompt_ready, prompt_left && prompt_ready)
+}
+
+fn codex_response_added(before: &str, after: &str) -> bool {
+    let previous = before
+        .lines()
+        .map(str::trim)
+        .collect::<std::collections::HashSet<_>>();
+    after.lines().map(str::trim).any(|line| {
+        (line.starts_with('•') || line.starts_with('·') || line.starts_with('■'))
+            && !previous.contains(line)
+    }) || (after.contains("Worked for") && !before.contains("Worked for"))
+        || (after.contains("tokens used") && !before.contains("tokens used"))
 }
 
 pub(super) struct TerminalScreen {
@@ -379,15 +681,16 @@ impl TerminalScreen {
     /// Text around the caret used for input-prompt detection.
     ///
     /// Codex often parks the cursor on the model line directly under `›` /
-    /// `❯`, so a single cursor line misses the prompt glyph entirely.
+    /// `❯`, so include the preceding row. Do not include older rows: for a
+    /// short reply the submitted prompt can remain two rows above the caret and
+    /// would otherwise make the turn look idle for its entire lifetime.
     fn prompt_region_text(&self) -> String {
-        const RADIUS: usize = 2;
         let screen = self.parser.screen();
         let (row, _) = screen.cursor_position();
         let width = self.size.X.max(1) as u16;
         let row = row as usize;
-        let start = row.saturating_sub(RADIUS);
-        let end = row.saturating_add(RADIUS);
+        let start = row.saturating_sub(1);
+        let end = row;
         screen
             .rows(0, width)
             .enumerate()
@@ -416,6 +719,33 @@ impl TerminalScreen {
             self.size = size;
             self.last_prompt_key = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_region_includes_prompt_on_row_above_caret() {
+        let mut terminal = TerminalScreen::new(COORD { X: 80, Y: 8 });
+        terminal.process("› ready\r\n  gpt-5.6-sol medium".as_bytes());
+
+        assert!(cli_input_prompt_ready(
+            "codex",
+            &terminal.prompt_region_text()
+        ));
+    }
+
+    #[test]
+    fn prompt_region_excludes_submitted_prompt_two_rows_above_caret() {
+        let mut terminal = TerminalScreen::new(COORD { X: 80, Y: 8 });
+        terminal.process("› submitted\r\n• short reply\r\nworking".as_bytes());
+
+        assert!(!cli_input_prompt_ready(
+            "codex",
+            &terminal.prompt_region_text()
+        ));
     }
 }
 
@@ -652,6 +982,41 @@ pub(super) fn build_command_line(cli: &str, args: &[String]) -> String {
         command.push_str(&quote_cmd_arg(arg));
     }
     format!("cmd.exe /d /s /c \"{command}\"")
+}
+
+fn codex_notify_config(executable: &std::path::Path, pid: u32) -> Option<String> {
+    let executable = executable.to_str()?;
+    // Use TOML basic strings so an apostrophe in a Windows user/profile path
+    // is harmless.  Backslashes must be escaped for TOML, then Codex receives
+    // the original Windows path after parsing the `-c` value.
+    let executable = executable.replace('\\', "\\\\").replace('"', "\\\"");
+    Some(format!(
+        "notify=[\"{executable}\",\"--codex-notify\",\"{pid}\"]"
+    ))
+}
+
+#[cfg(test)]
+mod codex_notify_config_tests {
+    use super::codex_notify_config;
+    use std::path::Path;
+
+    #[test]
+    fn builds_a_process_local_codex_notify_command() {
+        assert_eq!(
+            codex_notify_config(Path::new(r"C:\Apps\HeadroomRouteCLI.exe"), 42),
+            Some(
+                "notify=[\"C:\\\\Apps\\\\HeadroomRouteCLI.exe\",\"--codex-notify\",\"42\"]".into()
+            )
+        );
+    }
+
+    #[test]
+    fn escapes_paths_that_contain_an_apostrophe() {
+        assert_eq!(
+            codex_notify_config(Path::new(r"C:\O'Brien\cli.exe"), 42),
+            Some("notify=[\"C:\\\\O'Brien\\\\cli.exe\",\"--codex-notify\",\"42\"]".into())
+        );
+    }
 }
 
 pub(super) fn quote_cmd_arg(value: &str) -> String {

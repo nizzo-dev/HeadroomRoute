@@ -13,8 +13,14 @@ mod notification;
 const TERMINAL_CLEANUP: &[u8] = b"\x1b[?9001l\x1b[?1004l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[0m\r\n";
 
 fn main() {
-    let _console = ConsoleSettings::configure();
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|arg| arg == "--codex-notify") {
+        if let Err(error) = approval::run_codex_notify(&args[1..]) {
+            eprintln!("HeadroomRoute CLI Codex 通知失败：{error:#}");
+        }
+        return;
+    }
+    let _console = ConsoleSettings::configure();
     if args.first().is_some_and(|arg| arg == "--version") {
         println!(
             "HeadroomRouteCLI {} notification-protocol={}",

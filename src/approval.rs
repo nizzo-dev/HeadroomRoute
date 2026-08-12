@@ -79,6 +79,11 @@ const MAX_PENDING_REQUESTS: usize = 32;
 const CHILD_SCREEN_WIDTH: i16 = 120;
 const CHILD_SCREEN_HEIGHT: i16 = 40;
 const GENERIC_READ_FLAG: u32 = 0x8000_0000;
+
+#[allow(dead_code)] // Used by the CLI binary; this module is also compiled into the tray binary.
+pub fn run_codex_notify(args: &[String]) -> Result<()> {
+    turn::run_codex_notify(args)
+}
 const GENERIC_WRITE_FLAG: u32 = 0x4000_0000;
 const PIPE_ACCESS_DUPLEX_FLAG: u32 = 0x0000_0003;
 // 给终端短暂的焦点切换时间，避免后台请求在瞬时失焦时立刻抢占；不再等待 3 秒。
@@ -926,6 +931,8 @@ mod tests {
             focused: AtomicBool::new(false),
             turn_pending: AtomicBool::new(false),
             turn_activity_seen: AtomicBool::new(false),
+            turn_prompt_left: AtomicBool::new(false),
+            turn_prompt_returned: AtomicBool::new(false),
             turn_completion_armed: AtomicBool::new(false),
             turn_input_has_text: AtomicBool::new(false),
         };

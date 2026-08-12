@@ -1,6 +1,10 @@
 use super::{WireRequest, connect_pipe};
 use anyhow::Result;
-use std::{io::Write, thread};
+use serde_json::Value;
+use std::{
+    io::{BufRead, BufReader, Write},
+    thread,
+};
 
 const RECENT_PROMPT_LINES: usize = 8;
 const MAX_ERROR_CHARS: usize = 300;
@@ -32,7 +36,10 @@ pub(super) fn cli_input_prompt_ready(cli: &str, contents: &str) -> bool {
 /// Current Codex (0.14x+) renders English status such as `Worked for 12s` /
 /// `N tokens used` rather than the older `• 已完成` bullet. Match both.
 pub(super) fn completion_bullet_visible(contents: &str) -> bool {
-    contents.lines().map(str::trim).any(line_looks_like_codex_completion)
+    contents
+        .lines()
+        .map(str::trim)
+        .any(line_looks_like_codex_completion)
 }
 
 fn line_looks_like_codex_completion(line: &str) -> bool {
@@ -79,14 +86,12 @@ pub(super) fn notify_turn_result(cli: &str, pid: u32, result: TurnResult) {
         .name("headroom-turn-notification".into())
         .spawn(move || {
             if let Err(error) = send_turn_result(&cli, pid, &result) {
-                eprintln!(
-                    "HeadroomRoute：无法发送回合通知（{cli} pid={pid}）：{error:#}"
-                );
+                eprintln!("HeadroomRoute：无法发送回合通知（{cli} pid={pid}）：{error:#}");
             }
         });
 }
 
-fn send_turn_result(cli: &str, pid: u32, result: &TurnResult) -> Result<()> {
+pub(super) fn send_turn_result(cli: &str, pid: u32, result: &TurnResult) -> Result<()> {
     let (kind, summary) = match result {
         TurnResult::Completed => ("turn_completed", String::new()),
         TurnResult::Failed(message) => ("turn_failed", message.clone()),
@@ -110,7 +115,62 @@ fn send_turn_result(cli: &str, pid: u32, result: &TurnResult) -> Result<()> {
     let mut stream = connect_pipe()?;
     stream.write_all(&body)?;
     stream.flush()?;
+    let mut response = String::new();
+    let mut reader = BufReader::new(stream);
+    if reader.read_line(&mut response)? == 0 {
+        anyhow::bail!("通知服务未返回确认");
+    }
+    let accepted = serde_json::from_str::<Value>(&response)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|reason| reason == kind);
+    if !accepted {
+        anyhow::bail!("通知服务拒绝请求：{}", response.trim());
+    }
     Ok(())
+}
+
+/// Handles Codex's legacy `notify` hook. Codex appends the JSON payload as
+/// the final argument to the configured command.
+#[allow(dead_code)] // Used through the CLI-only notify entry point.
+pub(super) fn run_codex_notify(args: &[String]) -> Result<()> {
+    let Some(pid) = args.first().and_then(|value| value.parse::<u32>().ok()) else {
+        return Ok(());
+    };
+    let Some(payload) = args.last() else {
+        return Ok(());
+    };
+    if is_codex_completion_payload(payload) {
+        send_turn_result("codex", pid, &TurnResult::Completed)?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn is_codex_completion_payload(payload: &str) -> bool {
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|kind| kind == "agent-turn-complete")
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::is_codex_completion_payload;
+
+    #[test]
+    fn accepts_only_agent_turn_complete_payloads() {
+        assert!(is_codex_completion_payload(
+            r#"{"type":"agent-turn-complete","thread-id":"t"}"#
+        ));
+        assert!(!is_codex_completion_payload(r#"{"type":"turn-started"}"#));
+        assert!(!is_codex_completion_payload("not json"));
+    }
 }
 
 fn clamp(value: &str, max_chars: usize) -> String {
@@ -147,16 +207,15 @@ mod tests {
     fn detects_codex_prompt_when_caret_sits_on_model_status_row() {
         // Mirrors TerminalScreen::prompt_region_text around a caret on the
         // model line: the › glyph is on the previous row, not the cursor line.
-        assert!(cli_input_prompt_ready(
-            "codex",
-            "›\n  gpt-5.6-luna low"
-        ));
+        assert!(cli_input_prompt_ready("codex", "›\n  gpt-5.6-luna low"));
         assert!(!cli_input_prompt_ready("codex", "  gpt-5.6-luna low"));
     }
 
     #[test]
     fn detects_codex_completion_bullet_but_not_intermediate_steps() {
-        assert!(completion_bullet_visible("• 已完成\n\n›\n  gpt-5.6-luna low"));
+        assert!(completion_bullet_visible(
+            "• 已完成\n\n›\n  gpt-5.6-luna low"
+        ));
         assert!(completion_bullet_visible("• Done\n›"));
         assert!(completion_bullet_visible(
             "hello\nWorked for 3s\n›\n  gpt-5.6 low"

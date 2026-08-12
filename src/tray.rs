@@ -317,6 +317,18 @@ pub fn run_approval_host() -> anyhow::Result<()> {
     approval::start_server();
     let result = unsafe {
         let instance = GetModuleHandleW(ptr::null());
+        let approval_class_name = wide("HeadroomRouteApprovalWindow");
+        let approval_class = WNDCLASSW {
+            lpfnWndProc: Some(approval_window_proc),
+            hInstance: instance,
+            lpszClassName: approval_class_name.as_ptr(),
+            hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
+            hbrBackground: (COLOR_WINDOW + 1) as _,
+            ..std::mem::zeroed()
+        };
+        if RegisterClassW(&approval_class) == 0 {
+            anyhow::bail!("无法注册确认悬浮窗");
+        }
         let class_name = wide("HeadroomRouteApprovalHostWindow");
         let class = WNDCLASSW {
             lpfnWndProc: Some(approval_host_window_proc),
