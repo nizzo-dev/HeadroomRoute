@@ -141,14 +141,7 @@ pub(super) fn write_reason(stream: &mut File, approved: bool, reason: &str) -> i
 
 pub(super) fn confirmation_prompt(cli: &str, text: &str) -> Option<ConfirmationPrompt> {
     let cleaned = strip_ansi(text);
-    let mut normalized = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    let char_count = normalized.chars().count();
-    if char_count > 1400 {
-        normalized = normalized
-            .chars()
-            .skip(char_count - 1400)
-            .collect::<String>();
-    }
+    let normalized = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     let lower = normalized.to_ascii_lowercase();
     let onboarding_prompt = [
         "accessing workspace",
@@ -182,24 +175,28 @@ pub(super) fn confirmation_prompt(cli: &str, text: &str) -> Option<ConfirmationP
             "allow once",
             "allow always",
             "yes, allow",
+            // Claude Code 2.x network and extension-install permissions.
+            "do you want to allow this connection",
+            "would you like to install it",
+            "permission to run",
         ]
         .iter()
         .any(|marker| lower.contains(marker)),
         _ => false,
     };
-    let has_choice = [
-        "deny",
-        "reject",
-        "cancel",
-        "allow once",
-        "yes",
-        "y/n",
-        "yes/no",
-    ]
-    .iter()
-    .any(|word| lower.contains(word))
-        && contains_word(&lower, "no");
-    if !(permission_marker && (lower.contains('?') || lower.contains("y/n")) && has_choice) {
+    // A dialog without a trailing question mark (for example
+    // `WebSearchTool requires permission.` plus options) must still count as a
+    // permission prompt when the option list is visible.
+    let question_evidence = lower.contains('?')
+        || lower.contains("y/n")
+        || lower.contains("yes/no")
+        || has_numbered_options(&lower);
+    let choice_evidence = ["deny", "reject", "cancel", "y/n", "yes/no"]
+        .iter()
+        .any(|word| lower.contains(word))
+        || contains_word(&lower, "yes")
+        || contains_word(&lower, "no");
+    if !(permission_marker && question_evidence && choice_evidence) {
         return None;
     }
     let summary = prompt_summary(&cleaned);
@@ -213,6 +210,12 @@ pub(super) fn confirmation_prompt(cli: &str, text: &str) -> Option<ConfirmationP
         feedback_answer,
         deny_answer,
     })
+}
+
+fn has_numbered_options(lower: &str) -> bool {
+    ["1.", "2.", "3.", "(1)", "(2)", "(3)"]
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 pub(super) fn prompt_summary(text: &str) -> String {
@@ -283,19 +286,22 @@ pub(super) fn confirmation_answers(
     &'static str,
 ) {
     let lower = summary.to_ascii_lowercase();
-    if lower.contains("1.") && (lower.contains("yes") || lower.contains("allow")) {
-        let allow_rule = (lower.contains("2.")
+    let numbered = has_numbered_options(&lower);
+    if numbered && (lower.contains("yes") || lower.contains("allow")) {
+        let has_second = ["2.", "(2)"].iter().any(|marker| lower.contains(marker));
+        let has_third = ["3.", "(3)"].iter().any(|marker| lower.contains(marker));
+        let allow_rule = (has_second
             && ["always", "don't ask", "do not ask", "again"]
                 .iter()
                 .any(|word| lower.contains(word)))
         .then_some("2\n");
-        let feedback = (lower.contains("3.")
+        let feedback = (has_third
             && lower.contains("tell")
             && ["different", "instead", "feedback"]
                 .iter()
                 .any(|word| lower.contains(word)))
         .then_some("3\n");
-        let deny = if lower.contains("3.") { "3\n" } else { "2\n" };
+        let deny = if has_third { "3\n" } else { "2\n" };
         ("1\n", allow_rule, feedback, deny)
     } else {
         ("y\n", None, None, "n\n")

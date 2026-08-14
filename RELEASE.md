@@ -23,14 +23,15 @@ $env:HEADROOM_ROUTE_TIMESTAMP_SERVER = 'https://<trusted timestamp service>'
 
 证书位于本机 `Cert:\CurrentUser\My`。如由受控构建机使用计算机级证书，可增加 `-CertificateStoreLocation LocalMachine`。证书必须包含私钥、处于有效期内，并具有 Code Signing EKU。时间戳服务地址由发布环境提供，仓库不绑定证书颁发机构或外部服务。
 
-构建完成后复核两个版本化二进制：
+构建完成后复核版本化二进制（托盘主程序、桌面主程序、CLI）：
 
 ```powershell
 Get-AuthenticodeSignature .\dist\HeadroomRoute-<version>.exe
+Get-AuthenticodeSignature .\dist\HeadroomRoute-<version>-desktop.exe
 Get-AuthenticodeSignature .\dist\HeadroomRouteCLI-<version>.exe
 ```
 
-两项状态都必须为 `Valid`，签名者指纹必须与发布证书一致。SHA-256 清单在签名完成后生成，因此校验值对应最终签名产物。
+三项状态都必须为 `Valid`，签名者指纹必须与发布证书一致。SHA-256 清单在签名完成后生成，因此校验值对应最终签名产物。同一清单包含两个 ZIP：`HeadroomRoute-<version>-windows-x64.zip`（托盘）与 `HeadroomRoute-<version>-desktop-windows-x64.zip`（桌面）。应用内更新按编译进二进制的版本选择对应 ZIP，不会把托盘用户升级到桌面包。
 
 ## 安装签名策略
 

@@ -17,7 +17,14 @@
 
 ---
 
-HeadroomRoute 是一个轻量、原生的 Windows 托盘路由器，面向同时使用 **Codex CLI、Claude Code、Headroom 或 CC-Switch** 的用户。核心、托盘和本地代理运行在同一个 Rust 进程中；没有 Electron，也不会捆绑或自动安装 Python 与 Headroom。
+HeadroomRoute 是一个轻量、原生的 Windows 托盘路由器，面向同时使用 **Codex CLI、Claude Code、Headroom 或 CC-Switch** 的用户。核心、托盘和本地代理运行在同一个 Rust 进程中；没有 Electron，也不会捆绑或自动安装 Python 与 Headroom。同一套代码发布两个安装包：
+
+| 安装包 | 适用 |
+| --- | --- |
+| `HeadroomRoute-<version>-windows-x64.zip` | **托盘版**：启动后只出现通知区图标；主窗口为原生 Win32 页，需要时再打开 |
+| `HeadroomRoute-<version>-desktop-windows-x64.zip` | **桌面版**：启动即打开 WebView2 主控制台；关窗后仍驻留托盘并保持代理 |
+
+两版共用安装目录 `%LOCALAPPDATA%\HeadroomRoute`、同一套配置和单实例锁，不能同时运行。应用内更新只会下载你当前安装的那一版。覆盖安装另一版会替换主程序，配置保留。
 
 ## 为什么使用 HeadroomRoute
 
@@ -49,7 +56,7 @@ python -m venv "$env:USERPROFILE\.headroom\venv"
 
 如需使用其他虚拟环境，可从主窗口 **设置** 页或历史托盘入口选择 Headroom Python，验证通过后重新启动 HeadroomRoute。程序只检测该环境，不会安装或升级其中的任何内容。
 
-主控制台（任务栏窗口）需要本机已安装 **Microsoft Edge WebView2 Runtime**（Evergreen；Windows 11 通常已具备）。仅托盘可在无 Runtime 时运行；打开主窗口若缺失会提示安装，不会捆绑 Fixed Version 运行时。
+主控制台需要本机已安装 **Microsoft Edge WebView2 Runtime**（Evergreen；Windows 11 通常已具备）时，请使用桌面版 ZIP。托盘版不依赖 WebView2。桌面版在 Runtime 缺失时仍可驻留托盘；打开主窗口会提示安装，不会捆绑 Fixed Version 运行时。
 
 ### 推荐：正式安装
 

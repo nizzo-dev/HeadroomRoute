@@ -56,12 +56,18 @@ When the repository's RTK wrapper is available, prefix shell commands with
 `rtk` (for example, `rtk cargo test` and `rtk git status`). For debugging or
 commands without an RTK filter, `rtk proxy <command>` is acceptable.
 
-- `cargo check` performs a fast compile check.
-- `cargo test` runs all Rust unit tests.
+- `cargo check` / `cargo check --features desktop` compile the tray and desktop editions.
+- `cargo test` / `cargo test --features desktop` run unit tests for both editions.
 - `cargo fmt -- --check` verifies standard formatting.
-- `cargo clippy --all-targets -- -D warnings` treats warnings as errors.
+- `./Test-SourceLineLimit.ps1` freezes files listed in `SourceLineCeilings.txt`
+  at their current size (they must not grow). Unfrozen files warn at 500 and
+  fail above 600. After a split, lower or delete that file's ceiling row.
+- `cargo clippy --all-targets -- -D warnings` and the same with `--features desktop`
+  treat warnings as errors.
 - `./Build.ps1` (or `PowerShell -File .\Build.ps1`) runs checks, tests,
-  isolated install tests, and creates versioned release artifacts under `dist\`.
+  isolated install tests, and creates both edition ZIPs under `dist\`.
+  Tray: `HeadroomRoute-<version>-windows-x64.zip`. Desktop:
+  `HeadroomRoute-<version>-desktop-windows-x64.zip`.
 - `./Test-Install.ps1 -Release` exercises install, upgrade, rollback, and
   signature-policy paths in temporary directories.
 - `./Test-CliPopup.ps1` and `./Test-ApprovalVisual.ps1` exercise interactive
@@ -83,11 +89,12 @@ helpers and propagate recoverable failures with `anyhow::Result` plus context.
 Isolate `unsafe` Windows API calls and document non-obvious lifetime or
 ownership assumptions.
 
-Keep each hand-written source file at or below 500 lines after formatting.
-Begin a module split at 400 lines; do not increase an existing legacy exception
-above 500 lines without documenting the reason and follow-up plan. Generated
-files, lockfiles, build artifacts, and CodeGraph data are excluded from this
-limit.
+Keep each hand-written source file around 500 physical lines after formatting.
+`Build.ps1` runs `Test-SourceLineLimit.ps1`. Files in `SourceLineCeilings.txt`
+are accepted at their current size and must not grow; after a split, lower or
+delete that row. Unfrozen files warn at 500 and fail above 600. Do not raise a
+ceiling. Generated files, lockfiles, build artifacts, and CodeGraph data are
+excluded.
 
 Never commit API keys, tokens, certificates/private keys, `%LOCALAPPDATA%`
 state, CC-Switch databases, logs, diagnostic exports, or generated binaries.

@@ -8,7 +8,8 @@
   <title>Headroom Route</title>
   <style>
 /* ===== Headroom Route console ===== */
-:root {
+:root, html[data-theme="dark"] {
+  color-scheme: dark;
   --bg: #12141a;
   --bg-elevated: #1a1d27;
   --bg-card: #222633;
@@ -20,6 +21,42 @@
   --good: #3ecf8e;
   --warn: #f0b429;
   --bad: #f07178;
+  --top-grad: #171a22;
+  --hover-bg: #1c2030;
+  --btn-bg: #2a3144;
+  --btn-hover-bg: #343c52;
+  --strong-border: #3d4660;
+  --route-bg: #1b1f2c;
+  --route-selected-bg: #1e2740;
+  --pill-good-border: #2a5a44;
+  --pill-warn-border: #5a4a20;
+  --pill-bad-border: #5a3038;
+}
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f2f4f8;
+  --bg-elevated: #ffffff;
+  --bg-card: #ffffff;
+  --border: #d9dee8;
+  --text: #1d2533;
+  --text-dim: #5d6a80;
+  --accent: #3963e8;
+  --accent-hover: #2f52c8;
+  --good: #12835c;
+  --warn: #a97b0e;
+  --bad: #c93a43;
+  --top-grad: #e7eaf2;
+  --hover-bg: #eef1f7;
+  --btn-bg: #ffffff;
+  --btn-hover-bg: #eef1f7;
+  --strong-border: #c2cbd9;
+  --route-bg: #f6f8fc;
+  --route-selected-bg: #e7eeff;
+  --pill-good-border: #bfe3d3;
+  --pill-warn-border: #ecd9a8;
+  --pill-bad-border: #ecc7cc;
+}
+:root {
   --radius: 10px;
   --font: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
 }
@@ -38,10 +75,11 @@ body { display: flex; flex-direction: column; min-height: 100%; }
   justify-content: space-between;
   padding: 14px 18px 8px;
   border-bottom: 1px solid var(--border);
-  background: linear-gradient(180deg, #171a22, var(--bg));
+  background: linear-gradient(180deg, var(--top-grad), var(--bg));
 }
 .brand { font-weight: 600; letter-spacing: 0.02em; display: inline-flex; align-items: center; gap: 8px; }
 .brand-logo { display: block; border-radius: 4px; }
+.top-right { display: inline-flex; align-items: center; gap: 8px; }
 .pill {
   font-size: 12px;
   padding: 4px 10px;
@@ -50,9 +88,21 @@ body { display: flex; flex-direction: column; min-height: 100%; }
   border: 1px solid var(--border);
   color: var(--text-dim);
 }
-.pill.good { color: var(--good); border-color: #2a5a44; }
-.pill.warn { color: var(--warn); border-color: #5a4a20; }
-.pill.bad { color: var(--bad); border-color: #5a3038; }
+.theme-pick {
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  cursor: pointer;
+  outline: none;
+}
+.theme-pick:hover { border-color: var(--strong-border); color: var(--text); }
+.theme-pick option { background: var(--bg-card); color: var(--text); }
+.pill.good { color: var(--good); border-color: var(--pill-good-border); }
+.pill.warn { color: var(--warn); border-color: var(--pill-warn-border); }
+.pill.bad { color: var(--bad); border-color: var(--pill-bad-border); }
 .tabs {
   display: flex;
   gap: 4px;
@@ -69,7 +119,7 @@ body { display: flex; flex-direction: column; min-height: 100%; }
   cursor: pointer;
   font: inherit;
 }
-.tabs button:hover { color: var(--text); background: #1c2030; }
+.tabs button:hover { color: var(--text); background: var(--hover-bg); }
 .tabs button.active {
   color: var(--text);
   background: var(--bg-elevated);
@@ -114,14 +164,14 @@ main { flex: 1; overflow: auto; padding: 16px 18px 24px; background: var(--bg-el
 button.btn, label.check {
   appearance: none;
   border: 1px solid var(--border);
-  background: #2a3144;
+  background: var(--btn-bg);
   color: var(--text);
   border-radius: 8px;
   padding: 8px 12px;
   font: inherit;
   cursor: pointer;
 }
-button.btn:hover { background: #343c52; border-color: #3d4660; }
+button.btn:hover { background: var(--btn-hover-bg); border-color: var(--strong-border); }
 button.btn.primary {
   background: var(--accent);
   border-color: transparent;
@@ -149,11 +199,11 @@ label.check input { accent-color: var(--accent); }
   padding: 10px 12px;
   border-radius: 8px;
   border: 1px solid var(--border);
-  background: #1b1f2c;
+  background: var(--route-bg);
   cursor: pointer;
 }
-.route:hover { border-color: #3d4660; }
-.route.selected { border-color: var(--accent); background: #1e2740; }
+.route:hover { border-color: var(--strong-border); }
+.route.selected { border-color: var(--accent); background: var(--route-selected-bg); }
 .route .mark { width: 10px; height: 10px; border-radius: 50%; background: var(--text-dim); }
 .route.selected .mark { background: var(--accent); }
 .route .meta { font-size: 12px; color: var(--text-dim); }
@@ -166,72 +216,268 @@ label.check input { accent-color: var(--accent); }
 @media (max-width: 640px) {
   .grid-2, .settings-grid { grid-template-columns: 1fr; }
 }
+
+/* CC Switch-inspired desktop workbench */
+:root, html[data-theme="dark"] {
+  --bg: #18191d;
+  --bg-elevated: #18191d;
+  --bg-card: #24262b;
+  --border: #373a41;
+  --text: #f2f3f5;
+  --text-dim: #989ba5;
+  --accent: #1683ff;
+  --accent-hover: #3293ff;
+  --good: #43c59e;
+  --route-bg: #24262b;
+  --route-selected-bg: #252b34;
+  --radius: 8px;
+}
+html[data-theme="light"] {
+  --bg: #f2f4f7;
+  --bg-elevated: #f2f4f7;
+  --bg-card: #ffffff;
+  --border: #d7dce4;
+  --text: #20242b;
+  --text-dim: #697180;
+  --accent: #0b73e0;
+  --accent-hover: #075fbd;
+  --good: #158562;
+  --route-bg: #ffffff;
+  --route-selected-bg: #f0f7ff;
+  --top-surface: #ffffff;
+  --switcher-bg: #e9edf3;
+  --switcher-active: #ffffff;
+  --switcher-text: #657083;
+  --avatar-bg: #edf4fc;
+  --avatar-border: #cfdaea;
+  --avatar-text: #31597f;
+  --hover-border: #aeb8c7;
+}
+html, body { min-width: 720px; }
+body { overflow: hidden; }
+.top {
+  min-height: 84px;
+  padding: 0 30px;
+  gap: 24px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+.brand { min-width: 260px; color: var(--accent); font-size: 22px; font-weight: 650; }
+.brand-logo { width: 26px; height: 26px; border-radius: 6px; }
+.top-right { display: flex; align-items: center; margin-left: auto; }
+.theme-pick { height: 42px; border-radius: 7px; padding: 0 14px; background: var(--bg-card); }
+.pill { display: inline-flex; align-items: center; min-height: 42px; padding: 0 14px; border-radius: 7px; background: var(--bg-card); }
+.direct-toggle { min-width: 112px; gap: 8px; justify-content: center; font-weight: 600; }
+.direct-toggle::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--good); box-shadow: 0 0 0 3px rgba(67,197,158,.12); }
+.direct-toggle.direct { border-color: var(--pill-good-border); color: var(--good); }
+.direct-toggle.direct::before { background: var(--good); }
+.direct-toggle.headroom::before { background: var(--accent); box-shadow: 0 0 0 3px rgba(22,131,255,.12); }
+.tabs {
+  position: absolute;
+  top: 20px;
+  left: 50%;
+  z-index: 2;
+  transform: translateX(-50%);
+  width: max-content;
+  padding: 4px;
+  gap: 3px;
+  border: 0;
+  border-radius: 14px;
+  background: #292a30;
+}
+.tabs button {
+  width: auto;
+  min-width: 66px;
+  height: 42px;
+  padding: 0;
+  border-radius: 10px;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+}
+.tabs button:hover { border-radius: 10px; }
+.tabs button.active {
+  margin: 0;
+  border: 0;
+  border-radius: 10px;
+  background: #202126;
+  box-shadow: 0 1px 3px rgba(0,0,0,.35);
+}
+main { padding: 26px 36px 32px; overflow: auto; background: var(--bg); }
+.panel-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 20px; }
+.panel-title { margin: 0 0 5px; font-size: 22px; font-weight: 650; }
+.panel-subtitle, .hint { margin: 0; color: var(--text-dim); font-size: 12px; }
+.toolbar { display: flex; align-items: center; gap: 10px; }
+.card {
+  padding: 0;
+  margin-bottom: 14px;
+  overflow: hidden;
+  border-radius: 8px;
+  background: var(--bg-card);
+}
+.card h2 { margin: 0; padding: 17px 20px 8px; color: var(--text); font-size: 13px; }
+.status-list { display: grid; grid-template-columns: repeat(3, 1fr); }
+.status-item { min-width: 0; padding: 18px 20px 20px; border-right: 1px solid var(--border); }
+.status-item:last-child { border-right: 0; }
+.status-item .k { display: block; margin-bottom: 8px; color: var(--text-dim); font-size: 11px; }
+.status-item .v { display: block; font-size: 15px; font-weight: 600; word-break: break-word; }
+.status-item .detail { display: block; margin-top: 5px; color: var(--text-dim); font-size: 11px; font-weight: 400; }
+.route-list { gap: 14px; }
+.route {
+  min-height: 88px;
+  grid-template-columns: 24px 44px minmax(180px, 1fr) auto;
+  gap: 14px;
+  padding: 13px 20px;
+  border-radius: 8px;
+  background: var(--route-bg);
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.route:hover { border-color: #535760; }
+.route.selected { border-color: var(--accent); background: var(--route-selected-bg); }
+.route .drag { color: #686c76; font-size: 18px; letter-spacing: 1px; }
+.route .avatar { display: grid; place-items: center; width: 42px; height: 42px; border: 1px solid var(--border); border-radius: 7px; color: #b6bac4; background: #292b30; font-size: 12px; font-weight: 650; }
+.route .name { font-size: 15px; font-weight: 650; }
+.route .meta { margin-top: 5px; color: var(--accent); font-size: 12px; }
+.route .route-actions { display: flex; align-items: center; gap: 8px; }
+.route .latency { min-width: 64px; color: var(--text-dim); font-size: 11px; text-align: right; }
+button.btn, label.check { border-radius: 7px; }
+button.btn { min-height: 38px; }
+button.btn.primary { box-shadow: 0 6px 18px rgba(22,131,255,.18); }
+.route .select-route { display: none; }
+.route.selected .select-route, .route:hover .select-route { display: inline-flex; }
+label.check { min-height: 42px; padding: 0 13px; }
+.ops-grid, .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.action-row { display: flex; align-items: center; justify-content: space-between; min-height: 72px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-card); }
+.action-copy strong { display: block; font-size: 13px; }
+.action-copy span { display: block; margin-top: 4px; color: var(--text-dim); font-size: 11px; }
+.settings-grid .btn { min-height: 52px; text-align: left; }
+html[data-theme="light"] .top {
+  background: var(--top-surface);
+  box-shadow: 0 1px 0 rgba(31, 45, 61, .04);
+}
+html[data-theme="light"] .tabs {
+  background: var(--switcher-bg);
+  box-shadow: inset 0 0 0 1px rgba(55, 72, 92, .04);
+}
+html[data-theme="light"] .tabs button { color: var(--switcher-text); }
+html[data-theme="light"] .tabs button:hover { background: rgba(255, 255, 255, .55); color: var(--text); }
+html[data-theme="light"] .tabs button.active {
+  background: var(--switcher-active);
+  color: var(--text);
+  box-shadow: 0 1px 4px rgba(35, 48, 67, .14);
+}
+html[data-theme="light"] .theme-pick,
+html[data-theme="light"] .pill,
+html[data-theme="light"] button.btn,
+html[data-theme="light"] label.check { background: #fff; }
+html[data-theme="light"] button.btn.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+html[data-theme="light"] button.btn.primary:hover {
+  border-color: var(--accent-hover);
+  background: var(--accent-hover);
+}
+html[data-theme="light"] .route {
+  box-shadow: 0 1px 2px rgba(28, 39, 54, .025);
+}
+html[data-theme="light"] .route:hover { border-color: var(--hover-border); }
+html[data-theme="light"] .route.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(11, 115, 224, .05), 0 4px 14px rgba(11, 115, 224, .07);
+}
+html[data-theme="light"] .route .avatar {
+  border-color: var(--avatar-border);
+  color: var(--avatar-text);
+  background: var(--avatar-bg);
+}
+html[data-theme="light"] .route .drag { color: #9aa3b1; }
+html[data-theme="light"] .card,
+html[data-theme="light"] .action-row { box-shadow: 0 1px 3px rgba(31, 45, 61, .035); }
+html[data-theme="light"] ::-webkit-scrollbar { width: 11px; height: 11px; }
+html[data-theme="light"] ::-webkit-scrollbar-track { background: #edf0f4; }
+html[data-theme="light"] ::-webkit-scrollbar-thumb { background: #bcc3ce; border: 3px solid #edf0f4; border-radius: 8px; }
+html[data-theme="light"] ::-webkit-scrollbar-thumb:hover { background: #9fa8b5; }
+@media (max-width: 900px) {
+  .brand { min-width: auto; font-size: 0; }
+  .tabs button { min-width: 54px; }
+  .status-list, .ops-grid, .settings-grid { grid-template-columns: 1fr; }
+  .status-item { border-right: 0; border-bottom: 1px solid var(--border); }
+  .route { grid-template-columns: 20px 42px minmax(150px, 1fr); }
+  .route-actions { grid-column: 2 / -1; justify-content: flex-end; }
+}
   </style>
 </head>
 <body>
   <header class="top">
-    <div class="brand"><img class="brand-logo" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAEQElEQVR42s1XPY8bVRQ95707znqdD1ZE0a4lKClQQOnpEYr4AVDyF5CQiIQoqeA3IAFdilQUUFKQjiqKUESKJFp7EcuiTbIknvdxKPzGGXvHXpsPiSc9zdi6c+e+e8+59wyxsCQRHYuksMH6t/z854sdkbslkecNT7/d9n94eMgYY97b2ztp21rzAEk9fPiwH2P8zsx2Y4ypOGCxuU7yviS3LJjGz/Hx8UuDweBH59xOzjlBwOXLl32McSTpLZLPGtu5eknqhzr8pu51dVWGFvy8HEJ4sugghPCrpO22rXUU5U8AOcaYIDmQAMCc86bgmQAYhBAySZmZB1AvGnWdxjVb5UrSAb213/wYj8Fp5CTZlLHcrg6AEDrp01v//biIi626oPt+WQbIDjOt5nYHDiRIizzT1JFWBqDT1BQdMZlMUkHtqiAcST19+tQI9tbBzVwABwcHsxIUmgCCnHOqquoLSedIpi4mFPskaavf73/tvLuQU8oLAXPxAHOOdnd3BSIAiCQDhAgixxBr59z1lNLNpg+0y1HuKelCSumW9/7tGGMC6Tbq25K2QwgnWrFijLePjo4uSfKt5wwA6rr+pPD9eQght3aUpBjio/39/dN9oDUgAsVPAVyKMc7q55wTcoamJ9/e2dlJrVLM7Lz35wFkCK4LKYI4HA5xqhW3Vnw2efbN+eq8N7N5ALlZNhOAVyTdJ1m3S5FzlnPOgUjrUnZuFgDob21t/QRgmGLMnTWUkvfmU07fS3q3BORmmZpmRB0dQF2dwHVMxx0A8GbOe49T28xnZRSgfVUGE0sGGh/mvXdm5mzqx8r/vc4MtDAwAfA+gK2UUsN5tWwHALykjyG8ambvpZTGJD+U5HPOofioc8pOUCaYBUUzI8GDxSywQwtcA7DVGIYQUFWVA/AHybvF7lpO+QdBfe+9pZQ+MrPPGyYByO29Sku0m44KDQ+qqrqwaJhS+tl7/wYAT3ISQnjHOfetpAzBQNyU9ARABMTS1Ilpa6eZ+RjjkZndaMDbpQe2QwgPJMVQhzqEEEIdJlP6x9uNraQKAGKMH5TekLXGKhrhDD0AeAC+FKfhs5fkW/IsSDKSX9Z1vVdV1Y2UUi3Bc1q6cwBMsykGWWWO5O9n64E1ZQfJKMn1er3PTk5OXvPeXw2hfvP55Pnrgm5589UMvIQHYOUQWtqIRqMRrly5ogYcas2+LjHRzASS4/b/IYQn3T3/jGE0HA4xm4YlCoJnZUIFF5RUldr6eaTzhdw5Sw/8LW1PqiB6dl1S19UZGI1GWOSwlDW9bqJJ3Yv2O+Xp0lZsiyWIIfYBODNzLVaA5AaqMFeAo3Ou56ZDzC3zMRfAIzzSkMNfAJy0PkyymRmABxuk4BDAOOccim6Qc85LGp/JswKkXrlWd+7c6TW/1337vXv3zkkaSNpu9ng8HjRi5H//ccpVaP8nn+ZdPv4CLlNGIJXQjKIAAAAASUVORK5CYII=" alt="" width="20" height="20" /> Headroom Route</div>
-    <div id="mode-pill" class="pill">—</div>
+    <div class="brand"><img id="brand-logo" class="brand-logo" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAEQElEQVR42s1XPY8bVRQ95707znqdD1ZE0a4lKClQQOnpEYr4AVDyF5CQiIQoqeA3IAFdilQUUFKQjiqKUESKJFp7EcuiTbIknvdxKPzGGXvHXpsPiSc9zdi6c+e+e8+59wyxsCQRHYuksMH6t/z854sdkbslkecNT7/d9n94eMgYY97b2ztp21rzAEk9fPiwH2P8zsx2Y4ypOGCxuU7yviS3LJjGz/Hx8UuDweBH59xOzjlBwOXLl32McSTpLZLPGtu5eknqhzr8pu51dVWGFvy8HEJ4sugghPCrpO22rXUU5U8AOcaYIDmQAMCc86bgmQAYhBAySZmZB1AvGnWdxjVb5UrSAb213/wYj8Fp5CTZlLHcrg6AEDrp01v//biIi626oPt+WQbIDjOt5nYHDiRIizzT1JFWBqDT1BQdMZlMUkHtqiAcST19+tQI9tbBzVwABwcHsxIUmgCCnHOqquoLSedIpi4mFPskaavf73/tvLuQU8oLAXPxAHOOdnd3BSIAiCQDhAgixxBr59z1lNLNpg+0y1HuKelCSumW9/7tGGMC6Tbq25K2QwgnWrFijLePjo4uSfKt5wwA6rr+pPD9eQght3aUpBjio/39/dN9oDUgAsVPAVyKMc7q55wTcoamJ9/e2dlJrVLM7Lz35wFkCK4LKYI4HA5xqhW3Vnw2efbN+eq8N7N5ALlZNhOAVyTdJ1m3S5FzlnPOgUjrUnZuFgDob21t/QRgmGLMnTWUkvfmU07fS3q3BORmmZpmRB0dQF2dwHVMxx0A8GbOe49T28xnZRSgfVUGE0sGGh/mvXdm5mzqx8r/vc4MtDAwAfA+gK2UUsN5tWwHALykjyG8ambvpZTGJD+U5HPOofioc8pOUCaYBUUzI8GDxSywQwtcA7DVGIYQUFWVA/AHybvF7lpO+QdBfe+9pZQ+MrPPGyYByO29Sku0m44KDQ+qqrqwaJhS+tl7/wYAT3ISQnjHOfetpAzBQNyU9ARABMTS1Ilpa6eZ+RjjkZndaMDbpQe2QwgPJMVQhzqEEEIdJlP6x9uNraQKAGKMH5TekLXGKhrhDD0AeAC+FKfhs5fkW/IsSDKSX9Z1vVdV1Y2UUi3Bc1q6cwBMsykGWWWO5O9n64E1ZQfJKMn1er3PTk5OXvPeXw2hfvP55Pnrgm5589UMvIQHYOUQWtqIRqMRrly5ogYcas2+LjHRzASS4/b/IYQn3T3/jGE0HA4xm4YlCoJnZUIFF5RUldr6eaTzhdw5Sw/8LW1PqiB6dl1S19UZGI1GWOSwlDW9bqJJ3Yv2O+Xp0lZsiyWIIfYBODNzLVaA5AaqMFeAo3Ou56ZDzC3zMRfAIzzSkMNfAJy0PkyymRmABxuk4BDAOOccim6Qc85LGp/JswKkXrlWd+7c6TW/1337vXv3zkkaSNpu9ng8HjRi5H//ccpVaP8nn+ZdPv4CLlNGIJXQjKIAAAAASUVORK5CYII=" alt="" width="20" height="20" /> Headroom Route</div>
+    <div class="top-right">
+      <button type="button" id="direct-toggle" class="btn direct-toggle headroom" data-command="114" title="切换 Headroom / 直连路径">直连：关闭</button>
+    </div>
   </header>
   <nav class="tabs" role="tablist">
     <button type="button" data-tab="status" class="active">状态</button>
-    <button type="button" data-tab="routes">上游</button>
+    <button type="button" data-tab="codex">Codex</button>
+    <button type="button" data-tab="claude">Claude</button>
     <button type="button" data-tab="ops">运维</button>
     <button type="button" data-tab="settings">设置</button>
   </nav>
   <main>
     <section id="tab-status" class="panel active">
-      <div class="card">
-        <h2>运行状态</h2>
-        <div class="grid-2">
-          <div class="kv"><span class="k">模式</span><span class="v" id="st-mode">—</span></div>
-          <div class="kv"><span class="k">原因</span><span class="v" id="st-reason">—</span></div>
-          <div class="kv"><span class="k">Codex</span><span class="v" id="st-codex">—</span></div>
-          <div class="kv"><span class="k">Claude</span><span class="v" id="st-claude">—</span></div>
-          <div class="kv"><span class="k">Headroom</span><span class="v" id="st-headroom">—</span></div>
-          <div class="kv"><span class="k">恢复建议</span><span class="v" id="st-recovery">—</span></div>
-        </div>
+      <div class="panel-head">
+        <div><h1 class="panel-title">运行概览</h1><p class="panel-subtitle">Headroom Route 当前服务与路由状态</p></div>
+        <div class="toolbar"><button type="button" class="btn" data-command="102">立即检查</button><button type="button" class="btn primary" id="btn-recommended" disabled>暂无建议操作</button></div>
       </div>
       <div class="card">
-        <h2>当前路由</h2>
-        <div class="grid-2">
-          <div class="kv"><span class="k">Codex</span><span class="v" id="st-codex-route">—</span></div>
-          <div class="kv"><span class="k">Claude</span><span class="v" id="st-claude-route">—</span></div>
+        <h2>运行状态</h2>
+        <div class="status-list">
+          <div class="status-item"><span class="k">运行模式</span><span class="v" id="st-mode">—</span><span class="detail" id="st-reason">—</span></div>
+          <div class="status-item"><span class="k">Codex</span><span class="v" id="st-codex">—</span><span class="detail" id="st-codex-route">—</span></div>
+          <div class="status-item"><span class="k">Claude</span><span class="v" id="st-claude">—</span><span class="detail" id="st-claude-route">—</span></div>
         </div>
       </div>
       <div class="card">
         <h2>Headroom 指标</h2>
-        <div class="grid-2">
-          <div class="kv"><span class="k">Token</span><span class="v mono" id="st-tokens">—</span></div>
-          <div class="kv"><span class="k">请求</span><span class="v mono" id="st-requests">—</span></div>
-          <div class="kv"><span class="k">统计范围</span><span class="v" id="st-metrics-since">—</span></div>
-          <div class="kv"><span class="k">最近错误</span><span class="v" id="st-error">—</span></div>
+        <div class="status-list">
+          <div class="status-item"><span class="k">Token 优化</span><span class="v mono" id="st-tokens">—</span><span class="detail" id="st-metrics-since">—</span></div>
+          <div class="status-item"><span class="k">请求统计</span><span class="v mono" id="st-requests">—</span><span class="detail">当前日志累计</span></div>
+          <div class="status-item"><span class="k">Headroom</span><span class="v" id="st-headroom">—</span><span class="detail" id="st-recovery">—</span></div>
         </div>
-        <div class="row">
-          <button type="button" class="btn primary" id="btn-recommended" disabled>暂无建议操作</button>
-        </div>
+      </div>
+      <div class="card">
+        <h2>最近错误</h2>
+        <div class="status-item"><span class="v" id="st-error">无</span></div>
       </div>
     </section>
 
-    <section id="tab-routes" class="panel">
-      <p class="hint">点击列表项切换上游。打开「接管上游」后，切换才会写入客户端配置。</p>
-      <div class="row" style="margin-top:0;margin-bottom:12px">
-        <label class="check"><input type="checkbox" data-command="123" id="chk-manage" /> 接管上游</label>
+    <section id="tab-codex" class="panel">
+      <div class="panel-head">
+        <div><h1 class="panel-title">Codex 上游</h1><p class="panel-subtitle">选择 OpenAI 兼容路由，蓝色描边表示当前上游</p></div>
+        <div class="toolbar"><label class="check"><input type="checkbox" data-command="123" id="chk-manage-codex" /> 接管配置</label><button type="button" class="btn" data-command="102">刷新</button></div>
       </div>
-      <div id="route-list" class="route-list"></div>
+      <div id="route-list-codex" class="route-list"></div>
+    </section>
+
+    <section id="tab-claude" class="panel">
+      <div class="panel-head">
+        <div><h1 class="panel-title">Claude 上游</h1><p class="panel-subtitle">选择 Anthropic 兼容路由，蓝色描边表示当前上游</p></div>
+        <div class="toolbar"><label class="check"><input type="checkbox" data-command="123" id="chk-manage-claude" /> 接管配置</label><button type="button" class="btn" data-command="102">刷新</button></div>
+      </div>
+      <div id="route-list-claude" class="route-list"></div>
     </section>
 
     <section id="tab-ops" class="panel">
-      <p class="hint">常用运维开关与动作。同步/重启进行中时对应按钮会禁用。</p>
+      <div class="panel-head"><div><h1 class="panel-title">运维工具</h1><p class="panel-subtitle">服务控制、配置同步与故障转移</p></div></div>
       <div class="row">
         <label class="check"><input type="checkbox" data-command="104" id="chk-auto" /> 自动故障切换</label>
         <label class="check"><input type="checkbox" data-command="114" id="chk-bypass" /> 旁路 Headroom</label>
       </div>
-      <div class="row">
-        <button type="button" class="btn" data-command="102">立即检查上游</button>
-        <button type="button" class="btn" data-command="101" id="btn-sync">同步 Codex + Claude</button>
-        <button type="button" class="btn" data-command="103" id="btn-restart">重启 Headroom</button>
-        <button type="button" class="btn" data-command="121">配置故障转移策略…</button>
+      <div class="ops-grid" style="margin-top:14px">
+        <div class="action-row"><div class="action-copy"><strong>检查上游</strong><span>重新探测所有路由的可用性与延迟</span></div><button type="button" class="btn" data-command="102">检查</button></div>
+        <div class="action-row"><div class="action-copy"><strong>同步客户端</strong><span>将当前路由写入 Codex 与 Claude 配置</span></div><button type="button" class="btn primary" data-command="101" id="btn-sync">同步</button></div>
+        <div class="action-row"><div class="action-copy"><strong>Headroom 服务</strong><span>重启压缩代理并重新载入配置</span></div><button type="button" class="btn" data-command="103" id="btn-restart">重启</button></div>
+        <div class="action-row"><div class="action-copy"><strong>故障转移</strong><span>调整协议与备用上游优先级</span></div><button type="button" class="btn" data-command="121">配置</button></div>
       </div>
       <div class="card" style="margin-top:14px">
         <h2>任务状态</h2>
@@ -243,6 +489,15 @@ label.check input { accent-color: var(--accent); }
     </section>
 
     <section id="tab-settings" class="panel">
+      <div class="panel-head"><div><h1 class="panel-title">设置</h1><p class="panel-subtitle">启动行为、维护工具与配置可移植性</p></div></div>
+      <div class="action-row" style="margin-bottom:14px">
+        <div class="action-copy"><strong>界面主题</strong><span>选择深色、浅色或跟随 Windows 系统设置</span></div>
+        <select id="theme-select" class="theme-pick" title="界面主题" aria-label="界面主题">
+          <option value="dark">深色</option>
+          <option value="light">浅色</option>
+          <option value="system">跟随系统</option>
+        </select>
+      </div>
       <div class="row" style="margin-top:0">
         <label class="check"><input type="checkbox" data-command="105" id="chk-startup" /> 随 Windows 启动</label>
         <label class="check"><input type="checkbox" data-command="118" id="chk-autoupdate" /> 每日检查软件更新</label>
@@ -272,6 +527,62 @@ label.check input { accent-color: var(--accent); }
     </section>
   </main>
   <script>
+/* Theme: dark / light / follow system (persisted in localStorage) */
+(function () {
+  var THEME_KEY = "hr_theme";
+  var mq = window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
+  var themeMode = "system";
+  try {
+    var saved = localStorage.getItem(THEME_KEY);
+    if (saved === "light" || saved === "dark" || saved === "system") themeMode = saved;
+  } catch (e) {}
+  var favicon = document.querySelector("link[rel^='icon']");
+  var LOGO_DARK = favicon ? favicon.getAttribute("href") : "";
+  var LOGO_LIGHT = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAACqElEQVR42s2Xv4rVQBTGf5Nk12VXQcHGykrWP2CxImJhYesLaOEr2Fpe1kIfQPABxEKwsLRQH0BstrLRRrFQdhWUi3q9N8nYfAPHuTO5yV4XHDgkmZycf/OdbyaO+eESc57hw2Xm92Pr4IY7oMhLYC1h1wO/gDZMVroWmjwLPDUKXsY+ANeAxhjKOW6Ay8CTSD8kdhV4F3xWkYF1YDNh+HBHZVJjDTiReVdlH5R5EKdrCfwcuLStsm6UqTeV8F0BhOWwWCgkbiC2rBDdzzlbBED3j8DtFwWQA1czIIhC+r0C61uBEpgm9FP2WmAjk9DgCoRsTgIjA8qc8xlwHngg3YIBZQPYkpHfyniq+4mCu50JPIB0C/gs3dp0VGO64nTKRni4ZFolJ3elXyaWbkc606ilbQCb1mcVlf4jcC/qW2eAWADfovJadB/SfbGgPed4IBjYBe5nusEZaj5l6NRHBNTVLb4PBsL6NZGEcs4kt/TNirHzxuiE72rzXMcYiJlwxbQdHVzeqlJfgMeaq3V1GYZNtnq8BG+BG6aUlr9XtFkdB+4oyIfAHvASWBU+vitjH4EwOJ51Ec86cCZaqwCqr8B7zd0EHsn4WFvszjIHksBgF4HXGd1XwBVVbSIMBMB+Ap6ZdnNRBa2vkbjir73BgrBRmWrJRHPPjW7AynYP3ojlXBcIXWI7Ls2WHEYA3DZwFLgu8inlZEOHmHgZW32bbcMLhrFs23ngReK8EII8Ijkmx6OIEbNUXC1x8LRrO04cPHsRUcHyw4Iu8EDZ9zxQLXnyiTPzpv97jSpjzCee/T6C8lFQvk8AcQmLBOf3+TFxYsdeVIyhyd2ohI2c7w0IYCw7MwXTmp2z7lrzUnScGnUHuuOxqrNBDFSAH0Mw8l/9nA7liV4/uX8Al5jspKz94/sAAAAASUVORK5CYII=";
+
+  function applyTheme() {
+    var scheme = themeMode === "system"
+      ? (mq && mq.matches ? "light" : "dark")
+      : themeMode;
+    document.documentElement.setAttribute("data-theme", scheme);
+    var logo = scheme === "light" ? LOGO_LIGHT : LOGO_DARK;
+    var img = document.getElementById("brand-logo");
+    if (img && img.getAttribute("src") !== logo) img.setAttribute("src", logo);
+    if (favicon && favicon.getAttribute("href") !== logo) favicon.setAttribute("href", logo);
+  }
+
+  function sendTheme() {
+    var msg = JSON.stringify({ type: "theme", mode: themeMode });
+    try {
+      if (window.ipc && typeof window.ipc.postMessage === "function") {
+        window.ipc.postMessage(msg);
+        return;
+      }
+      if (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === "function") {
+        window.chrome.webview.postMessage(msg);
+        return;
+      }
+    } catch (e) {}
+  }
+  applyTheme();
+  sendTheme();
+
+  var sel = document.getElementById("theme-select");
+  if (sel) {
+    sel.value = themeMode;
+    sel.addEventListener("change", function () {
+      themeMode = sel.value;
+      try { localStorage.setItem(THEME_KEY, themeMode); } catch (e) {}
+      applyTheme();
+      sendTheme();
+    });
+  }
+  if (mq) {
+    mq.addEventListener("change", function () {
+      if (themeMode === "system") applyTheme();
+    });
+  }
+})();
 /* IPC: wry injects window.ipc.postMessage; WebView2 may use chrome.webview */
 (function () {
   function post(msg) {
@@ -321,28 +632,33 @@ label.check input { accent-color: var(--accent); }
     return String(n);
   }
 
-  function renderRoutes(routes) {
-    var root = $("route-list");
+  function renderRoutes(listId, routes, protocol) {
+    var root = $(listId);
     if (!root) return;
     root.innerHTML = "";
-    (routes || []).forEach(function (route) {
+    var items = (routes || []).filter(function (route) {
+      return route.protocol === protocol;
+    });
+    items.forEach(function (route) {
       var el = document.createElement("div");
       el.className = "route" + (route.selected ? " selected" : "");
+      var initials = protocol === "openai" ? "CX" : "CL";
       el.innerHTML =
-        '<span class="mark"></span>' +
-        "<div><div><strong>" + escapeHtml(route.name) + "</strong> · " +
-        escapeHtml(route.protocol === "openai" ? "Codex" : "Claude") +
-        "</div><div class=\"meta\">" +
+        '<span class="drag" aria-hidden="true">⠿</span>' +
+        '<span class="avatar">' + initials + '</span>' +
+        '<div><div class="name">' + escapeHtml(route.name) + '</div><div class="meta">' +
         escapeHtml(route.provider) + " · " + escapeHtml(route.evidence || route.state || "") +
-        " · " + (route.latency_ms != null ? route.latency_ms + " ms" : "--") +
-        "</div></div>" +
-        "<div class=\"meta\">" + (route.selected ? "当前" : "切换") + "</div>";
+        '</div></div>' +
+        '<div class="route-actions"><span class="latency">' +
+        (route.latency_ms != null ? route.latency_ms + " ms" : "--") +
+        '</span><button type="button" class="btn primary select-route">' +
+        (route.selected ? "✓ 已启用" : "▷ 启用") + '</button></div>';
       el.addEventListener("click", function () {
         post({ type: "switch_route", index: route.index });
       });
       root.appendChild(el);
     });
-    if (!routes || !routes.length) {
+    if (!items.length) {
       root.innerHTML = '<p class="hint">未发现可用上游</p>';
     }
   }
@@ -361,10 +677,15 @@ label.check input { accent-color: var(--accent); }
     applySnapshot: function (snapshot) {
       if (!snapshot || typeof snapshot !== "object") return;
       var mode = snapshot.runtime_mode || "—";
-      var pill = $("mode-pill");
-      if (pill) {
-        pill.textContent = mode;
-        pill.className = pillClass(mode);
+      var directToggle = $("direct-toggle");
+      if (directToggle) {
+        var direct = !!snapshot.bypass_headroom;
+        directToggle.textContent = direct ? "直连：开启" : "直连：关闭";
+        directToggle.className = "btn direct-toggle " + (direct ? "direct" : "headroom");
+        directToggle.setAttribute(
+          "title",
+          direct ? "当前已直连上游，点击切换到 Headroom" : "当前通过 Headroom，点击切换为直连"
+        );
       }
       setText("st-mode", mode);
       setText("st-reason", snapshot.runtime_reason);
@@ -409,7 +730,8 @@ label.check input { accent-color: var(--accent); }
         }
       }
 
-      setCheck("chk-manage", snapshot.manage_upstream);
+      setCheck("chk-manage-codex", snapshot.manage_upstream);
+      setCheck("chk-manage-claude", snapshot.manage_upstream);
       setCheck("chk-auto", snapshot.auto_enabled);
       setCheck("chk-bypass", snapshot.bypass_headroom);
       setCheck("chk-startup", snapshot.start_with_windows);
@@ -420,7 +742,8 @@ label.check input { accent-color: var(--accent); }
       setDisabled("btn-update", snapshot.update_running);
       setText("ops-sync", snapshot.sync_status);
       setText("ops-restart", snapshot.restart_status);
-      renderRoutes(snapshot.routes);
+      renderRoutes("route-list-codex", snapshot.routes, "openai");
+      renderRoutes("route-list-claude", snapshot.routes, "anthropic");
     }
   };
 

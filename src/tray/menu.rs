@@ -8,12 +8,7 @@ pub(super) unsafe fn show_menu(hwnd: HWND) {
     unsafe {
         // Disabled native menu items with ID 0 stay inert but render normal text.
         AppendMenuW(menu, MF_STRING, 0, wide(&service).as_ptr());
-        AppendMenuW(
-            menu,
-            MF_STRING,
-            ID_OPEN_STATUS,
-            wide("打开主窗口").as_ptr(),
-        );
+        AppendMenuW(menu, MF_STRING, ID_OPEN_STATUS, wide("打开主窗口").as_ptr());
         if let Some((command, label)) = recommended_action(
             &snapshot.runtime_status,
             &snapshot.headroom_state,

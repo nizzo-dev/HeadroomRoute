@@ -7,6 +7,8 @@ mod commands;
 mod failover_editor;
 use failover_editor::*;
 mod icon_bitmap;
+#[cfg_attr(feature = "desktop", path = "tray/main_window/mod.rs")]
+#[cfg_attr(not(feature = "desktop"), path = "tray/main_window/native.rs")]
 mod main_window;
 mod menu;
 mod portability_actions;
@@ -103,7 +105,7 @@ use windows_sys::Win32::{
         Controls::{BST_CHECKED, BST_UNCHECKED, WM_MOUSELEAVE},
         Input::KeyboardAndMouse::{EnableWindow, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
         Shell::{
-            NIF_GUID, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIN_SELECT, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+            NIF_GUID, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIN_SELECT,
             NOTIFYICONDATAW, Shell_NotifyIconW,
         },
         WindowsAndMessaging::*,
@@ -112,7 +114,6 @@ use windows_sys::Win32::{
 use windows_sys::core::GUID;
 
 const WM_TRAY: u32 = WM_APP + 1;
-/// Keyboard activation of the tray icon (NIN_SELECT | 1). Not always exported by windows-sys.
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const SS_CENTERIMAGE_STYLE: u32 = 0x0000_0200;
 const SS_NOPREFIX_STYLE: u32 = 0x0000_0080;
@@ -165,7 +166,6 @@ const ID_EDITOR_SAVE: usize = 210;
 const ID_EDITOR_CANCEL: usize = 211;
 const ID_EDITOR_STATUS: usize = 212;
 const ID_EDITOR_SOURCE_DETAIL: usize = 213;
-/// 预检窗口布局基线（96 DPI 客户区像素）。所有尺寸、间距与字体高度按 DPI 缩放。
 const TRAY_ICON_GUID: GUID = GUID::from_u128(0x5bdb64d1_1bb9_4d6d_9cb3_496b8e5a6d53);
 const APPROVAL_HOST_MUTEX_NAME: &str = "Local\\HeadroomRouteApprovalHost-v1";
 static APP: OnceLock<Arc<AppState>> = OnceLock::new();

@@ -14,6 +14,7 @@ pub enum UiInbound {
     Ready,
     Command { id: usize },
     SwitchRoute { index: usize },
+    Theme { mode: String },
 }
 
 pub fn parse_ui_message(body: &str) -> Option<UiInbound> {
@@ -71,6 +72,7 @@ pub struct UiSnapshot {
 
 impl UiSnapshot {
     /// Pure mapper used by tests and by [`build_ui_snapshot`].
+    #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         snapshot: &Snapshot,
         recovery_hint: String,
@@ -174,7 +176,7 @@ pub fn build_ui_snapshot(app: &AppState) -> UiSnapshot {
 mod tests {
     use super::*;
     use crate::model::{
-        AuthStyle, ComponentState, HeadroomRuntimeStatus, RuntimeMode, RuntimeStatus, RouteHealth,
+        AuthStyle, ComponentState, HeadroomRuntimeStatus, RouteHealth, RuntimeMode, RuntimeStatus,
     };
     use crate::model::{ClientPath, ClientRuntimeStatus};
 
@@ -270,6 +272,10 @@ mod tests {
         assert!(matches!(
             parse_ui_message(r#"{"type":"ready"}"#),
             Some(UiInbound::Ready)
+        ));
+        assert!(matches!(
+            parse_ui_message(r#"{"type":"theme","mode":"system"}"#),
+            Some(UiInbound::Theme { mode }) if mode == "system"
         ));
         assert!(parse_ui_message("not-json").is_none());
         assert!(parse_ui_message(r#"{"type":"command","id":-1}"#).is_none());

@@ -72,16 +72,54 @@ if (Test-Path (Join-Path $xwin 'sdk\lib\um\x86_64\kernel32.lib')) {
     $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $lld
     $env:RUSTFLAGS = @('-Lnative=' + (Join-Path $xwin 'sdk\lib\um\x86_64'), '-Lnative=' + (Join-Path $xwin 'sdk\lib\ucrt\x86_64'), '-Lnative=' + (Join-Path $xwin 'crt\lib\x86_64')) -join ' '
 }
+function New-ReleaseZip([string]$MainExe, [string]$CliExe, [string]$DestinationZip) {
+    $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("headroom-route-zip-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $stage | Out-Null
+    try {
+        Copy-Item -LiteralPath $MainExe (Join-Path $stage "HeadroomRoute-$version.exe")
+        Copy-Item -LiteralPath $CliExe (Join-Path $stage "HeadroomRouteCLI-$version.exe")
+        Copy-Item -LiteralPath $cliShim (Join-Path $stage 'hr.cmd')
+        foreach ($doc in @('Install.ps1', 'README.md', 'COMPATIBILITY.md', 'RELEASE.md', 'LICENSE')) {
+            Copy-Item -LiteralPath (Join-Path $project $doc) (Join-Path $stage $doc)
+        }
+        if (Test-Path -LiteralPath $DestinationZip) {
+            Remove-Item -LiteralPath $DestinationZip -Force
+        }
+        Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $DestinationZip
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $packageArchive = [System.IO.Compression.ZipFile]::OpenRead($DestinationZip)
+        try {
+            $packageEntries = @($packageArchive.Entries | ForEach-Object { $_.FullName })
+            foreach ($requiredFile in @("HeadroomRoute-$version.exe", "HeadroomRouteCLI-$version.exe", 'hr.cmd', 'Install.ps1')) {
+                if ($packageEntries -notcontains $requiredFile) {
+                    throw "发布包缺少必需文件：$requiredFile（$(Split-Path -Leaf $DestinationZip)）"
+                }
+            }
+        }
+        finally { $packageArchive.Dispose() }
+    }
+    finally {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Push-Location $project
 try {
     cargo fmt -- --check
     if ($LASTEXITCODE -ne 0) { throw 'cargo fmt -- --check 未通过，请先运行 cargo fmt' }
+    & (Join-Path $project 'Test-SourceLineLimit.ps1')
     cargo clippy --all-targets -- -D warnings
     if ($LASTEXITCODE -ne 0) { throw 'cargo clippy --all-targets -- -D warnings 未通过' }
+    cargo clippy --all-targets --features desktop -- -D warnings
+    if ($LASTEXITCODE -ne 0) { throw 'cargo clippy --features desktop 未通过' }
     cargo check
     if ($LASTEXITCODE -ne 0) { throw 'cargo check failed' }
+    cargo check --features desktop
+    if ($LASTEXITCODE -ne 0) { throw 'cargo check --features desktop failed' }
     cargo test
     if ($LASTEXITCODE -ne 0) { throw 'cargo test failed' }
+    cargo test --features desktop
+    if ($LASTEXITCODE -ne 0) { throw 'cargo test --features desktop failed' }
     & (Join-Path $project 'Test-Install.ps1')
     cargo build --release
     if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
@@ -100,11 +138,22 @@ try {
     }
     Copy-VersionedArtifact $releaseCliExe $versionedCliExe
 
+    cargo build --release --features desktop
+    if ($LASTEXITCODE -ne 0) { throw 'cargo build --features desktop failed' }
+    $versionedDesktopExe = Join-Path $project "dist\HeadroomRoute-$version-desktop.exe"
+    try {
+        Copy-VersionedArtifact $releaseExe $versionedDesktopExe
+    } catch [System.IO.IOException] {
+        if (!(Test-Path $versionedDesktopExe) -or (Get-Sha256 $releaseExe) -ne (Get-Sha256 $versionedDesktopExe)) { throw }
+        Write-Warning "dist\HeadroomRoute-$version-desktop.exe is locked but already matches this build."
+    }
+
     if ($signingCertificate) {
         if ([string]::IsNullOrWhiteSpace($TimestampServer)) {
             Write-Warning '正在生成无时间戳的 Authenticode 签名；证书过期后签名将无法继续验证。建议设置 HEADROOM_ROUTE_TIMESTAMP_SERVER。'
         }
         Set-AndConfirmSignature $versionedExe $signingCertificate $TimestampServer
+        Set-AndConfirmSignature $versionedDesktopExe $signingCertificate $TimestampServer
         Set-AndConfirmSignature $versionedCliExe $signingCertificate $TimestampServer
         Write-Host "已使用证书 $($signingCertificate.Thumbprint) 签名并复核发布二进制。"
     }
@@ -119,19 +168,10 @@ try {
         Write-Warning "dist\HeadroomRouteCLI.exe is locked; use HeadroomRouteCLI-$version.exe."
     }
     $zip = Join-Path $project "dist\HeadroomRoute-$version-windows-x64.zip"
-    Compress-Archive -Path $versionedExe, $versionedCliExe, $cliShim, (Join-Path $project 'Install.ps1'), (Join-Path $project 'README.md'), (Join-Path $project 'COMPATIBILITY.md'), (Join-Path $project 'RELEASE.md'), (Join-Path $project 'LICENSE') -DestinationPath $zip -Force
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $packageArchive = [System.IO.Compression.ZipFile]::OpenRead($zip)
-    try {
-        $packageEntries = @($packageArchive.Entries | ForEach-Object { $_.FullName })
-        foreach ($requiredFile in @("HeadroomRouteCLI-$version.exe", 'hr.cmd')) {
-            if ($packageEntries -notcontains $requiredFile) {
-                throw "发布包缺少必需文件：$requiredFile"
-            }
-        }
-    }
-    finally { $packageArchive.Dispose() }
-    $checksums = @($versionedExe, $versionedCliExe, $zip | ForEach-Object {
+    $desktopZip = Join-Path $project "dist\HeadroomRoute-$version-desktop-windows-x64.zip"
+    New-ReleaseZip $versionedExe $versionedCliExe $zip
+    New-ReleaseZip $versionedDesktopExe $versionedCliExe $desktopZip
+    $checksums = @($versionedExe, $versionedDesktopExe, $versionedCliExe, $zip, $desktopZip | ForEach-Object {
         $artifactPath = $_
         $hash = Get-Sha256 $artifactPath
         "$hash  $(Split-Path -Leaf $artifactPath)"

@@ -4,6 +4,7 @@ mod approval;
 mod branding;
 mod cli_identity;
 pub mod config;
+mod edition;
 pub mod environment_recovery;
 mod model;
 mod notification;

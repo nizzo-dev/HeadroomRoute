@@ -1,6 +1,9 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+mod theme;
 mod ui_model;
+
+use theme::{HostTheme, apply_host_theme, parse_host_theme, refresh_system_theme};
 
 #[allow(unused_imports)]
 pub(super) use ui_model::{UiInbound, UiSnapshot, build_ui_snapshot, parse_ui_message};
@@ -11,9 +14,9 @@ use raw_window_handle::{
     RawWindowHandle, Win32WindowHandle, WindowHandle, WindowsDisplayHandle,
 };
 use std::num::NonZeroIsize;
+use wry::Rect;
 use wry::WebViewBuilder;
 use wry::dpi::{LogicalPosition, LogicalSize, Position, Size};
-use wry::Rect;
 
 /// HWND wrapper so wry can attach a WebView to the existing shell window.
 pub(super) struct ShellWindow(pub HWND);
@@ -49,6 +52,9 @@ thread_local! {
 
 struct MainWindowState {
     webview: Option<wry::WebView>,
+    /// Last theme choice reported by the console; `None` means "system"
+    /// until the WebView reports in.
+    theme: Option<HostTheme>,
 }
 
 pub(super) fn set_tray_host_hwnd(hwnd: HWND) {
@@ -58,11 +64,7 @@ pub(super) fn set_tray_host_hwnd(hwnd: HWND) {
 pub(super) fn tray_host_hwnd(fallback: HWND) -> HWND {
     TRAY_HOST_HWND.with(|slot| {
         let host = slot.get();
-        if host.is_null() {
-            fallback
-        } else {
-            host
-        }
+        if host.is_null() { fallback } else { host }
     })
 }
 
@@ -114,7 +116,10 @@ pub(super) unsafe fn create_main_window(tray_hwnd: HWND) -> anyhow::Result<HWND>
     let width = bounds.right - bounds.left;
     let height = bounds.bottom - bounds.top;
     let _ = tray_hwnd;
-    let state = Box::new(MainWindowState { webview: None });
+    let state = Box::new(MainWindowState {
+        webview: None,
+        theme: None,
+    });
     let raw = Box::into_raw(state);
     let hwnd = CreateWindowExW(
         0,
@@ -135,16 +140,26 @@ pub(super) unsafe fn create_main_window(tray_hwnd: HWND) -> anyhow::Result<HWND>
         anyhow::bail!("无法创建主控制台窗口");
     }
     MAIN_HWND.with(|slot| slot.set(hwnd));
-    // Title-bar small icon (class hIcon covers big/taskbar).
-    let small = crate::branding::window_icon_small();
+    // Follow the system frame theme until the console reports its choice.
+    apply_host_theme(hwnd, HostTheme::System);
+    apply_window_icons(hwnd);
+    if crate::edition::show_window_on_start() {
+        show_main_window();
+    }
+    Ok(hwnd)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn apply_window_icons(hwnd: HWND) {
+    let dpi = GetDpiForWindow(hwnd).max(96);
+    let small = crate::branding::window_icon_small_for_dpi(dpi);
     if !small.is_null() {
         SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as LPARAM);
     }
-    let big = crate::branding::window_icon_big();
+    let big = crate::branding::window_icon_big_for_dpi(dpi);
     if !big.is_null() {
         SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, big as LPARAM);
     }
-    Ok(hwnd)
 }
 
 pub(super) unsafe fn show_main_window() {
@@ -211,6 +226,10 @@ unsafe extern "system" fn main_window_proc(
             resize_webview(hwnd, &*state_ptr);
             0
         }
+        WM_DPICHANGED => {
+            apply_window_icons(hwnd);
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
         WM_TIMER if wparam == MAIN_REFRESH_TIMER => {
             if IsWindowVisible(hwnd) != 0 {
                 push_snapshot(hwnd);
@@ -220,7 +239,17 @@ unsafe extern "system" fn main_window_proc(
         WM_UI_IPC => {
             if lparam != 0 {
                 let body = *Box::from_raw(lparam as *mut String);
-                dispatch_ui_message(&body);
+                dispatch_ui_message(hwnd, &body);
+            }
+            0
+        }
+        WM_SETTINGCHANGE => {
+            // Windows reports app color-scheme changes this way; re-apply the
+            // system-following frame theme when the console is following the
+            // system (or has not yet reported a choice).
+            let state = &*state_ptr;
+            if state.theme != Some(HostTheme::Dark) && state.theme != Some(HostTheme::Light) {
+                refresh_system_theme(hwnd, lparam as *const u16);
             }
             0
         }
@@ -308,9 +337,21 @@ unsafe fn handle_command_for_ui(ui_hwnd: HWND, id: usize) {
     }
 }
 
-fn dispatch_ui_message(body: &str) {
+fn dispatch_ui_message(hwnd: HWND, body: &str) {
     match parse_ui_message(body) {
         Some(UiInbound::Ready) => unsafe { push_snapshot(main_hwnd()) },
+        Some(UiInbound::Theme { mode }) => {
+            let Some(theme) = parse_host_theme(&mode) else {
+                return;
+            };
+            unsafe {
+                let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut MainWindowState;
+                if !state_ptr.is_null() {
+                    (*state_ptr).theme = Some(theme);
+                    apply_host_theme(hwnd, theme);
+                }
+            }
+        }
         Some(UiInbound::Command { id }) => {
             if !is_allowed_ui_command(id) {
                 return;
@@ -321,10 +362,10 @@ fn dispatch_ui_message(body: &str) {
             }
         }
         Some(UiInbound::SwitchRoute { index }) => {
-            if let Some(app) = APP.get() {
-                if app.switch_index(index, "主窗口手动切换") {
-                    let _ = app.write_status();
-                }
+            if let Some(app) = APP.get()
+                && app.switch_index(index, "主窗口手动切换")
+            {
+                let _ = app.write_status();
             }
             unsafe { push_snapshot(main_hwnd()) };
         }
@@ -365,9 +406,7 @@ unsafe fn ensure_webview(hwnd: HWND) {
         Err(error) => {
             notification::error(
                 "无法打开主窗口",
-                format!(
-                    "需要已安装的 Microsoft Edge WebView2 Runtime（Evergreen）。\n{error}"
-                ),
+                format!("需要已安装的 Microsoft Edge WebView2 Runtime（Evergreen）。\n{error}"),
             );
         }
     }

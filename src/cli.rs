@@ -20,6 +20,12 @@ fn main() {
         }
         return;
     }
+    if args.first().is_some_and(|arg| arg == "--claude-notify") {
+        if let Err(error) = approval::run_claude_notify(&args[1..]) {
+            eprintln!("HeadroomRoute CLI Claude 通知失败：{error:#}");
+        }
+        return;
+    }
     let _console = ConsoleSettings::configure();
     if args.first().is_some_and(|arg| arg == "--version") {
         println!(

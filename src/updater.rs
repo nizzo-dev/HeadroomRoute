@@ -1,4 +1,4 @@
-#![cfg(windows)]
+﻿#![cfg(windows)]
 
 use crate::{config, model::AppConfig, notification, progress::ProgressWindow};
 use anyhow::{Context, Result, anyhow, bail};
@@ -250,7 +250,7 @@ fn select_update(release: GithubRelease, current: &str) -> Result<Option<UpdateI
     if parse_version(&version)? <= parse_version(current)? {
         return Ok(None);
     }
-    let archive_name = format!("HeadroomRoute-{version}-windows-x64.zip");
+    let archive_name = crate::edition::release_archive_name(&version);
     let checksum_name = format!("HeadroomRoute-{version}-SHA256SUMS.txt");
     let asset = |name: &str| {
         release
@@ -623,7 +623,7 @@ mod tests {
             "draft": false,
             "prerelease": prerelease,
             "assets": [
-                {"name": "HeadroomRoute-0.5.0-windows-x64.zip", "browser_download_url": "https://example/zip", "size": 100},
+                {"name": crate::edition::release_archive_name("0.5.0"), "browser_download_url": "https://example/zip", "size": 100},
                 {"name": "HeadroomRoute-0.5.0-SHA256SUMS.txt", "browser_download_url": "https://example/sums", "size": 100}
             ]
         }))

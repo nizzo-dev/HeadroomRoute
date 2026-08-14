@@ -1,8 +1,11 @@
 use super::{WireRequest, connect_pipe};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
 use std::{
-    io::{BufRead, BufReader, Write},
+    collections::HashSet,
+    fs,
+    io::{BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
     thread,
 };
 
@@ -26,9 +29,48 @@ pub(super) fn cli_input_prompt_ready(cli: &str, contents: &str) -> bool {
             "codex" => {
                 matches!(line, "›" | "❯") || line.starts_with("› ") || line.starts_with("❯ ")
             }
-            "claude" => matches!(line, "❯" | ">"),
+            "claude" => claude_input_prompt_line(line),
             _ => false,
         })
+}
+
+fn claude_input_prompt_line(line: &str) -> bool {
+    matches!(line, "❯" | ">") || claude_placeholder_prompt(line)
+}
+
+fn claude_placeholder_prompt(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("❯ ").or_else(|| line.strip_prefix("> ")) else {
+        return false;
+    };
+    if claude_numbered_menu_line(line) {
+        return false;
+    }
+    let lower = rest.trim().to_ascii_lowercase();
+    lower.is_empty() || lower.starts_with("ask claude") || lower.contains("to continue")
+}
+
+fn claude_numbered_menu_line(line: &str) -> bool {
+    let rest = line.trim_start_matches(['❯', '>', ' ']).trim_start();
+    rest.starts_with(|character: char| character.is_ascii_digit()) && rest.contains('.')
+}
+
+/// True when `after` gained a non-prompt line that is not just the submitted
+/// user text sitting on `❯` / `>`.  Enter echo (`❯ hi` then a fresh `❯`)
+/// must not count as a finished reply.
+pub(super) fn claude_screen_has_new_reply(before: &str, after: &str) -> bool {
+    let previous: HashSet<&str> = before
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    after.lines().map(str::trim).any(|line| {
+        !line.is_empty()
+            && !previous.contains(line)
+            && !claude_input_prompt_line(line)
+            && !line.starts_with("❯ ")
+            && !line.starts_with("> ")
+            && !line.starts_with("› ")
+    })
 }
 
 /// Codex end-of-turn chrome near the prompt.
@@ -151,6 +193,65 @@ pub(super) fn run_codex_notify(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Claude Code `Stop` / `StopFailure` hooks send JSON on stdin (not argv).
+#[allow(dead_code)] // Used through the CLI-only notify entry point.
+pub(super) fn run_claude_notify(args: &[String]) -> Result<()> {
+    let Some(pid) = args.first().and_then(|value| value.parse::<u32>().ok()) else {
+        return Ok(());
+    };
+    let mut stdin = String::new();
+    std::io::stdin().read_to_string(&mut stdin)?;
+    match claude_hook_turn_result(&stdin) {
+        Some(result) => send_turn_result("claude", pid, &result),
+        None => Ok(()),
+    }
+}
+
+pub(super) fn write_claude_stop_hook_settings(executable: &Path, pid: u32) -> Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!("headroom-route-claude-stop-{pid}.json"));
+    fs::write(&path, claude_stop_hook_settings(executable, pid))
+        .with_context(|| format!("写入 Claude Stop 钩子配置失败：{}", path.display()))?;
+    Ok(path)
+}
+
+pub(super) fn claude_stop_hook_settings(executable: &Path, pid: u32) -> String {
+    let command = format!("\"{}\" --claude-notify {pid}", executable.display());
+    let hook = serde_json::json!({
+        "hooks": [{
+            "type": "command",
+            "command": command,
+            "timeout": 8
+        }]
+    });
+    serde_json::json!({
+        "hooks": {
+            "Stop": [hook.clone()],
+            "StopFailure": [hook]
+        }
+    })
+    .to_string()
+}
+
+fn claude_hook_turn_result(payload: &str) -> Option<TurnResult> {
+    let value = serde_json::from_str::<Value>(payload).ok()?;
+    match value.get("hook_event_name").and_then(Value::as_str)? {
+        "Stop" => Some(TurnResult::Completed),
+        "StopFailure" => Some(TurnResult::Failed(claude_stop_failure_summary(&value))),
+        _ => None,
+    }
+}
+
+fn claude_stop_failure_summary(value: &Value) -> String {
+    value
+        .get("error")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .or_else(|| value.get("last_assistant_message").and_then(Value::as_str))
+        .map(|text| clamp(text, MAX_ERROR_CHARS))
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "Claude 本轮异常结束".into())
+}
+
 #[allow(dead_code)]
 fn is_codex_completion_payload(payload: &str) -> bool {
     serde_json::from_str::<Value>(payload)
@@ -161,7 +262,10 @@ fn is_codex_completion_payload(payload: &str) -> bool {
 
 #[cfg(test)]
 mod notify_tests {
-    use super::is_codex_completion_payload;
+    use super::{
+        TurnResult, claude_hook_turn_result, claude_stop_hook_settings, is_codex_completion_payload,
+    };
+    use std::path::Path;
 
     #[test]
     fn accepts_only_agent_turn_complete_payloads() {
@@ -170,6 +274,33 @@ mod notify_tests {
         ));
         assert!(!is_codex_completion_payload(r#"{"type":"turn-started"}"#));
         assert!(!is_codex_completion_payload("not json"));
+    }
+
+    #[test]
+    fn claude_stop_hook_notifies_completion_not_prompt_submit() {
+        assert_eq!(
+            claude_hook_turn_result(r#"{"hook_event_name":"Stop","stop_hook_active":false}"#),
+            Some(TurnResult::Completed)
+        );
+        assert!(claude_hook_turn_result(r#"{"hook_event_name":"UserPromptSubmit"}"#).is_none());
+        assert!(claude_hook_turn_result(r#"{"hook_event_name":"SubagentStop"}"#).is_none());
+    }
+
+    #[test]
+    fn claude_stop_failure_hook_notifies_failure() {
+        assert_eq!(
+            claude_hook_turn_result(r#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#),
+            Some(TurnResult::Failed("rate_limit".into()))
+        );
+    }
+
+    #[test]
+    fn claude_session_settings_point_at_the_cli_notify_entry() {
+        let json = claude_stop_hook_settings(Path::new(r"C:\Apps\HeadroomRouteCLI.exe"), 42);
+        assert!(json.contains("--claude-notify 42"));
+        assert!(json.contains("HeadroomRouteCLI.exe"));
+        assert!(json.contains("\"Stop\""));
+        assert!(json.contains("\"StopFailure\""));
     }
 }
 
@@ -180,7 +311,8 @@ fn clamp(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        TurnResult, classify_turn_result, cli_input_prompt_ready, completion_bullet_visible,
+        TurnResult, classify_turn_result, claude_screen_has_new_reply, cli_input_prompt_ready,
+        completion_bullet_visible,
     };
 
     #[test]
@@ -209,6 +341,26 @@ mod tests {
         // model line: the › glyph is on the previous row, not the cursor line.
         assert!(cli_input_prompt_ready("codex", "›\n  gpt-5.6-luna low"));
         assert!(!cli_input_prompt_ready("codex", "  gpt-5.6-luna low"));
+    }
+
+    #[test]
+    fn detects_claude_prompt_with_placeholder_text() {
+        assert!(cli_input_prompt_ready("claude", "❯"));
+        assert!(cli_input_prompt_ready("claude", "❯ Ask Claude to continue"));
+        assert!(cli_input_prompt_ready("claude", "> Ask Claude to continue"));
+        assert!(!cli_input_prompt_ready("claude", "Ask Claude to continue"));
+        assert!(!cli_input_prompt_ready("claude", "❯ 只回复 pong"));
+        assert!(!cli_input_prompt_ready(
+            "claude",
+            "> 1. Yes, I trust this folder"
+        ));
+        assert!(!cli_input_prompt_ready("claude", "> 1. No, exit"));
+    }
+
+    #[test]
+    fn submit_echo_is_not_a_claude_reply() {
+        assert!(!claude_screen_has_new_reply("❯", "❯ 只回复 pong\n❯"));
+        assert!(claude_screen_has_new_reply("❯", "❯ 只回复 pong\npong\n❯"));
     }
 
     #[test]

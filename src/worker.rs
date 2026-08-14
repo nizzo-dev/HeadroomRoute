@@ -1,12 +1,13 @@
 use crate::{
     config,
     environment_recovery::{EnvironmentEvent, RecoveryAction},
-    model::{AppConfig, HeadroomMetrics},
+    model::HeadroomMetrics,
     runtime,
-    sqlite::{self, ProviderRow},
     state::{AppState, should_stop},
     updater,
 };
+
+mod cc_switch_watch;
 use reqwest::blocking::Client;
 use serde_json::Value;
 use std::{
@@ -127,7 +128,8 @@ fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
             .metadata()
             .and_then(|metadata| metadata.modified())
             .ok();
-        let mut cc_switch_providers = cc_switch_provider_snapshot(&watcher_config).ok();
+        let mut cc_switch_providers =
+            cc_switch_watch::cc_switch_provider_snapshot(&watcher_config).ok();
         let mut routing_drift_active = false;
         let mut last_heartbeat = Instant::now();
         while !should_stop(&app) {
@@ -202,12 +204,11 @@ fn status_loop(app: Arc<AppState>) -> thread::JoinHandle<()> {
                 .ok();
             if current_modified.is_some()
                 && current_modified != cc_switch_modified
-                && let Ok(current) = cc_switch_provider_snapshot(&config)
+                && let Ok(current) = cc_switch_watch::cc_switch_provider_snapshot(&config)
             {
                 cc_switch_modified = current_modified;
-                if provider_snapshot_changed(&mut cc_switch_providers, current) {
+                if cc_switch_watch::provider_snapshot_changed(&mut cc_switch_providers, current) {
                     app.refresh_routes();
-                    execute_recovery_event(&app, EnvironmentEvent::NetworkOrProxyChanged);
                     let mut notice = app.config_change_notice.lock().unwrap();
                     if notice.is_none() {
                         *notice = Some(
@@ -297,33 +298,6 @@ fn should_repair_drift(active: &mut bool, drifted: bool) -> bool {
     }
     *active = true;
     true
-}
-
-fn cc_switch_provider_snapshot(
-    config: &AppConfig,
-) -> anyhow::Result<(Vec<ProviderRow>, Vec<ProviderRow>)> {
-    let codex = if config.enable_codex {
-        sqlite::providers(&config.cc_switch_db, "codex")?
-    } else {
-        Vec::new()
-    };
-    let claude = if config.enable_claude {
-        sqlite::providers(&config.cc_switch_db, "claude")?
-    } else {
-        Vec::new()
-    };
-    Ok((codex, claude))
-}
-
-fn provider_snapshot_changed(
-    previous: &mut Option<(Vec<ProviderRow>, Vec<ProviderRow>)>,
-    current: (Vec<ProviderRow>, Vec<ProviderRow>),
-) -> bool {
-    let changed = previous
-        .as_ref()
-        .is_some_and(|previous| previous != &current);
-    *previous = Some(current);
-    changed
 }
 
 fn update_headroom_metrics(
@@ -701,33 +675,6 @@ mod tests {
         assert_eq!(metrics.completed_requests, 1);
         assert_eq!(metrics.tokens_saved, 20);
         let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn only_reports_provider_snapshot_changes() {
-        let row = |name: &str| ProviderRow {
-            id: "provider".into(),
-            name: name.into(),
-            settings: "{}".into(),
-            website_url: String::new(),
-        };
-        let mut previous = None;
-        assert!(!provider_snapshot_changed(
-            &mut previous,
-            (vec![row("Before")], Vec::new())
-        ));
-        assert!(!provider_snapshot_changed(
-            &mut previous,
-            (vec![row("Before")], Vec::new())
-        ));
-        assert!(provider_snapshot_changed(
-            &mut previous,
-            (vec![row("After")], Vec::new())
-        ));
-        assert!(!provider_snapshot_changed(
-            &mut previous,
-            (vec![row("After")], Vec::new())
-        ));
     }
 
     #[test]
