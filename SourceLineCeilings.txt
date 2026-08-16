@@ -2,7 +2,7 @@
 # Do not raise any number. After a split, lower or delete the row.
 838	src/state.rs
 805	src/routing_policy.rs
-787	ui/main/app.html
+786	ui/main/app.html
 747	src/config.rs
 742	src/tray.rs
 688	src/worker.rs

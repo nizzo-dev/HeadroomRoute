@@ -1,5 +1,5 @@
 //! Frontend-facing snapshot DTO and IPC inbound parser for the WebView console.
-//! Routes never include API keys.
+//! API keys are included only when show_api_key_on_hover is enabled.
 
 use super::super::{recommended_action, route_is_selected};
 use crate::model::{HeadroomMetrics, Protocol, Route, Snapshot};
@@ -37,6 +37,9 @@ pub struct UiRoute {
     pub evidence: String,
     pub selected: bool,
     pub state: String,
+    pub base_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,6 +156,15 @@ fn ui_route(index: usize, route: &Route, snapshot: &Snapshot) -> UiRoute {
         evidence: route.evidence_label().to_string(),
         selected,
         state: route.state.label().to_string(),
+        base_url: route.base_url.clone(),
+        api_key: snapshot.show_api_key_on_hover.then(|| {
+            route
+                .api_key
+                .as_deref()
+                .filter(|key| !key.is_empty())
+                .unwrap_or("未配置")
+                .to_string()
+        }),
     }
 }
 
@@ -250,7 +262,7 @@ mod tests {
             headroom_metrics: HeadroomMetrics::default(),
             headroom_metrics_since: None,
             auto_update_check: true,
-            show_api_key_on_hover: true,
+            show_api_key_on_hover: false,
             sync_status: "空闲".into(),
             restart_status: "空闲".into(),
             routes: vec![route],
@@ -305,6 +317,37 @@ mod tests {
         );
         assert_eq!(ui.routes.len(), 1);
         assert_eq!(ui.routes[0].name, "Alpha");
+        assert_eq!(ui.routes[0].base_url, "https://example.test/v1");
+        assert!(ui.routes[0].api_key.is_none());
         assert!(ui.routes[0].selected);
+        assert!(
+            json.contains("https://example.test/v1"),
+            "serialized UI snapshot should include the upstream URL: {json}"
+        );
+    }
+
+    #[test]
+    fn ui_snapshot_includes_api_keys_when_hover_is_enabled() {
+        let mut snap = sample_snapshot_with_secret();
+        snap.show_api_key_on_hover = true;
+        let ui = UiSnapshot::from_parts(
+            &snap,
+            "无".into(),
+            false,
+            false,
+            false,
+            false,
+            "Alpha".into(),
+            "未配置".into(),
+        );
+        let json = serde_json::to_string(&ui).expect("serialize");
+        assert_eq!(
+            ui.routes[0].api_key.as_deref(),
+            Some("sk-secret-should-not-leak")
+        );
+        assert!(
+            json.contains("sk-secret-should-not-leak"),
+            "serialized UI snapshot should include the API key when enabled: {json}"
+        );
     }
 }

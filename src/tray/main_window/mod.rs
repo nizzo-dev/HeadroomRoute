@@ -14,6 +14,7 @@ use raw_window_handle::{
     RawWindowHandle, Win32WindowHandle, WindowHandle, WindowsDisplayHandle,
 };
 use std::num::NonZeroIsize;
+use windows_sys::Win32::UI::HiDpi::AdjustWindowRectExForDpi;
 use wry::Rect;
 use wry::WebViewBuilder;
 use wry::dpi::{LogicalPosition, LogicalSize, Position, Size};
@@ -37,8 +38,10 @@ impl HasDisplayHandle for ShellWindow {
     }
 }
 
-const MAIN_CLIENT_WIDTH: i32 = 760;
-const MAIN_CLIENT_HEIGHT: i32 = 560;
+const MAIN_CLIENT_WIDTH: i32 = 1024;
+const MAIN_CLIENT_HEIGHT: i32 = 720;
+const MAIN_MIN_CLIENT_WIDTH: i32 = 960;
+const MAIN_MIN_CLIENT_HEIGHT: i32 = 600;
 const MAIN_REFRESH_TIMER: usize = 2;
 /// Custom message: lparam owns `Box<String>` IPC body from the WebView thread.
 const WM_UI_IPC: u32 = WM_APP + 40;
@@ -106,15 +109,8 @@ pub(super) unsafe fn create_main_window(tray_hwnd: HWND) -> anyhow::Result<HWND>
     let class_name = wide("HeadroomRouteMainWindow");
     let title = wide("Headroom Route");
     let style = WS_OVERLAPPEDWINDOW;
-    let mut bounds = RECT {
-        left: 0,
-        top: 0,
-        right: MAIN_CLIENT_WIDTH,
-        bottom: MAIN_CLIENT_HEIGHT,
-    };
-    AdjustWindowRectEx(&mut bounds, style, 0, 0);
-    let width = bounds.right - bounds.left;
-    let height = bounds.bottom - bounds.top;
+    let dpi = GetDpiForSystem().max(96);
+    let (width, height) = outer_window_size(MAIN_CLIENT_WIDTH, MAIN_CLIENT_HEIGHT, dpi, style);
     let _ = tray_hwnd;
     let state = Box::new(MainWindowState {
         webview: None,
@@ -202,12 +198,57 @@ pub(super) unsafe fn refresh_main_window_if_visible() {
     }
 }
 
+fn scale_px(logical: i32, dpi: u32) -> i32 {
+    let dpi = i64::from(dpi.max(96));
+    (i64::from(logical) * dpi / 96).clamp(1, i64::from(i32::MAX)) as i32
+}
+
+fn outer_window_size(client_w: i32, client_h: i32, dpi: u32, style: u32) -> (i32, i32) {
+    let dpi = dpi.max(96);
+    let mut bounds = RECT {
+        left: 0,
+        top: 0,
+        right: scale_px(client_w, dpi),
+        bottom: scale_px(client_h, dpi),
+    };
+    unsafe {
+        let _ = AdjustWindowRectExForDpi(&mut bounds, style, 0, 0, dpi);
+    }
+    (
+        (bounds.right - bounds.left).max(1),
+        (bounds.bottom - bounds.top).max(1),
+    )
+}
+
+fn apply_min_track_size(hwnd: HWND, lparam: LPARAM) {
+    let dpi = unsafe {
+        if hwnd.is_null() {
+            GetDpiForSystem()
+        } else {
+            GetDpiForWindow(hwnd)
+        }
+    };
+    let (width, height) = outer_window_size(
+        MAIN_MIN_CLIENT_WIDTH,
+        MAIN_MIN_CLIENT_HEIGHT,
+        dpi,
+        WS_OVERLAPPEDWINDOW,
+    );
+    let info = unsafe { &mut *(lparam as *mut MINMAXINFO) };
+    info.ptMinTrackSize.x = width;
+    info.ptMinTrackSize.y = height;
+}
+
 unsafe extern "system" fn main_window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == WM_GETMINMAXINFO && lparam != 0 {
+        apply_min_track_size(hwnd, lparam);
+        return 0;
+    }
     if message == WM_NCCREATE {
         let create = &*(lparam as *const CREATESTRUCTW);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
@@ -455,4 +496,25 @@ unsafe fn push_snapshot(hwnd: HWND) {
     // json is a JS object literal when inserted raw.
     let script = format!("window.__hr && window.__hr.applySnapshot({json});");
     let _ = webview.evaluate_script(&script);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scale_px_is_identity_at_96_dpi() {
+        assert_eq!(scale_px(1024, 96), 1024);
+        assert_eq!(scale_px(960, 144), 1440);
+    }
+
+    #[test]
+    fn outer_window_size_exceeds_client_and_min_is_smaller() {
+        let (width, height) = outer_window_size(1024, 720, 96, WS_OVERLAPPEDWINDOW);
+        assert!(width > 1024);
+        assert!(height > 720);
+        let (min_width, min_height) = outer_window_size(960, 600, 96, WS_OVERLAPPEDWINDOW);
+        assert!(min_width < width);
+        assert!(min_height < height);
+    }
 }
