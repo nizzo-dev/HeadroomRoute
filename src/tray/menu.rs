@@ -23,7 +23,7 @@ pub(super) unsafe fn show_menu(hwnd: HWND) {
             menu,
             MF_STRING,
             ID_EXIT,
-            wide(if snapshot.manage_upstream {
+            wide(if snapshot.manage_codex || snapshot.manage_claude {
                 "退出并交还 CC-Switch"
             } else {
                 "退出 HeadroomRoute"
@@ -33,6 +33,7 @@ pub(super) unsafe fn show_menu(hwnd: HWND) {
         let mut point = POINT::default();
         GetCursorPos(&mut point);
         SetForegroundWindow(hwnd);
+        popup_theme::apply_to_menus(hwnd);
         TrackPopupMenu(
             menu,
             TPM_RIGHTBUTTON,

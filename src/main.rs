@@ -472,11 +472,7 @@ fn adopt_cc_switch_startup_selection(config: &mut crate::model::AppConfig) {
     if !config.cc_switch_db.exists() {
         return;
     }
-    // In observe mode, align selection with CC-Switch current providers.
-    if config.manage_upstream {
-        return;
-    }
-    if config.enable_codex {
+    if !config.manage_codex && config.enable_codex {
         match sqlite::current_provider(&config.cc_switch_db, "codex") {
             Ok(Some(provider)) => config.selected_openai_provider = Some(provider.id),
             Ok(None) => {}
@@ -486,7 +482,7 @@ fn adopt_cc_switch_startup_selection(config: &mut crate::model::AppConfig) {
             ),
         }
     }
-    if config.enable_claude {
+    if !config.manage_claude && config.enable_claude {
         match sqlite::current_provider(&config.cc_switch_db, "claude") {
             Ok(Some(provider)) => config.selected_anthropic_provider = Some(provider.id),
             Ok(None) => {}
@@ -505,8 +501,7 @@ fn show_info(message: &str) {
     notification::blocking_info("Headroom Route", message);
 }
 
-/// 首次运行（启动前 config.json 不存在）且未走无界面模式时，托盘窗口初始化完成后
-/// 自动打开一次预检向导；测试演示参数不自动打开。
+/// 首次运行且非无界面/演示参数时，自动打开一次预检向导。
 fn should_auto_open_precheck(first_run: bool, args: &[String]) -> bool {
     first_run
         && !args

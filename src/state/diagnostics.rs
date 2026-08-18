@@ -31,9 +31,9 @@ impl AppState {
                 snapshot.active_score,
                 snapshot.auto_enabled,
                 snapshot.bypass_headroom,
-                snapshot.manage_upstream,
-                snapshot.direct_codex,
-                snapshot.direct_claude,
+                snapshot.manage_codex || snapshot.manage_claude,
+                !snapshot.manage_codex,
+                !snapshot.manage_claude,
                 snapshot.headroom_state,
                 snapshot.routes.len().min(32),
                 snapshot.last_error.as_deref().unwrap_or("")

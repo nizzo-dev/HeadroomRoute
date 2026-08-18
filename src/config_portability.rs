@@ -199,8 +199,8 @@ mod tests {
     fn takeover_preview_is_redacted_and_requires_fresh_confirmation() {
         let dir = test_dir("preview");
         let mut config = fixture_config(&dir);
-        config.manage_upstream = true;
-        config.sync_deprecated_direct_flags();
+        config.manage_codex = true;
+        config.manage_claude = true;
         let secret = "sk-test-preview-secret-0123456789";
         write_fixture(&config, secret);
 

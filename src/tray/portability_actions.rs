@@ -346,10 +346,16 @@ fn portable_change_summary(
             current.bypass_headroom, updated.bypass_headroom
         ));
     }
-    if current.manage_upstream != updated.manage_upstream {
+    if current.manage_codex != updated.manage_codex {
         changes.push(format!(
-            "manage_upstream: {} -> {}",
-            current.manage_upstream, updated.manage_upstream
+            "manage_codex: {} -> {}",
+            current.manage_codex, updated.manage_codex
+        ));
+    }
+    if current.manage_claude != updated.manage_claude {
+        changes.push(format!(
+            "manage_claude: {} -> {}",
+            current.manage_claude, updated.manage_claude
         ));
     }
     if current.direct_codex != updated.direct_codex {

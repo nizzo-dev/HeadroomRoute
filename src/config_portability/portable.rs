@@ -26,6 +26,10 @@ struct PortableSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     bypass_headroom: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    manage_codex: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manage_claude: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     manage_upstream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     direct_codex: Option<bool>,
@@ -125,6 +129,8 @@ impl PortableSettings {
             no_subscription_tracking: Some(config.no_subscription_tracking),
             use_system_proxy: Some(config.use_system_proxy),
             bypass_headroom: Some(config.bypass_headroom),
+            manage_codex: Some(config.manage_codex),
+            manage_claude: Some(config.manage_claude),
             manage_upstream: Some(config.manage_upstream),
             direct_codex: Some(config.direct_codex),
             direct_claude: Some(config.direct_claude),
@@ -153,6 +159,8 @@ impl PortableSettings {
         apply!(no_subscription_tracking);
         apply!(use_system_proxy);
         apply!(bypass_headroom);
+        apply!(manage_codex);
+        apply!(manage_claude);
         apply!(manage_upstream);
         apply!(direct_codex);
         apply!(direct_claude);

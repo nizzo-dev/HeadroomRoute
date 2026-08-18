@@ -93,7 +93,15 @@ impl AppState {
         Ok(enabled)
     }
 
-    pub fn toggle_manage_upstream(&self) -> Result<bool> {
+    pub fn toggle_manage_codex(&self) -> Result<bool> {
+        self.toggle_manage_client(true)
+    }
+
+    pub fn toggle_manage_claude(&self) -> Result<bool> {
+        self.toggle_manage_client(false)
+    }
+
+    fn toggle_manage_client(&self, codex: bool) -> Result<bool> {
         let _config_guard = self.config_write_guard();
         let (current, mut updated, path, preferred_openai, preferred_anthropic) = {
             let state = self.inner.lock().unwrap();
@@ -105,10 +113,18 @@ impl AppState {
                 active_route(&state, Protocol::Anthropic).map(|route| route.base_url.clone()),
             )
         };
-        updated.manage_upstream = !updated.manage_upstream;
+        if codex {
+            updated.manage_codex = !updated.manage_codex;
+        } else {
+            updated.manage_claude = !updated.manage_claude;
+        }
         updated.sync_deprecated_direct_flags();
-        let enabled = updated.manage_upstream;
-        let apply = if enabled {
+        let enabled = if codex {
+            updated.manage_codex
+        } else {
+            updated.manage_claude
+        };
+        let apply = if updated.manage_upstream {
             config::sync_all_with_targets(
                 &updated,
                 preferred_openai.as_deref(),

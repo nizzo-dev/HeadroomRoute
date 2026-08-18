@@ -55,7 +55,8 @@ pub struct UiSnapshot {
     pub claude_availability: String,
     pub auto_enabled: bool,
     pub bypass_headroom: bool,
-    pub manage_upstream: bool,
+    pub manage_codex: bool,
+    pub manage_claude: bool,
     pub sync_status: String,
     pub restart_status: String,
     pub headroom_metrics: HeadroomMetrics,
@@ -115,7 +116,8 @@ impl UiSnapshot {
             claude_availability: snapshot.claude_availability.to_string(),
             auto_enabled: snapshot.auto_enabled,
             bypass_headroom: snapshot.bypass_headroom,
-            manage_upstream: snapshot.manage_upstream,
+            manage_codex: snapshot.manage_codex,
+            manage_claude: snapshot.manage_claude,
             sync_status: snapshot.sync_status.clone(),
             restart_status: snapshot.restart_status.clone(),
             headroom_metrics: snapshot.headroom_metrics,
@@ -254,9 +256,8 @@ mod tests {
             claude_availability: "未配置",
             auto_enabled: false,
             bypass_headroom: false,
-            manage_upstream: true,
-            direct_codex: false,
-            direct_claude: false,
+            manage_codex: true,
+            manage_claude: false,
             headroom_state: "ready".into(),
             headroom_pid: Some(1),
             headroom_metrics: HeadroomMetrics::default(),
@@ -317,6 +318,8 @@ mod tests {
         );
         assert_eq!(ui.routes.len(), 1);
         assert_eq!(ui.routes[0].name, "Alpha");
+        assert!(ui.manage_codex);
+        assert!(!ui.manage_claude);
         assert_eq!(ui.routes[0].base_url, "https://example.test/v1");
         assert!(ui.routes[0].api_key.is_none());
         assert!(ui.routes[0].selected);

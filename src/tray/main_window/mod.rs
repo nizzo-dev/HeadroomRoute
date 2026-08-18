@@ -340,6 +340,7 @@ fn is_allowed_ui_command(id: usize) -> bool {
             | ID_AUTO
             | ID_BYPASS
             | ID_MANAGE_UPSTREAM
+            | ID_MANAGE_CLAUDE
             | ID_FAILOVER_EDITOR
             | ID_STARTUP
             | ID_AUTO_UPDATE

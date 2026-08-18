@@ -23,13 +23,16 @@ impl AppState {
                 route.protocol,
                 route.provider.clone(),
                 from_provider,
-                state.config.manage_upstream,
+                match route.protocol {
+                    Protocol::OpenAi => state.config.manage_codex,
+                    Protocol::Anthropic => state.config.manage_claude,
+                },
                 state.config.clone(),
             )
         };
         if !managing {
             self.inner.lock().unwrap().last_error =
-                Some("当前为观测模式：请在 CC-Switch 切换上游，或打开「接管上游」".into());
+                Some("当前为观测模式：请在 CC-Switch 切换上游，或打开该协议的「接管配置」".into());
             return false;
         }
         // Managing: point clients at local Headroom and sync model metadata.
@@ -328,7 +331,11 @@ impl AppState {
                 state.active_anthropic
             };
             // Auto-failover only while managing upstream (own the switch).
-            if !state.config.manage_upstream
+            let managing = match protocol {
+                Protocol::OpenAi => state.config.manage_codex,
+                Protocol::Anthropic => state.config.manage_claude,
+            };
+            if !managing
                 || !state.config.auto_failover
                 || active != Some(failed)
                 || state.routes[failed].state != RouteHealth::Unavailable

@@ -36,15 +36,14 @@ pub struct AppConfig {
     pub no_subscription_tracking: bool,
     pub use_system_proxy: bool,
     pub bypass_headroom: bool,
-    /// When true, rewrite Codex/Claude client configs to the local HeadroomRoute
-    /// agent and own provider switching. When false (default), only observe:
-    /// clients stay on the CC-Switch current upstream.
+    #[serde(default)]
+    pub manage_codex: bool,
+    #[serde(default)]
+    pub manage_claude: bool,
     #[serde(default)]
     pub manage_upstream: bool,
-    /// Deprecated: folded into `manage_upstream`. Kept for config migration.
     #[serde(default)]
     pub direct_codex: bool,
-    /// Deprecated: folded into `manage_upstream`. Kept for config migration.
     #[serde(default)]
     pub direct_claude: bool,
     pub metrics_log_offset: u64,
@@ -88,6 +87,8 @@ impl Default for AppConfig {
             no_subscription_tracking: true,
             use_system_proxy: true,
             bypass_headroom: false,
+            manage_codex: false,
+            manage_claude: false,
             manage_upstream: false,
             direct_codex: false,
             direct_claude: false,
@@ -103,22 +104,22 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// Normalize after deserialize.
-    /// - `manage_upstream` defaults to false (observe-by-default).
-    /// - Legacy `direct_*` mean "do not manage"; if either was on, force observe.
-    /// - Keep `direct_*` as derived mirrors of `!manage_upstream` so existing
-    ///   call sites that branch on direct keep working during the transition.
+    /// Split legacy `manage_upstream` / `direct_*` into per-protocol flags.
     pub fn migrate_manage_upstream(&mut self) {
         if self.direct_codex || self.direct_claude {
             self.manage_upstream = false;
+        }
+        if self.manage_upstream && !self.manage_codex && !self.manage_claude {
+            self.manage_codex = true;
+            self.manage_claude = true;
         }
         self.sync_deprecated_direct_flags();
     }
 
     pub fn sync_deprecated_direct_flags(&mut self) {
-        let observing = !self.manage_upstream;
-        self.direct_codex = observing;
-        self.direct_claude = observing;
+        self.direct_codex = !self.manage_codex;
+        self.direct_claude = !self.manage_claude;
+        self.manage_upstream = self.manage_codex || self.manage_claude;
     }
 }
 
@@ -366,9 +367,8 @@ pub struct Snapshot {
     pub claude_availability: &'static str,
     pub auto_enabled: bool,
     pub bypass_headroom: bool,
-    pub manage_upstream: bool,
-    pub direct_codex: bool,
-    pub direct_claude: bool,
+    pub manage_codex: bool,
+    pub manage_claude: bool,
     pub headroom_state: String,
     pub headroom_pid: Option<u32>,
     pub headroom_metrics: HeadroomMetrics,

@@ -133,7 +133,7 @@ pub fn sync_codex(config: &AppConfig, preferred: Option<&str>) -> Result<String>
     if !config.enable_codex || !config.codex_config.exists() {
         return Ok("未启用".into());
     }
-    if !config.manage_upstream {
+    if !config.manage_codex {
         return sync_codex_direct_provider(
             config,
             config.selected_openai_provider.as_deref(),
@@ -339,7 +339,8 @@ pub fn release_to_cc_switch(config: &AppConfig) -> Result<String> {
     {
         // Persist selection only; manage_upstream flag is owned by caller.
         let mut to_save = updated.clone();
-        to_save.manage_upstream = config.manage_upstream;
+        to_save.manage_codex = config.manage_codex;
+        to_save.manage_claude = config.manage_claude;
         to_save.sync_deprecated_direct_flags();
         save(&config.state_dir.join("config.json"), &to_save)?;
     }
@@ -359,7 +360,7 @@ pub fn sync_claude_with_target(config: &AppConfig, preferred: Option<&str>) -> R
     if !config.enable_claude {
         return Ok("未启用".into());
     }
-    if !config.manage_upstream {
+    if !config.manage_claude {
         return sync_claude_direct_provider(
             config,
             config.selected_anthropic_provider.as_deref(),
@@ -403,14 +404,14 @@ pub fn sync_all_with_targets(
     preferred_anthropic: Option<&str>,
 ) -> Result<String> {
     capture_baseline(config)?;
-    if !config.manage_upstream {
-        // Observe mode: keep/restore real upstreams, never point at local agent.
-        let _ = (preferred_openai, preferred_anthropic);
+    if !config.manage_codex && !config.manage_claude {
         return release_to_cc_switch(config);
     }
-    let codex = sync_codex(config, preferred_openai)?;
-    let claude = sync_claude_with_target(config, preferred_anthropic)?;
-    Ok(format!("Codex={codex}, Claude={claude}"))
+    Ok(format!(
+        "Codex={}, Claude={}",
+        sync_codex(config, preferred_openai)?,
+        sync_claude_with_target(config, preferred_anthropic)?
+    ))
 }
 
 pub fn sync_protocol_with_target(
@@ -422,5 +423,67 @@ pub fn sync_protocol_with_target(
     match protocol {
         Protocol::OpenAi => sync_codex(config, preferred),
         Protocol::Anthropic => sync_claude_with_target(config, preferred),
+    }
+}
+
+#[cfg(test)]
+mod independent_manage_tests {
+    use super::*;
+    use crate::model::AppConfig;
+    use std::fs;
+
+    #[test]
+    fn migrate_splits_legacy_flag_and_keeps_single_protocol() {
+        let mut both = AppConfig {
+            manage_upstream: true,
+            ..AppConfig::default()
+        };
+        both.migrate_manage_upstream();
+        assert!(both.manage_codex && both.manage_claude && both.manage_upstream);
+
+        let mut codex_only = AppConfig {
+            manage_codex: true,
+            ..AppConfig::default()
+        };
+        codex_only.migrate_manage_upstream();
+        assert!(codex_only.manage_codex && !codex_only.manage_claude);
+        assert!(codex_only.manage_upstream && !codex_only.direct_codex && codex_only.direct_claude);
+    }
+
+    #[test]
+    fn sync_all_rewrites_only_managed_protocol() {
+        let dir = std::env::temp_dir().join(format!(
+            "headroom-route-manage-split-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig {
+            state_dir: dir.clone(),
+            codex_config: dir.join("config.toml"),
+            claude_settings: dir.join("settings.json"),
+            cc_switch_db: dir.join("missing.db"),
+            manage_codex: true,
+            manage_claude: false,
+            ..AppConfig::default()
+        };
+        config.sync_deprecated_direct_flags();
+        fs::write(
+            &config.codex_config,
+            "model_provider = \"upstream\"\n[model_providers.upstream]\nname = \"Upstream\"\nbase_url = \"https://api.example.com/v1\"\n",
+        )
+        .unwrap();
+        fs::write(
+            &config.claude_settings,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://claude.example.com"}}"#,
+        )
+        .unwrap();
+        sync_all_with_targets(&config, None, None).unwrap();
+        let codex = fs::read_to_string(&config.codex_config).unwrap();
+        let claude = fs::read_to_string(&config.claude_settings).unwrap();
+        assert!(codex.contains("model_provider = \"headroom\""));
+        assert!(claude.contains("https://claude.example.com"));
+        assert!(!claude.contains("127.0.0.1"));
+        let _ = fs::remove_dir_all(dir);
     }
 }

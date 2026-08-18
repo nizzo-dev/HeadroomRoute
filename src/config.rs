@@ -276,7 +276,7 @@ mod tests {
         let mut managed = AppConfig::default();
         managed.manage_upstream = true;
         managed.migrate_manage_upstream();
-        assert!(managed.manage_upstream);
+        assert!(managed.manage_codex && managed.manage_claude);
         assert!(!managed.direct_codex && !managed.direct_claude);
     }
 
@@ -342,8 +342,7 @@ mod tests {
         config.claude_settings = path.clone();
         config.headroom_port = 8787;
         config.enable_codex = false;
-        config.manage_upstream = true;
-        config.sync_deprecated_direct_flags();
+        config.manage_claude = true;
         sync_claude_with_target(&config, None).unwrap();
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["theme"], "dark");
@@ -409,8 +408,8 @@ mod tests {
         config.codex_config = dir.join("config.toml");
         config.claude_settings = dir.join("settings.json");
         config.bypass_headroom = true;
-        config.manage_upstream = true;
-        config.sync_deprecated_direct_flags();
+        config.manage_codex = true;
+        config.manage_claude = true;
         fs::write(
             &config.codex_config,
             "model_provider = \"upstream\"\n[model_providers.upstream]\nname = \"Upstream\"\nbase_url = \"https://api.example.com/v1\"\n",

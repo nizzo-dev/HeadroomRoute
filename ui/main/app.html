@@ -459,7 +459,7 @@ html[data-theme="light"] .action-row { box-shadow: 0 1px 3px rgba(31, 45, 61, .0
     <section id="tab-claude" class="panel">
       <div class="panel-head">
         <div><h1 class="panel-title">Claude 上游</h1><p class="panel-subtitle">选择 Anthropic 兼容路由，蓝色描边表示当前上游</p></div>
-        <div class="toolbar"><label class="check"><input type="checkbox" data-command="123" id="chk-manage-claude" /> 接管配置</label><button type="button" class="btn" data-command="102">刷新</button></div>
+        <div class="toolbar"><label class="check"><input type="checkbox" data-command="124" id="chk-manage-claude" /> 接管配置</label><button type="button" class="btn" data-command="102">刷新</button></div>
       </div>
       <div id="route-list-claude" class="route-list"></div>
     </section>
@@ -729,8 +729,8 @@ html[data-theme="light"] .action-row { box-shadow: 0 1px 3px rgba(31, 45, 61, .0
         }
       }
 
-      setCheck("chk-manage-codex", snapshot.manage_upstream);
-      setCheck("chk-manage-claude", snapshot.manage_upstream);
+      setCheck("chk-manage-codex", snapshot.manage_codex);
+      setCheck("chk-manage-claude", snapshot.manage_claude);
       setCheck("chk-auto", snapshot.auto_enabled);
       setCheck("chk-bypass", snapshot.bypass_headroom);
       setCheck("chk-startup", snapshot.start_with_windows);

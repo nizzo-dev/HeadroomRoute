@@ -52,6 +52,12 @@ pub(super) unsafe fn apply_host_theme(hwnd: HWND, theme: HostTheme) {
             )
         };
     }
+    super::super::popup_theme::remember_console_theme(match theme {
+        HostTheme::Dark => "dark",
+        HostTheme::Light => "light",
+        HostTheme::System => "system",
+    });
+    super::super::popup_theme::apply_to_menus(hwnd);
 }
 
 /// True when Windows is in dark app mode (`AppsUseLightTheme` is 0).

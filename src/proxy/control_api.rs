@@ -37,15 +37,16 @@ pub(super) fn stable_status(app: &AppState) -> serde_json::Value {
         "protocols": {
             "codex": {
                 "availability": snapshot.codex_availability,
-                "manage_upstream": snapshot.manage_upstream,
-                "mode": protocol_mode(snapshot.direct_codex, snapshot.bypass_headroom),
+                "manage_codex": snapshot.manage_codex,
+                "mode": protocol_mode(!snapshot.manage_codex, snapshot.bypass_headroom),
                 "active_name": snapshot.active_name,
                 "active_host": snapshot.active_host,
                 "latency_ms": snapshot.latency_ms,
             },
             "claude": {
                 "availability": snapshot.claude_availability,
-                "mode": protocol_mode(snapshot.direct_claude, snapshot.bypass_headroom),
+                "manage_claude": snapshot.manage_claude,
+                "mode": protocol_mode(!snapshot.manage_claude, snapshot.bypass_headroom),
                 "active_name": snapshot.active_anthropic_name,
                 "active_host": snapshot.active_anthropic_host,
                 "latency_ms": snapshot.anthropic_latency_ms,

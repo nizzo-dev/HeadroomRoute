@@ -119,9 +119,8 @@ impl AppState {
             ),
             auto_enabled: state.config.auto_failover,
             bypass_headroom: state.config.bypass_headroom,
-            manage_upstream: state.config.manage_upstream,
-            direct_codex: state.config.direct_codex,
-            direct_claude: state.config.direct_claude,
+            manage_codex: state.config.manage_codex,
+            manage_claude: state.config.manage_claude,
             headroom_state: state.headroom_state.clone(),
             headroom_pid: state.headroom_pid,
             headroom_metrics: state.headroom_metrics,
@@ -546,7 +545,7 @@ mod tests {
         config.state_dir = dir.clone();
         config.cc_switch_db = dir.join("missing.db");
         config.auto_failover = false;
-        config.manage_upstream = true;
+        config.manage_codex = true;
         config.sync_deprecated_direct_flags();
         let mut routes = vec![
             Route::new(
@@ -728,7 +727,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut config = AppConfig::default();
         config.state_dir = dir.clone();
-        config.manage_upstream = true;
+        config.manage_codex = true;
         config.sync_deprecated_direct_flags();
         let routes = vec![
             Route::new(

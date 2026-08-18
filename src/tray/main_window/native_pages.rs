@@ -104,12 +104,13 @@ pub(super) unsafe fn create_controls(hwnd: HWND, state: &mut MainWindowState) {
 
     let route_hint = static_text(
         hwnd,
-        "双击列表项切换上游。勾选「接管上游」后，托盘与本页切换才会写入客户端配置。",
+        "双击列表项切换上游。勾选对应协议的「接管配置」后才会写入客户端。",
         ID_MAIN_ROUTE_HINT as usize,
         instance,
         font,
     );
-    let manage = checkbox(hwnd, "接管上游", ID_MANAGE_UPSTREAM, instance, font);
+    let manage_codex = checkbox(hwnd, "接管 Codex", ID_MANAGE_UPSTREAM, instance, font);
+    let manage_claude = checkbox(hwnd, "接管 Claude", ID_MANAGE_CLAUDE, instance, font);
     let route_list = editor_control(
         hwnd,
         "LISTBOX",
@@ -123,7 +124,7 @@ pub(super) unsafe fn create_controls(hwnd: HWND, state: &mut MainWindowState) {
         instance,
         font,
     );
-    state.page_controls[1].extend([route_hint, manage, route_list]);
+    state.page_controls[1].extend([route_hint, manage_codex, manage_claude, route_list]);
 
     let ops_hint = static_text(
         hwnd,
@@ -325,9 +326,27 @@ unsafe fn place_page(
         }
         1 => {
             SetWindowPos(controls[0], ptr::null_mut(), x, y, w, 36, SWP_NOZORDER);
-            SetWindowPos(controls[1], ptr::null_mut(), x, y + 40, w, 24, SWP_NOZORDER);
+            let half = (w / 2).max(80);
+            SetWindowPos(
+                controls[1],
+                ptr::null_mut(),
+                x,
+                y + 40,
+                half - 8,
+                24,
+                SWP_NOZORDER,
+            );
             SetWindowPos(
                 controls[2],
+                ptr::null_mut(),
+                x + half,
+                y + 40,
+                w - half,
+                24,
+                SWP_NOZORDER,
+            );
+            SetWindowPos(
+                controls[3],
                 ptr::null_mut(),
                 x,
                 y + 72,
@@ -434,7 +453,8 @@ pub(super) unsafe fn refresh_main_window(hwnd: HWND) {
         SendMessageW(list, LB_ADDSTRING, 0, wide(&line).as_ptr() as LPARAM);
     }
 
-    set_check(hwnd, ID_MANAGE_UPSTREAM, snapshot.manage_upstream);
+    set_check(hwnd, ID_MANAGE_UPSTREAM, snapshot.manage_codex);
+    set_check(hwnd, ID_MANAGE_CLAUDE, snapshot.manage_claude);
     set_check(hwnd, ID_AUTO, snapshot.auto_enabled);
     set_check(hwnd, ID_BYPASS, snapshot.bypass_headroom);
     set_check(

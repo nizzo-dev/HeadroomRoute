@@ -11,6 +11,7 @@ mod icon_bitmap;
 #[cfg_attr(not(feature = "desktop"), path = "tray/main_window/native.rs")]
 mod main_window;
 mod menu;
+mod popup_theme;
 mod portability_actions;
 mod precheck_dialog;
 mod precheck_layout;
@@ -142,8 +143,7 @@ const ID_RELOAD_FAILOVER: usize = 120;
 const ID_FAILOVER_EDITOR: usize = 121;
 const ID_APPROVAL_DEMO: usize = 122;
 const ID_MANAGE_UPSTREAM: usize = 123;
-#[allow(dead_code)]
-const ID_DIRECT_CLAUDE: usize = 124; // reserved (legacy dual-direct removed)
+const ID_MANAGE_CLAUDE: usize = 124;
 const ID_PRECHECK: usize = 125;
 const ID_TAKEOVER: usize = 126;
 const ID_CREATE_BACKUP: usize = 127;

@@ -31,18 +31,27 @@ pub(super) unsafe fn handle_command(hwnd: HWND, id: usize) {
             Err(error) => notify(hwnd, "自动切换设置失败", &error.to_string()),
         },
         ID_FAILOVER_EDITOR => unsafe { show_failover_editor(dialog_owner(hwnd)) },
-        ID_MANAGE_UPSTREAM => match app.toggle_manage_upstream() {
+        ID_MANAGE_UPSTREAM => match app.toggle_manage_codex() {
+            Ok(true) => notify(hwnd, "已接管 Codex", "Codex 已指向本地 HeadroomRoute。"),
+            Ok(false) => notify(
+                hwnd,
+                "已交还 Codex",
+                "观测模式：请在 CC-Switch 切换 Codex Provider。",
+            ),
+            Err(error) => notify(hwnd, "切换 Codex 接管失败", &error.to_string()),
+        },
+        ID_MANAGE_CLAUDE => match app.toggle_manage_claude() {
             Ok(true) => notify(
                 hwnd,
-                "已接管上游",
-                "Codex / Claude 已指向本地 HeadroomRoute；托盘可切换 Provider。退出时交还 CC-Switch。",
+                "已接管 Claude Code",
+                "Claude Code 已指向本地 HeadroomRoute。",
             ),
             Ok(false) => notify(
                 hwnd,
-                "已交还 CC-Switch",
-                "观测模式：客户端使用 CC-Switch 当前上游；请在 CC-Switch 切换 Provider。",
+                "已交还 Claude Code",
+                "观测模式：请在 CC-Switch 切换 Claude Provider。",
             ),
-            Err(error) => notify(hwnd, "切换上游接管失败", &error.to_string()),
+            Err(error) => notify(hwnd, "切换 Claude 接管失败", &error.to_string()),
         },
         ID_BYPASS => match app.toggle_headroom_bypass() {
             Ok(true) => notify(
