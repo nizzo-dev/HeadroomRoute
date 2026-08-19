@@ -94,10 +94,6 @@ use windows_sys::Win32::{
         DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
         LibraryLoader::GetModuleHandleW,
         Ole::CF_UNICODETEXT,
-        Registry::{
-            HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegCreateKeyExW,
-            RegDeleteValueW, RegSetValueExW,
-        },
         Threading::{
             CreateMutexW, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         },
@@ -217,7 +213,17 @@ struct ApprovalVisual {
 }
 
 pub fn run(app: Arc<AppState>, auto_open_precheck: bool) -> anyhow::Result<()> {
-    let _ = APP.set(app);
+    let _ = APP.set(app.clone());
+    if let Err(error) = {
+        let config = app.inner.lock().unwrap().config.clone();
+        crate::startup::sync_from_config(config.start_with_windows, &config.state_dir)
+    } {
+        app.inner
+            .lock()
+            .unwrap()
+            .last_error
+            .replace(format!("同步开机启动项失败: {error}"));
+    }
     approval::start_server();
     unsafe {
         let instance = GetModuleHandleW(ptr::null());
@@ -672,47 +678,6 @@ fn notify(hwnd: HWND, title: &str, message: &str) {
     }
 }
 
-#[allow(unsafe_op_in_unsafe_fn)]
-fn set_startup(enabled: bool) -> anyhow::Result<()> {
-    unsafe {
-        let mut key = ptr::null_mut();
-        let sub = wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
-        if RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            sub.as_ptr(),
-            0,
-            ptr::null_mut(),
-            0,
-            KEY_SET_VALUE,
-            ptr::null(),
-            &mut key,
-            ptr::null_mut(),
-        ) != 0
-        {
-            anyhow::bail!("无法打开启动项注册表")
-        };
-        let name = wide("HeadroomRoute");
-        let result = if enabled {
-            let exe = std::env::current_exe()?;
-            let value = wide(&format!("\"{}\"", exe.display()));
-            RegSetValueExW(
-                key,
-                name.as_ptr(),
-                0,
-                REG_SZ,
-                value.as_ptr() as *const u8,
-                (value.len() * 2) as u32,
-            )
-        } else {
-            RegDeleteValueW(key, name.as_ptr())
-        };
-        RegCloseKey(key);
-        if result != 0 && enabled {
-            anyhow::bail!("注册表写入失败: {result}")
-        };
-        Ok(())
-    }
-}
 fn copy_clipboard(hwnd: HWND, text: &str) -> anyhow::Result<()> {
     unsafe {
         if OpenClipboard(hwnd) == 0 {

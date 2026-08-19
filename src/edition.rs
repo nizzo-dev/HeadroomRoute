@@ -6,8 +6,15 @@ pub const EDITION: &str = "desktop";
 #[cfg(not(feature = "desktop"))]
 pub const EDITION: &str = "tray";
 
-pub const fn show_window_on_start() -> bool {
-    cfg!(feature = "desktop")
+/// Windows Run-key autostart; desktop edition stays in the tray.
+pub const AUTOSTART_ARG: &str = "--autostart";
+
+pub fn show_window_on_start() -> bool {
+    cfg!(feature = "desktop") && !is_autostart_launch(std::env::args())
+}
+
+pub fn is_autostart_launch<S: AsRef<str>>(args: impl IntoIterator<Item = S>) -> bool {
+    args.into_iter().any(|arg| arg.as_ref() == AUTOSTART_ARG)
 }
 
 pub fn release_archive_name(version: &str) -> String {
@@ -31,7 +38,12 @@ mod tests {
 
     #[test]
     fn desktop_opens_window_on_start() {
-        assert_eq!(super::show_window_on_start(), cfg!(feature = "desktop"));
+        assert!(super::is_autostart_launch(["--autostart"]));
+        assert!(!super::is_autostart_launch(["--doctor"]));
+        assert_eq!(
+            super::show_window_on_start(),
+            cfg!(feature = "desktop") && !super::is_autostart_launch(std::env::args())
+        );
         assert_eq!(super::EDITION == "desktop", cfg!(feature = "desktop"));
     }
 }

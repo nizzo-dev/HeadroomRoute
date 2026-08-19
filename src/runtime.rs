@@ -6,12 +6,7 @@ use std::{
     process::{Command, Stdio},
 };
 #[cfg(windows)]
-use windows_sys::Win32::{
-    Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW},
-    System::Registry::{
-        HKEY_CURRENT_USER, KEY_SET_VALUE, RegCloseKey, RegDeleteValueW, RegOpenKeyExW,
-    },
-};
+use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
 
 pub const HEADROOM_VERSION: &str = "0.34.0";
 
@@ -113,7 +108,7 @@ pub fn remove_managed_runtime(config: &AppConfig) -> Result<()> {
 
 pub fn uninstall(config: &AppConfig) -> Result<()> {
     config::restore_clients(config)?;
-    remove_startup_entry()?;
+    crate::startup::disable()?;
     remove_managed_runtime(config)?;
     cleanup_state(config)?;
     schedule_self_delete()?;
@@ -143,33 +138,6 @@ fn cleanup_state(config: &AppConfig) -> Result<()> {
             fs::remove_file(path)?;
         }
     }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn remove_startup_entry() -> Result<()> {
-    let mut key = std::ptr::null_mut();
-    let subkey = wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
-    if unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            0,
-            KEY_SET_VALUE,
-            &mut key,
-        )
-    } == 0
-    {
-        unsafe {
-            RegDeleteValueW(key, wide("HeadroomRoute").as_ptr());
-            RegCloseKey(key);
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn remove_startup_entry() -> Result<()> {
     Ok(())
 }
 

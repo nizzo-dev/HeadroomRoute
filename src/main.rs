@@ -15,6 +15,7 @@ mod proxy;
 pub mod routing_policy;
 mod runtime;
 mod sqlite;
+mod startup;
 mod state;
 mod tray;
 mod updater;
@@ -369,13 +370,11 @@ fn run() -> Result<()> {
     }
     match app.begin_session() {
         Ok(true) if precheck::mode_needs_headroom(&startup_config) => {
-            // The previous process did not mark a clean exit. Let the
-            // managed Headroom worker perform a full stop/start recovery.
+            // Unclean previous exit: Headroom worker will stop/start.
             app.restart_headroom.store(true, Ordering::Release);
         }
         Ok(true) => {
-            // Direct and bypass modes have no managed Headroom child to
-            // restart, but the route configuration was already synchronized.
+            // Direct/bypass have no Headroom child; routes already synced.
             app.process_recovery_event(
                 crate::environment_recovery::EnvironmentEvent::RecoverySucceeded,
             );
@@ -501,15 +500,16 @@ fn show_info(message: &str) {
     notification::blocking_info("Headroom Route", message);
 }
 
-/// 首次运行且非无界面/演示参数时，自动打开一次预检向导。
+/// 首次运行且非无界面/演示/开机自启参数时，自动打开一次预检向导。
 fn should_auto_open_precheck(first_run: bool, args: &[String]) -> bool {
     first_run
-        && !args
-            .iter()
-            .any(|arg| arg.starts_with("--headless-seconds="))
-        && !args
-            .iter()
-            .any(|arg| matches!(arg.as_str(), "--approval-demo" | "--notification-demo"))
+        && !args.iter().any(|arg| {
+            arg.starts_with("--headless-seconds=")
+                || matches!(
+                    arg.as_str(),
+                    "--approval-demo" | "--notification-demo" | "--autostart"
+                )
+        })
 }
 
 /// 启动门禁：是否把 Headroom 运行环境标记为不可用。只有模式确实需要 Headroom
@@ -518,8 +518,7 @@ fn should_mark_runtime_unavailable(config: &crate::model::AppConfig, python_foun
     precheck::mode_needs_headroom(config) && !python_found
 }
 
-/// 启动阶段是否需要探测 Headroom 运行环境：仅在接管上游且未旁路时才启动
-/// 只读子进程探测。观测模式、旁路或协议全禁用时短路返回 `false`。
+/// 仅在模式需要 Headroom 时才做启动探测。
 fn should_probe_python_at_startup(config: &crate::model::AppConfig) -> bool {
     precheck::mode_needs_headroom(config)
 }
@@ -614,6 +613,7 @@ mod tests {
             true,
             &["--headless-seconds=5".into(), "--approval-demo".into()]
         ));
+        assert!(!should_auto_open_precheck(true, &["--autostart".into()]));
         assert!(should_auto_open_precheck(true, &["--doctor".into()]));
     }
 

@@ -108,15 +108,22 @@ pub(super) unsafe fn handle_command(hwnd: HWND, id: usize) {
             );
         }
         ID_STARTUP => {
-            let enabled = {
+            let (enabled, state_dir) = {
                 let _config_guard = app.config_write_guard();
                 let mut state = app.inner.lock().unwrap();
                 state.config.start_with_windows = !state.config.start_with_windows;
                 let path = state.config.state_dir.join("config.json");
                 let _ = config::save(&path, &state.config);
-                state.config.start_with_windows
+                (
+                    state.config.start_with_windows,
+                    state.config.state_dir.clone(),
+                )
             };
-            if let Err(e) = set_startup(enabled) {
+            let exe = match std::env::current_exe() {
+                Ok(current) => crate::startup::autostart_executable(&state_dir, &current),
+                Err(_) => crate::startup::installed_executable(&state_dir),
+            };
+            if let Err(e) = crate::startup::set_enabled(enabled, &exe) {
                 notify(hwnd, "开机启动设置失败", &e.to_string())
             }
         }

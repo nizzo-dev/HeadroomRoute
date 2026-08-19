@@ -4,7 +4,7 @@
 805	src/routing_policy.rs
 786	ui/main/app.html
 747	src/config.rs
-742	src/tray.rs
+707	src/tray.rs
 688	src/worker.rs
 737	src/updater.rs
 678	src/main.rs

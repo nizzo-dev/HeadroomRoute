@@ -50,6 +50,49 @@ function Remove-UserPathEntry([string]$Entry) {
     [Environment]::SetEnvironmentVariable('Path', ($entries -join ';'), 'User')
 }
 
+function Get-RunExecutablePath([string]$RunValue) {
+    $value = if ($null -eq $RunValue) { '' } else { $RunValue.Trim() }
+    if (!$value) { return '' }
+    if ($value.StartsWith('"')) {
+        $end = $value.IndexOf('"', 1)
+        if ($end -gt 1) { return Normalize-PathEntry $value.Substring(1, $end - 1) }
+    }
+    return Normalize-PathEntry (($value -split '\s+', 2)[0])
+}
+
+function Test-ShouldRewriteAutostart(
+    [string]$ExistingRunValue,
+    [string]$InstalledExe,
+    [string]$InstallDir,
+    [string]$UpdatingProcessPath
+) {
+    $existing = Get-RunExecutablePath $ExistingRunValue
+    $installed = Normalize-PathEntry $InstalledExe
+    if (!$existing -or !$installed -or ($existing -ieq $installed)) { return $false }
+    $leaf = [System.IO.Path]::GetFileName($existing)
+    if ($leaf -notmatch '^(?i)HeadroomRoute.*\.exe$') { return $false }
+    $existingDir = Normalize-PathEntry ([System.IO.Path]::GetDirectoryName($existing))
+    if ($existingDir -ieq (Normalize-PathEntry $InstallDir)) { return $true }
+    $updating = Normalize-PathEntry $UpdatingProcessPath
+    return [bool]($updating -and ($updating -ieq $existing))
+}
+
+function Sync-AutostartRunValue([string]$InstalledExe, [string]$InstallDir, [string]$UpdatingProcessPath) {
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $name = 'HeadroomRoute'
+    $existing = $null
+    if (Test-Path -LiteralPath $runKey) {
+        $existing = (Get-ItemProperty -LiteralPath $runKey -Name $name -ErrorAction SilentlyContinue).$name
+    }
+    if (-not (Test-ShouldRewriteAutostart $existing $InstalledExe $InstallDir $UpdatingProcessPath)) {
+        return
+    }
+    if (!(Test-Path -LiteralPath $runKey)) {
+        New-Item -Path $runKey -Force | Out-Null
+    }
+    Set-ItemProperty -LiteralPath $runKey -Name $name -Value ('"{0}" --autostart' -f $InstalledExe)
+}
+
 function Get-FileSha256([string]$Path) {
     $stream = [System.IO.File]::OpenRead($Path)
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
@@ -313,6 +356,7 @@ $started = $null
 $rollbackBackupPath = $null
 $pathAdded = $false
 $pathUpdateFailed = $false
+$updatingProcessPath = ''
 $hadTarget = Test-Path -LiteralPath $target
 $hadCliTarget = Test-Path -LiteralPath $cliTarget
 $hadShimTarget = Test-Path -LiteralPath $shimTarget
@@ -349,8 +393,9 @@ try {
     $running = @(Get-Process -Name 'HeadroomRoute' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $targetPath })
     if ($ProcessId) {
         $current = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
-        if ($current -and $current.ProcessName -like 'HeadroomRoute*' -and $running.Id -notcontains $current.Id) {
-            $running += $current
+        if ($current -and $current.ProcessName -like 'HeadroomRoute*') {
+            if ($current.Path) { $updatingProcessPath = $current.Path }
+            if ($running.Id -notcontains $current.Id) { $running += $current }
         }
     }
     $restart = $StartNow -or $running.Count -gt 0
@@ -450,6 +495,11 @@ try {
     throw
 }
 Remove-Item -LiteralPath $transactionDir -Recurse -Force -ErrorAction SilentlyContinue
+try {
+    Sync-AutostartRunValue -InstalledExe $targetPath -InstallDir $InstallDir -UpdatingProcessPath $updatingProcessPath
+} catch {
+    Write-Warning "已安装新版本，但未能同步开机启动项：$($_.Exception.Message)"
+}
 
 if (!$SkipPathUpdate -and (Test-Path $shimTarget) -and (Test-Path $cliTarget)) {
     try {
