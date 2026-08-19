@@ -2,6 +2,8 @@ use super::*;
 use crate::precheck::{PrecheckAction, PrecheckReport};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod precheck_wizard;
+
 const ID_PRECHECK_SUMMARY: usize = 310;
 const ID_PRECHECK_REPORT: usize = 311;
 const ID_PRECHECK_RECHECK: usize = 312;
@@ -9,6 +11,8 @@ const ID_PRECHECK_COPY: usize = 313;
 const ID_PRECHECK_CLOSE: usize = 314;
 const ID_PRECHECK_ACTION_BASE: usize = 400;
 const PRECHECK_TIMER: usize = 5;
+/// Readonly multiline EDIT 走 WM_CTLCOLORSTATIC。必须用不透明背景，否则换行后的「说明」「建议」会叠字。
+pub(super) const PRECHECK_REPORT_BK_MODE: i32 = OPAQUE as i32;
 const PRECHECK_ACTION_SLOTS: [PrecheckAction; 3] = [
     PrecheckAction::SelectPython,
     PrecheckAction::SyncRoutes,
@@ -43,8 +47,7 @@ pub(super) fn precheck_action_label(action: PrecheckAction) -> &'static str {
     }
 }
 
-/// 紧凑布局下的动作按钮短标签：只够放进极窄按钮（对应
-/// [`PRECHECK_COMPACT_*`] 宽度），保证极小工作区内文本不被裁切。
+/// 紧凑布局下的动作按钮短标签，保证极小工作区内文本不被裁切。
 pub(super) fn precheck_action_compact_label(action: PrecheckAction) -> &'static str {
     match action {
         PrecheckAction::SelectPython => "选择",
@@ -108,8 +111,7 @@ unsafe fn precheck_dpi(owner: HWND) -> u32 {
     GetDpiForSystem().max(96)
 }
 
-/// 打开启动预检向导。收集在后台线程运行，模态消息循环保持托盘可响应；
-/// 关闭窗口不会修改任何配置。窗口按 owner 所在显示器工作区定位并 DPI 缩放。
+/// 打开启动预检向导。收集在后台线程运行；关闭窗口不会修改任何配置。
 #[allow(unsafe_op_in_unsafe_fn)]
 pub(super) unsafe fn show_precheck(parent: HWND) {
     if PRECHECK_ACTIVE.swap(true, Ordering::AcqRel) {
@@ -165,8 +167,7 @@ pub(super) unsafe fn show_precheck(parent: HWND) {
         raw.cast(),
     );
     if window.is_null() {
-        // CreateWindowExW 返回空即 WM_NCCREATE 未成功安装对话框指针，Box 仍归本处所有，
-        // 释放一次；成功后由 WM_NCDESTROY 恰好释放一次，两条路径互斥。
+        // CreateWindowExW 失败时 Box 仍归本处；成功后由 WM_NCDESTROY 释放，两条路径互斥。
         drop(Box::from_raw(raw));
         EnableWindow(parent, 1);
         PRECHECK_ACTIVE.store(false, Ordering::Release);
@@ -177,9 +178,7 @@ pub(super) unsafe fn show_precheck(parent: HWND) {
         );
         return;
     }
-    // 启动时自动打开时，本进程通常还不是前台线程（例如从终端启动时控制台窗口持有
-    // 前台），新建的预检窗口若不被激活会落到前台窗口之后，看起来就像“没有打开”。
-    // 这里先用 HWND_TOPMOST 越过普通窗口、随后取消置顶，再激活到前台并取得键盘焦点。
+    // 自动打开时进程常非前台；先 TOPMOST 再取消，避免预检窗落到控制台后面。
     SetWindowPos(
         window,
         HWND_TOPMOST,
@@ -198,8 +197,7 @@ pub(super) unsafe fn show_precheck(parent: HWND) {
             DispatchMessageW(&message);
         }
     }
-    // 模态循环可能因 WM_QUIT 退出而窗口仍在；销毁它以保证 WM_NCDESTROY 一定执行，
-    // 使 `PRECHECK_ACTIVE` 复位且对话框 Box 恰好释放一次。
+    // 模态循环可能因 WM_QUIT 退出而窗口仍在；销毁以保证 WM_NCDESTROY 一定执行。
     if IsWindow(window) != 0 {
         DestroyWindow(window);
     }
@@ -224,8 +222,11 @@ pub(super) unsafe extern "system" fn precheck_window_proc(
             (*dialog).start_collect(hwnd);
             0
         }
-        WM_CTLCOLORSTATIC => {
-            SetBkMode(wparam as _, TRANSPARENT as i32);
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
+            // Readonly EDIT 发 WM_CTLCOLORSTATIC。透明背景会让「说明」「建议」叠字。
+            SetBkMode(wparam as _, PRECHECK_REPORT_BK_MODE);
+            SetBkColor(wparam as _, GetSysColor(COLOR_WINDOW));
+            SetTextColor(wparam as _, GetSysColor(COLOR_WINDOWTEXT));
             GetSysColorBrush(COLOR_WINDOW) as LRESULT
         }
         WM_TIMER if wparam == PRECHECK_TIMER => {
@@ -245,8 +246,7 @@ pub(super) unsafe extern "system" fn precheck_window_proc(
                 } else if (ID_PRECHECK_ACTION_BASE..ID_PRECHECK_ACTION_BASE + 3).contains(&id) {
                     let slot = id - ID_PRECHECK_ACTION_BASE;
                     if let Some(command) = precheck_action_command(slot) {
-                        // 修复动作委托给 owner（托盘）窗口，避免以预检子窗口为宿主；
-                        // 预检窗口保持打开，用户可随后点击“重新检测”。
+                        // 动作交给托盘窗口执行；预检窗保持打开，用户可再点「重新检测」。
                         unsafe { handle_command((*dialog).parent, command) };
                     }
                 }
@@ -447,8 +447,7 @@ impl PrecheckDialog {
         self.receiver = Some(rx);
         let config = self.app.inner.lock().unwrap().config.clone();
         self.update_ui(hwnd);
-        // 后台线程只持有克隆的 config 与发送端 tx，不持有任何窗口句柄；窗口提前
-        // 关闭时接收端随 Box 一起释放，tx.send 静默失败后线程自行退出，无悬挂指针。
+        // 后台线程只持有克隆的 config 与 tx；窗口关闭后 send 失败，线程自行退出。
         let _ = thread::Builder::new()
             .name("headroom-precheck".into())
             .spawn(move || {
@@ -516,7 +515,7 @@ impl PrecheckDialog {
         } else {
             self.report
                 .as_ref()
-                .map_or_else(String::new, |report| report.to_text())
+                .map_or_else(String::new, precheck_wizard::wizard_text)
         };
         SetWindowTextW(
             GetDlgItem(hwnd, ID_PRECHECK_REPORT as i32),
@@ -530,7 +529,7 @@ impl PrecheckDialog {
         let actions = self
             .report
             .as_ref()
-            .map_or_else(Vec::new, |report| report.actions());
+            .map_or_else(Vec::new, precheck_wizard::wizard_actions);
         for (slot, action) in PRECHECK_ACTION_SLOTS.into_iter().enumerate() {
             let show = !self.collecting && !self.failed && actions.contains(&action);
             ShowWindow(

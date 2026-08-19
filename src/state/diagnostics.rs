@@ -113,7 +113,7 @@ impl AppState {
             )
         };
         let cli = crate::cli_identity::CliCompatibility::inspect_cached(&config.state_dir);
-        format!(
+        let body = format!(
             "{existing}\r\n\r\n{}\r\nCLI wrapper: {}\r\nCLI 路径: {}\r\nCLI 版本: {}（期望 {}）\r\n通知协议: {}（期望 {}）",
             precheck.to_text(),
             if cli.compatible {
@@ -128,6 +128,78 @@ impl AppState {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "--".into()),
             crate::cli_identity::CLI_PROTOCOL_VERSION,
-        )
+        );
+        format!("{body}\r\n\r\n{}", current_install_verification())
+    }
+
+    pub fn install_verification_text() -> String {
+        current_install_verification()
+    }
+
+    pub fn current_exe_sha256() -> Option<String> {
+        hash_current_exe()
+    }
+}
+
+fn sha256_path(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = std::io::Read::read(&mut file, &mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn hash_current_exe() -> Option<String> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| sha256_path(&path).ok())
+}
+
+fn current_install_verification() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let edition = crate::edition::EDITION;
+    let path = std::env::current_exe()
+        .map(|value| value.display().to_string())
+        .unwrap_or_else(|_| "--".into());
+    let hash = hash_current_exe().unwrap_or_else(|| "无法计算".into());
+    let expected_name = match edition {
+        "desktop" => format!("HeadroomRoute-{version}-desktop.exe"),
+        _ => format!("HeadroomRoute-{version}.exe"),
+    };
+    format!(
+        "安装验证\r\n版本: {version}\r\n版本形态: {edition}\r\n路径: {path}\r\nSHA-256: {hash}\r\n\r\n当前正式版默认未做 Authenticode 签名。请把上述哈希对照 GitHub Release 同版本 HeadroomRoute-{version}-SHA256SUMS.txt 中的 {expected_name}。\r\n清单: https://github.com/nizzo-dev/HeadroomRoute/releases/download/v{version}/HeadroomRoute-{version}-SHA256SUMS.txt"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::Digest;
+
+    #[test]
+    fn sha256_path_matches_known_abc_digest() {
+        let path =
+            std::env::temp_dir().join(format!("headroom-route-sha256-test-{}", std::process::id()));
+        fs::write(&path, b"abc").unwrap();
+        let hash = sha256_path(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(hash, format!("{:x}", sha2::Sha256::digest(b"abc")));
+    }
+
+    #[test]
+    fn install_verification_text_names_sums_file_and_edition() {
+        let text = current_install_verification();
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(text.contains("SHA-256"));
+        assert!(text.contains(&format!("HeadroomRoute-{version}-SHA256SUMS.txt")));
+        assert!(text.contains(crate::edition::EDITION));
+        assert!(text.contains("未做 Authenticode 签名"));
     }
 }

@@ -1,16 +1,16 @@
 # Frozen line ceilings for files already at or above ~500 lines.
 # Do not raise any number. After a split, lower or delete the row.
-838	src/state.rs
+837	src/state.rs
 805	src/routing_policy.rs
-786	ui/main/app.html
-747	src/config.rs
+769	ui/main/app.html
+746	src/config.rs
 707	src/tray.rs
 688	src/worker.rs
-687	src/updater/mod.rs
+683	src/updater/mod.rs
 678	src/main.rs
 677	src/precheck.rs
 677	src/model.rs
 655	src/environment_recovery.rs
 635	src/operation_history.rs
 616	src/config_portability.rs
-557	src/tray/precheck_dialog.rs
+544	src/tray/precheck_dialog.rs

@@ -1,9 +1,9 @@
 use super::{
     ID_CONFIG, ID_RESTART, ID_SELECT_RUNTIME, ID_SYNC, approval_allow_rect, approval_deny_rect,
-    approval_ease, approval_lerp, approval_scale, compact_number, failover_sources,
-    hover_popup_size, move_target, precheck_action_command, precheck_action_compact_label,
-    precheck_action_label, precheck_layout, precheck_scale, recommended_action, route_hover_text,
-    route_is_selected,
+    approval_ease, approval_lerp, approval_scale, compact_number, exit_menu_label,
+    failover_sources, hover_popup_size, move_target, precheck_action_command,
+    precheck_action_compact_label, precheck_action_label, precheck_layout, precheck_scale,
+    recommended_action, route_hover_text, route_is_selected,
 };
 use crate::model::{
     AuthStyle, FailoverPolicy, Protocol, Route, RouteHealth, RuntimeStatusInput,
@@ -315,6 +315,19 @@ fn precheck_action_compact_labels_are_short() {
         precheck_action_compact_label(PrecheckAction::OpenConfig),
         "配置"
     );
+}
+
+#[test]
+fn precheck_report_paints_opaque_so_advice_does_not_overlap() {
+    assert_eq!(super::precheck_dialog::PRECHECK_REPORT_BK_MODE, 2);
+}
+
+#[test]
+fn exit_label_names_only_managed_protocols() {
+    assert_eq!(exit_menu_label(false, false), "退出 HeadroomRoute");
+    assert_eq!(exit_menu_label(true, false), "退出并交还 Codex");
+    assert_eq!(exit_menu_label(false, true), "退出并交还 Claude");
+    assert_eq!(exit_menu_label(true, true), "退出并交还 Codex 与 Claude");
 }
 
 #[test]

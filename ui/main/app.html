@@ -304,10 +304,10 @@ html, body { overflow: hidden; }
 }
 main { flex: 1; min-height: 0; padding: 26px 36px 32px; overflow: auto; background: var(--bg); scrollbar-width: none; }
 html::-webkit-scrollbar, body::-webkit-scrollbar, main::-webkit-scrollbar { width: 0; height: 0; }
-.panel-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 20px; }
+.panel-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 20px; min-width: 0; }
 .panel-title { margin: 0 0 5px; font-size: 22px; font-weight: 650; }
 .panel-subtitle, .hint { margin: 0; color: var(--text-dim); font-size: 12px; }
-.toolbar { display: flex; align-items: center; gap: 10px; }
+.toolbar { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
 .card {
   padding: 0;
   margin-bottom: 14px;
@@ -316,7 +316,7 @@ html::-webkit-scrollbar, body::-webkit-scrollbar, main::-webkit-scrollbar { widt
   background: var(--bg-card);
 }
 .card h2 { margin: 0; padding: 17px 20px 8px; color: var(--text); font-size: 13px; }
-.status-list { display: grid; grid-template-columns: repeat(3, 1fr); }
+.status-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); } .status-list:has(.status-item:nth-child(2):last-child) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .status-item { min-width: 0; padding: 18px 20px 20px; border-right: 1px solid var(--border); }
 .status-item:last-child { border-right: 0; }
 .status-item .k { display: block; margin-bottom: 8px; color: var(--text-dim); font-size: 11px; }
@@ -325,7 +325,7 @@ html::-webkit-scrollbar, body::-webkit-scrollbar, main::-webkit-scrollbar { widt
 .route-list { gap: 14px; }
 .route {
   min-height: 88px;
-  grid-template-columns: 24px 44px minmax(180px, 1fr) auto;
+  grid-template-columns: 24px 44px minmax(0, 1fr) auto;
   gap: 14px;
   padding: 13px 20px;
   border-radius: 8px;
@@ -336,22 +336,22 @@ html::-webkit-scrollbar, body::-webkit-scrollbar, main::-webkit-scrollbar { widt
 .route.selected { border-color: var(--accent); background: var(--route-selected-bg); }
 .route .drag { color: #686c76; font-size: 18px; letter-spacing: 1px; }
 .route .avatar { display: grid; place-items: center; width: 42px; height: 42px; border: 1px solid var(--border); border-radius: 7px; color: #b6bac4; background: #292b30; font-size: 12px; font-weight: 650; }
-.route .name { font-size: 15px; font-weight: 650; }
-.route .meta { margin-top: 5px; color: var(--accent); font-size: 12px; }
-.route .url { color: var(--text-dim); word-break: break-all; white-space: pre-wrap; }
-.route .route-actions { display: flex; align-items: center; gap: 8px; }
+.route .name { font-size: 15px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.route .meta { margin-top: 5px; color: var(--accent); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.route > div:not(.route-actions) { min-width: 0; overflow: hidden; } .route .url { color: var(--text-dim); }
+.route .route-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; white-space: nowrap; }
 .route .latency { min-width: 64px; color: var(--text-dim); font-size: 11px; text-align: right; }
 button.btn, label.check { border-radius: 7px; }
 button.btn { min-height: 38px; }
 button.btn.primary { box-shadow: 0 6px 18px rgba(22,131,255,.18); }
-.route .select-route { display: none; }
+.route .select-route { display: none; white-space: nowrap; }
 .route.selected .select-route, .route:hover .select-route { display: inline-flex; }
 label.check { min-height: 42px; padding: 0 13px; }
 .ops-grid, .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .action-row { display: flex; align-items: center; justify-content: space-between; min-height: 72px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-card); }
 .action-copy strong { display: block; font-size: 13px; }
 .action-copy span { display: block; margin-top: 4px; color: var(--text-dim); font-size: 11px; }
-.settings-grid .btn { min-height: 52px; text-align: left; }
+.settings-grid .btn { min-height: 42px; text-align: left; } .card .settings-grid { padding: 4px 16px 16px; }
 html[data-theme="light"] .top {
   background: var(--top-surface);
   box-shadow: 0 1px 0 rgba(31, 45, 61, .04);
@@ -399,10 +399,9 @@ html[data-theme="light"] .action-row { box-shadow: 0 1px 3px rgba(31, 45, 61, .0
 @media (max-width: 900px) {
   .brand { min-width: auto; font-size: 0; }
   .tabs button { min-width: 54px; }
-  .status-list, .ops-grid, .settings-grid { grid-template-columns: 1fr; }
+  .status-list, .status-list:has(.status-item:nth-child(2):last-child), .ops-grid, .settings-grid { grid-template-columns: 1fr; }
   .status-item { border-right: 0; border-bottom: 1px solid var(--border); }
-  .route { grid-template-columns: 20px 42px minmax(150px, 1fr); }
-  .route-actions { grid-column: 2 / -1; justify-content: flex-end; }
+  .route { grid-template-columns: 20px 36px minmax(0, 1fr) auto; gap: 10px; padding: 12px 14px; }
 }
   </style>
 </head>
@@ -478,15 +477,15 @@ html[data-theme="light"] .action-row { box-shadow: 0 1px 3px rgba(31, 45, 61, .0
       </div>
       <div class="card" style="margin-top:14px">
         <h2>任务状态</h2>
-        <div class="grid-2">
-          <div class="kv"><span class="k">同步</span><span class="v" id="ops-sync">—</span></div>
-          <div class="kv"><span class="k">重启</span><span class="v" id="ops-restart">—</span></div>
+        <div class="status-list">
+          <div class="status-item"><span class="k">同步</span><span class="v" id="ops-sync">—</span></div>
+          <div class="status-item"><span class="k">重启</span><span class="v" id="ops-restart">—</span></div>
         </div>
       </div>
     </section>
 
     <section id="tab-settings" class="panel">
-      <div class="panel-head"><div><h1 class="panel-title">设置</h1><p class="panel-subtitle">启动行为、维护工具与配置可移植性</p></div></div>
+      <div class="panel-head"><div><h1 class="panel-title">设置</h1><p class="panel-subtitle">日常选项在上，危险操作在下</p></div></div>
       <div class="action-row" style="margin-bottom:14px">
         <div class="action-copy"><strong>界面主题</strong><span>选择深色、浅色或跟随 Windows 系统设置</span></div>
         <select id="theme-select" class="theme-pick" title="界面主题" aria-label="界面主题">
@@ -500,27 +499,11 @@ html[data-theme="light"] .action-row { box-shadow: 0 1px 3px rgba(31, 45, 61, .0
         <label class="check"><input type="checkbox" data-command="118" id="chk-autoupdate" /> 每日检查软件更新</label>
         <label class="check"><input type="checkbox" data-command="116" id="chk-showkey" /> 显示上游 API Key</label>
       </div>
-      <div class="settings-grid" style="margin-top:12px">
-        <button type="button" class="btn" data-command="107">打开 config.json</button>
-        <button type="button" class="btn" data-command="108">打开数据与日志目录</button>
-        <button type="button" class="btn" data-command="125">运行启动预检…</button>
-        <button type="button" class="btn" data-command="106">复制脱敏诊断报告</button>
-        <button type="button" class="btn" data-command="131">创建脱敏诊断 ZIP…</button>
-        <button type="button" class="btn" data-command="119">复制 Provider ID 清单</button>
-        <button type="button" class="btn" data-command="120">重新加载故障转移规则</button>
-        <button type="button" class="btn" data-command="117">清零 Headroom 统计…</button>
-        <button type="button" class="btn" data-command="126">预览并应用 CLI 接管…</button>
-        <button type="button" class="btn" data-command="127">创建配置备份</button>
-        <button type="button" class="btn" data-command="128">恢复配置备份…</button>
-        <button type="button" class="btn" data-command="129">导出可移植配置…</button>
-        <button type="button" class="btn" data-command="130">导入可移植配置…</button>
-        <button type="button" class="btn" data-command="113" id="btn-update">检查软件更新…</button>
-        <button type="button" class="btn" data-command="111">重新检测 Headroom 环境…</button>
-        <button type="button" class="btn" data-command="115">选择 Headroom Python…</button>
-        <button type="button" class="btn" data-command="110">恢复 Codex / Claude 原始配置…</button>
-        <button type="button" class="btn" data-command="112">完全卸载并还原…</button>
-        <button type="button" class="btn" data-command="122">测试确认悬浮窗</button>
-      </div>
+      <div class="card" style="margin-top:14px"><h2>更新与验证</h2><div class="settings-grid" style="padding:8px 16px 16px"><button type="button" class="btn" data-command="113" id="btn-update">检查软件更新…</button><button type="button" class="btn" data-command="132">验证当前安装…</button></div></div>
+      <div class="card"><h2>环境</h2><div class="settings-grid" style="padding:8px 16px 16px"><button type="button" class="btn" data-command="125">运行启动预检…</button><button type="button" class="btn" data-command="115">选择 Headroom Python…</button><button type="button" class="btn" data-command="111">重新检测 Headroom 环境…</button></div></div>
+      <div class="card"><h2>配置与备份</h2><div class="settings-grid" style="padding:8px 16px 16px"><button type="button" class="btn" data-command="107">打开 config.json</button><button type="button" class="btn" data-command="108">打开数据与日志目录</button><button type="button" class="btn" data-command="127">创建配置备份</button><button type="button" class="btn" data-command="128">恢复配置备份…</button><button type="button" class="btn" data-command="129">导出可移植配置…</button><button type="button" class="btn" data-command="130">导入可移植配置…</button><button type="button" class="btn" data-command="126">预览并应用 CLI 接管…</button></div></div>
+      <div class="card"><h2>诊断</h2><div class="settings-grid" style="padding:8px 16px 16px"><button type="button" class="btn" data-command="106">复制脱敏诊断报告</button><button type="button" class="btn" data-command="131">创建脱敏诊断 ZIP…</button><button type="button" class="btn" data-command="119">复制 Provider ID 清单</button><button type="button" class="btn" data-command="120">重新加载故障转移规则</button><button type="button" class="btn" data-command="117">清零 Headroom 统计…</button></div></div>
+      <div class="card"><h2>危险操作</h2><div class="settings-grid" style="padding:8px 16px 16px"><button type="button" class="btn" data-command="110">恢复 Codex / Claude 原始配置…</button><button type="button" class="btn" data-command="112">完全卸载并还原…</button><button type="button" class="btn" data-command="122">测试确认悬浮窗</button></div></div>
     </section>
   </main>
   <script>
@@ -645,9 +628,9 @@ html[data-theme="light"] .action-row { box-shadow: 0 1px 3px rgba(31, 45, 61, .0
       el.innerHTML =
         '<span class="drag" aria-hidden="true">⠿</span>' +
         '<span class="avatar">' + initials + '</span>' +
-        '<div><div class="name">' + escapeHtml(route.name) + '</div><div class="meta">' +
+        '<div><div class="name" title="' + escapeHtml(route.name) + '">' + escapeHtml(route.name) + '</div><div class="meta">' +
         escapeHtml(route.provider) + " · " + escapeHtml(route.evidence || route.state || "") +
-        '</div><div class="meta url">' + extra + '</div></div>' +
+        '</div><div class="meta url" title="' + extra.replace(/\n/g, " ") + '">' + extra + '</div></div>' +
         '<div class="route-actions"><span class="latency">' +
         (route.latency_ms != null ? route.latency_ms + " ms" : "--") +
         '</span><button type="button" class="btn primary select-route">' +

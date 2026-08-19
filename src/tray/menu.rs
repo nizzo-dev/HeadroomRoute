@@ -23,11 +23,10 @@ pub(super) unsafe fn show_menu(hwnd: HWND) {
             menu,
             MF_STRING,
             ID_EXIT,
-            wide(if snapshot.manage_codex || snapshot.manage_claude {
-                "退出并交还 CC-Switch"
-            } else {
-                "退出 HeadroomRoute"
-            })
+            wide(exit_menu_label(
+                snapshot.manage_codex,
+                snapshot.manage_claude,
+            ))
             .as_ptr(),
         );
         let mut point = POINT::default();
@@ -82,4 +81,13 @@ pub(super) fn recommended_action(
         return Some((ID_CHECK, "建议操作：立即检查上游"));
     }
     (!error.is_empty()).then_some((ID_DIAG, "建议操作：复制脱敏诊断报告"))
+}
+
+pub(super) fn exit_menu_label(manage_codex: bool, manage_claude: bool) -> &'static str {
+    match (manage_codex, manage_claude) {
+        (true, true) => "退出并交还 Codex 与 Claude",
+        (true, false) => "退出并交还 Codex",
+        (false, true) => "退出并交还 Claude",
+        (false, false) => "退出 HeadroomRoute",
+    }
 }

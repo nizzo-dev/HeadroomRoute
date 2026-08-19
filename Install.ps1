@@ -511,6 +511,19 @@ if (!$SkipPathUpdate -and (Test-Path $shimTarget) -and (Test-Path $cliTarget)) {
 }
 
 Write-Host "已安装到 $InstallDir"
+if (Test-Path -LiteralPath $targetPath) {
+    try {
+        $installedHash = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        Write-Host "SHA-256：$installedHash"
+        if ($version) {
+            Write-Host "请对照同版本 HeadroomRoute-$version-SHA256SUMS.txt 中对应 EXE（托盘版 HeadroomRoute-$version.exe，桌面版 HeadroomRoute-$version-desktop.exe）。"
+        }
+        $signature = Get-AuthenticodeSignature -LiteralPath $targetPath
+        Write-Host "Authenticode：$($signature.Status)（当前正式版默认未签名，请以 SHA-256 为准）"
+    } catch {
+        Write-Warning "无法核验已安装程序：$($_.Exception.Message)"
+    }
+}
 if ($hadTarget) { Write-Host "旧版本备份：$backup" }
 if (Test-Path $settingsBackup) { Write-Host "设置备份：$settingsBackup" }
 if ($rollbackBackupPath) { Write-Host "升级前回滚备份：$rollbackBackupPath" }

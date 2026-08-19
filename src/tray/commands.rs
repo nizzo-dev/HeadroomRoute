@@ -222,6 +222,35 @@ pub(super) unsafe fn handle_command(hwnd: HWND, id: usize) {
                 notify(hwnd, "正在检查软件更新", "请等待当前更新操作完成");
             }
         }
+        ID_VERIFY_INSTALL => {
+            let text = AppState::install_verification_text();
+            let hash = AppState::current_exe_sha256().unwrap_or_default();
+            if unsafe {
+                MessageBoxW(
+                    hwnd,
+                    wide(&format!("{text}\r\n\r\n是否复制 SHA-256 并打开校验清单？")).as_ptr(),
+                    wide("验证当前安装").as_ptr(),
+                    MB_YESNO | MB_ICONINFORMATION,
+                )
+            } == IDYES
+            {
+                if !hash.is_empty() {
+                    match copy_clipboard(hwnd, &hash) {
+                        Ok(()) => notify(
+                            hwnd,
+                            "SHA-256 已复制",
+                            "请对照 GitHub 同版本 SHA256SUMS.txt",
+                        ),
+                        Err(error) => notify(hwnd, "复制 SHA-256 失败", &error.to_string()),
+                    }
+                }
+                let version = env!("CARGO_PKG_VERSION");
+                let url = format!(
+                    "https://github.com/nizzo-dev/HeadroomRoute/releases/download/v{version}/HeadroomRoute-{version}-SHA256SUMS.txt"
+                );
+                let _ = Command::new("explorer.exe").arg(url).spawn();
+            }
+        }
         ID_RESTORE => {
             if unsafe {
                 MessageBoxW(

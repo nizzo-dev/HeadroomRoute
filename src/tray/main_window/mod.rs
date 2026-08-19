@@ -359,6 +359,7 @@ fn is_allowed_ui_command(id: usize) -> bool {
             | ID_PROVIDER_IDS
             | ID_RELOAD_FAILOVER
             | ID_UPDATE
+            | ID_VERIFY_INSTALL
             | ID_REPAIR_RUNTIME
             | ID_SELECT_RUNTIME
             | ID_RESTORE

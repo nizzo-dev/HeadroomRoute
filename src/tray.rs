@@ -80,15 +80,15 @@ use windows_sys::Win32::{
         CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
     },
     Graphics::Gdi::{
-        BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW,
+        BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, COLOR_WINDOWTEXT,
         CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen, CreateRoundRectRgn,
         CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH, DT_CENTER,
         DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, DT_VCENTER, DT_WORDBREAK,
         DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD,
-        FillRect, GetMonitorInfoW, GetStockObject, GetSysColorBrush, InvalidateRect,
-        MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-        PS_SOLID, RoundRect, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
-        SetWindowRgn, TRANSPARENT, UpdateWindow,
+        FillRect, GetMonitorInfoW, GetStockObject, GetSysColor, GetSysColorBrush, InvalidateRect,
+        MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, OPAQUE, OUT_DEFAULT_PRECIS,
+        PAINTSTRUCT, PS_SOLID, RoundRect, SRCCOPY, ScreenToClient, SelectObject, SetBkColor,
+        SetBkMode, SetTextColor, SetWindowRgn, TRANSPARENT, UpdateWindow,
     },
     System::{
         DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
@@ -147,6 +147,7 @@ const ID_RESTORE_BACKUP: usize = 128;
 const ID_EXPORT_PORTABLE: usize = 129;
 const ID_IMPORT_PORTABLE: usize = 130;
 const ID_DIAGNOSTIC_ZIP: usize = 131;
+const ID_VERIFY_INSTALL: usize = 132;
 const ID_ROUTE_BASE: usize = 1000;
 const ID_EDITOR_AUTO: usize = 200;
 const ID_EDITOR_PROTOCOL: usize = 201;
@@ -663,8 +664,7 @@ fn make_icon(_health: &str) -> *mut c_void {
         )
     }
 }
-fn notify(hwnd: HWND, title: &str, message: &str) {
-    let _ = hwnd;
+fn notify(_hwnd: HWND, title: &str, message: &str) {
     if title.contains("失败") || title.contains("错误") || message.contains("失败") {
         notification::error(title, message);
     } else if title.contains("警告") || message.contains("不可用") || message.contains("已删除")

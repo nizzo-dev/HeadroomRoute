@@ -85,7 +85,7 @@ function New-ReleaseZip([string]$MainExe, [string]$CliExe, [string]$DestinationZ
         if (Test-Path -LiteralPath $DestinationZip) {
             Remove-Item -LiteralPath $DestinationZip -Force
         }
-        Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $DestinationZip
+        $ProgressPreference = 'SilentlyContinue'; Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $DestinationZip
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $packageArchive = [System.IO.Compression.ZipFile]::OpenRead($DestinationZip)
         try {

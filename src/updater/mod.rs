@@ -20,7 +20,6 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_YESNO, MessageBoxW,
 };
-use zip::ZipArchive;
 
 const DOWNLOAD_ATTEMPTS: usize = 3;
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -35,9 +34,7 @@ struct UpdateInfo {
     checksums: ReleaseAsset,
 }
 
-struct PreparedUpdate {
-    installer: PathBuf,
-}
+type PreparedUpdate = (PathBuf, String);
 
 pub fn is_running() -> bool {
     RUNNING.load(Ordering::Acquire)
@@ -86,7 +83,7 @@ pub fn check_background(config: &AppConfig) -> Result<Option<String>> {
         Ok(
             check_for_update(&client, env!("CARGO_PKG_VERSION"))?.map(|update| {
                 format!(
-                    "发现 HeadroomRoute v{}（{}）；可从“设置与诊断”手动检查并安装",
+                    "发现 HeadroomRoute v{}（{}）；可从设置手动检查并安装",
                     update.version, update.title
                 )
             }),
@@ -120,7 +117,10 @@ fn run_interactive(owner: HWND, config: &AppConfig) -> Result<()> {
         show_message(
             owner,
             "检查软件更新",
-            &format!("当前 v{} 已是最新正式版。", env!("CARGO_PKG_VERSION")),
+            &format!(
+                "当前 v{} 已是最新。可在设置中验证安装。",
+                env!("CARGO_PKG_VERSION")
+            ),
             MB_ICONINFORMATION,
         );
         return Ok(());
@@ -183,7 +183,10 @@ fn run_interactive(owner: HWND, config: &AppConfig) -> Result<()> {
     if show_message(
         owner,
         "更新已准备完成",
-        "更新包已通过 SHA-256 校验。是否立即重启并更新？\r\n\r\n用户设置将先备份，升级失败会自动恢复旧版本。",
+        &format!(
+            "SHA-256：{}\r\n立即重启并更新？失败会恢复。未签名。",
+            prepared.1
+        ),
         MB_YESNO | MB_ICONINFORMATION,
     ) != IDYES
     {
@@ -199,7 +202,7 @@ fn run_interactive(owner: HWND, config: &AppConfig) -> Result<()> {
             "Hidden",
             "-File",
         ])
-        .arg(&prepared.installer)
+        .arg(&prepared.0)
         .arg("-StartNow")
         .arg("-InstallDir")
         .arg(&config.state_dir)
@@ -329,7 +332,7 @@ fn download_update(
     if progress.is_cancelled() {
         return Ok(None);
     }
-    Ok(Some(PreparedUpdate { installer }))
+    Ok(Some((installer, actual)))
 }
 
 fn download_file(
@@ -441,7 +444,7 @@ where
 
 fn extract_files(archive_path: &Path, files: &[(&str, &Path)]) -> Result<()> {
     let file = File::open(archive_path).context("无法打开更新包")?;
-    let mut archive = ZipArchive::new(file).context("更新包不是有效的 ZIP")?;
+    let mut archive = zip::ZipArchive::new(file).context("更新包不是有效的 ZIP")?;
     for (name, destination) in files {
         let index = (0..archive.len())
             .find(|index| {
@@ -526,6 +529,7 @@ fn wide(value: &str) -> Vec<u16> {
 }
 
 #[cfg(test)]
+#[rustfmt::skip]
 mod tests {
     use super::{
         GithubRelease, checksum_for, extract_files, parse_version, select_update, write_download,
@@ -537,9 +541,7 @@ mod tests {
         let file = fs::File::create(path).unwrap();
         let mut archive = zip::ZipWriter::new(file);
         for (name, content) in entries {
-            archive
-                .start_file(*name, zip::write::SimpleFileOptions::default())
-                .unwrap();
+            archive.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
             archive.write_all(content).unwrap();
         }
         archive.finish().unwrap();
@@ -639,10 +641,7 @@ mod tests {
             &[
                 ("Install.ps1", target.join("Install.ps1").as_path()),
                 ("HeadroomRoute-0.5.0.exe", target.join("main.exe").as_path()),
-                (
-                    "HeadroomRouteCLI-0.5.0.exe",
-                    target.join("cli.exe").as_path(),
-                ),
+                ("HeadroomRouteCLI-0.5.0.exe", target.join("cli.exe").as_path()),
                 ("hr.cmd", target.join("hr.cmd").as_path()),
             ],
         );
@@ -672,10 +671,7 @@ mod tests {
             &[
                 ("Install.ps1", target.join("Install.ps1").as_path()),
                 ("HeadroomRoute-0.5.0.exe", target.join("main.exe").as_path()),
-                (
-                    "HeadroomRouteCLI-0.5.0.exe",
-                    target.join("cli.exe").as_path(),
-                ),
+                ("HeadroomRouteCLI-0.5.0.exe", target.join("cli.exe").as_path()),
                 ("hr.cmd", target.join("hr.cmd").as_path()),
             ],
         )
