@@ -6,7 +6,7 @@
 747	src/config.rs
 707	src/tray.rs
 688	src/worker.rs
-737	src/updater.rs
+687	src/updater/mod.rs
 678	src/main.rs
 677	src/precheck.rs
 677	src/model.rs

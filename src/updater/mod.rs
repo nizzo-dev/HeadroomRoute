@@ -1,13 +1,11 @@
-﻿#![cfg(windows)]
+#![cfg(windows)]
+
+mod github;
 
 use crate::{config, model::AppConfig, notification, progress::ProgressWindow};
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::{
-    StatusCode,
-    blocking::{Client, RequestBuilder, Response},
-    header::{RANGE, USER_AGENT},
-};
-use serde::Deserialize;
+use github::{GithubRelease, RELEASE_PAGE, ReleaseAsset};
+use reqwest::{StatusCode, blocking::Client};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
@@ -24,28 +22,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use zip::ZipArchive;
 
-const RELEASE_API: &str = "https://api.github.com/repos/nizzo-dev/HeadroomRoute/releases/latest";
-const RELEASE_PAGE: &str = "https://github.com/nizzo-dev/HeadroomRoute/releases/latest";
 const DOWNLOAD_ATTEMPTS: usize = 3;
 static RUNNING: AtomicBool = AtomicBool::new(false);
-
-#[derive(Clone, Debug, Deserialize)]
-struct ReleaseAsset {
-    name: String,
-    browser_download_url: String,
-    size: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubRelease {
-    tag_name: String,
-    name: Option<String>,
-    body: Option<String>,
-    published_at: Option<String>,
-    draft: bool,
-    prerelease: bool,
-    assets: Vec<ReleaseAsset>,
-}
 
 #[derive(Debug)]
 struct UpdateInfo {
@@ -74,12 +52,16 @@ pub fn start_interactive(owner: usize, config: AppConfig) -> bool {
     }
     thread::spawn(move || {
         if let Err(error) = run_interactive(owner as HWND, &config) {
-            show_message(
+            let detail = format!("{error:#}\r\n\r\n是否用浏览器打开 GitHub Release 页面？");
+            if show_message(
                 owner as HWND,
                 "检查更新失败",
-                &format!("{error:#}"),
-                MB_ICONERROR,
-            );
+                &detail,
+                MB_YESNO | MB_ICONERROR,
+            ) == IDYES
+            {
+                let _ = Command::new("explorer.exe").arg(RELEASE_PAGE).spawn();
+            }
         }
         RUNNING.store(false, Ordering::Release);
     });
@@ -229,17 +211,7 @@ fn run_interactive(owner: HWND, config: &AppConfig) -> Result<()> {
 }
 
 fn check_for_update(client: &Client, current: &str) -> Result<Option<UpdateInfo>> {
-    let release: GithubRelease = send_with_retry(
-        client
-            .get(RELEASE_API)
-            .header(USER_AGENT, format!("HeadroomRoute/{current}")),
-    )
-    .context("无法连接 GitHub")?
-    .error_for_status()
-    .context("GitHub Releases 返回错误")?
-    .json()
-    .context("无法解析 GitHub Release")?;
-    select_update(release, current)
+    select_update(github::fetch_latest_release(client, current)?, current)
 }
 
 fn select_update(release: GithubRelease, current: &str) -> Result<Option<UpdateInfo>> {
@@ -309,15 +281,12 @@ fn download_update(
     if progress.is_cancelled() {
         return Ok(None);
     }
-    let checksum_text = send_with_retry(client.get(&update.checksums.browser_download_url).header(
-        USER_AGENT,
-        format!("HeadroomRoute/{}", env!("CARGO_PKG_VERSION")),
-    ))
-    .context("无法下载 SHA-256 校验清单")?
-    .error_for_status()
-    .context("SHA-256 校验清单下载失败")?
-    .text()
-    .context("无法读取 SHA-256 校验清单")?;
+    let checksum_text = github::get_text(
+        client,
+        &update.checksums.browser_download_url,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .context("无法下载 SHA-256 校验清单")?;
     if progress.is_cancelled() {
         return Ok(None);
     }
@@ -373,23 +342,21 @@ fn download_file(
         let mut offset = fs::metadata(destination)
             .map(|value| value.len())
             .unwrap_or(0);
-        if offset == asset.size {
+        if asset.size != u64::MAX && offset == asset.size {
             progress.set_progress(100);
             return Ok(true);
         }
-        if offset > asset.size {
+        if asset.size != u64::MAX && offset > asset.size {
             fs::write(destination, []).context("无法重置无效的更新临时文件")?;
             offset = 0;
         }
-        let mut request = client.get(&asset.browser_download_url).header(
-            USER_AGENT,
-            format!("HeadroomRoute/{}", env!("CARGO_PKG_VERSION")),
-        );
-        if offset > 0 {
-            request = request.header(RANGE, format!("bytes={offset}-"));
-        }
         let result = (|| {
-            let response = request.send()?.error_for_status()?;
+            let response = github::send_download(
+                client,
+                &asset.browser_download_url,
+                env!("CARGO_PKG_VERSION"),
+                (offset > 0).then_some(offset),
+            )?;
             let resumed = offset > 0 && response.status() == StatusCode::PARTIAL_CONTENT;
             let start = if resumed { offset } else { 0 };
             let total = response
@@ -460,7 +427,7 @@ where
             downloaded += count as u64;
             report(downloaded, total);
         }
-        if downloaded != total {
+        if downloaded != total && total != u64::MAX {
             bail!("更新包下载不完整：{} / {} 字节", downloaded, total);
         }
         file.sync_all().context("无法保存完整更新包")?;
@@ -470,23 +437,6 @@ where
         let _ = fs::remove_file(destination);
     }
     result
-}
-
-fn send_with_retry(request: RequestBuilder) -> reqwest::Result<Response> {
-    for attempt in 1..=DOWNLOAD_ATTEMPTS {
-        match request
-            .try_clone()
-            .expect("update requests are cloneable")
-            .send()
-        {
-            Ok(response) => return Ok(response),
-            Err(_) if attempt < DOWNLOAD_ATTEMPTS => {
-                thread::sleep(Duration::from_millis(500 * attempt as u64));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!()
 }
 
 fn extract_files(archive_path: &Path, files: &[(&str, &Path)]) -> Result<()> {
