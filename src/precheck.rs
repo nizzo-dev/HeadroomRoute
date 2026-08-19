@@ -245,7 +245,7 @@ pub fn evaluate(facts: &PrecheckFacts, headroom_setup_advice: &str) -> PrecheckR
             "Headroom 运行环境",
             format!(
                 "当前模式需要 Headroom，已找到可用的 Python 与 Headroom {}",
-                runtime::HEADROOM_VERSION
+                runtime::HEADROOM_VERSIONS_LABEL
             ),
         ));
     } else {
@@ -253,7 +253,7 @@ pub fn evaluate(facts: &PrecheckFacts, headroom_setup_advice: &str) -> PrecheckR
             "Headroom 运行环境",
             format!(
                 "当前模式需要 Headroom，但未找到可用的 Python 与 Headroom {}",
-                runtime::HEADROOM_VERSION
+                runtime::HEADROOM_VERSIONS_LABEL
             ),
             headroom_setup_advice,
             Some(PrecheckAction::SelectPython),

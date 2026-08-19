@@ -10,11 +10,11 @@
 | Windows 10 | 22H2 x64，尽力兼容 | 非发布阻断项 | Windows 10 已结束常规支持，不再作为主要验证平台 |
 | PowerShell | Windows PowerShell 5.1 或更高 | Windows PowerShell 5.1 | `Build.ps1`、`Install.ps1`、`Test-Install.ps1` 必须保持 5.1 语法兼容 |
 | Python | CPython 3.10–3.12.x（`runtime.rs` 探测要求 `>= 3.10`） | CPython 3.12.10 | Python 3.13 及以上需单独验证后再纳入发布阻断矩阵 |
-| Headroom | `headroom-ai[code]==0.34.0`（`runtime.rs` 常量固定） | 0.34.0 | 运行时探测与安装提示固定到该版本；升级前需先做兼容性验证 |
+| Headroom | `headroom-ai[code]` **0.34.0 或 0.35.0**（`runtime.rs` 白名单） | 0.35.0 | 运行时探测接受这两个精确版本；新安装提示 0.35.0。增加其它版本前需先做兼容性验证 |
 | Codex CLI | 不硬编码版本，要求当前稳定版通过包装器验证 | 0.147.0 | 版本命令：`codex --version`（输出形如 `codex-cli 0.147.0`） |
 | Claude Code CLI | 不硬编码版本，要求当前稳定版通过包装器验证 | 2.1.220 | 版本命令：`claude --version`（输出形如 `2.1.220 (Claude Code)`） |
 
-以上本机版本记录更新于 2026-08-08。第三方 CLI 的版本号是已验证样本，不是最低版本声明。
+以上本机版本记录更新于 2026-08-19。第三方 CLI 的版本号是已验证样本，不是最低版本声明。Headroom 0.35.0 已核对 `headroom.cli` 与当前 `proxy` 启动参数均存在。
 
 ## 验证方法
 
@@ -28,7 +28,7 @@
 $PSVersionTable.PSVersion
 
 # Python + Headroom 只读探测，与 HeadroomRoute --doctor / 托盘预检使用的逻辑一致（src/runtime.rs）：
-python -c "import sys,importlib.metadata as m; assert sys.version_info >= (3,10); assert m.version('headroom-ai') == '0.34.0'; import headroom.cli"
+python -c "import sys,importlib.metadata as m; assert sys.version_info >= (3,10); assert m.version('headroom-ai') in ('0.34.0', '0.35.0'); import headroom.cli"
 # 退出码必须为 0；否则说明 Python 版本或 headroom-ai 版本不在基线内
 ```
 

@@ -8,7 +8,9 @@ use std::{
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
 
-pub const HEADROOM_VERSION: &str = "0.34.0";
+pub const HEADROOM_VERSIONS: &[&str] = &["0.34.0", "0.35.0"];
+pub const HEADROOM_VERSION: &str = "0.35.0";
+pub const HEADROOM_VERSIONS_LABEL: &str = "0.34.0 / 0.35.0";
 
 pub fn setup_instructions(config: &AppConfig) -> String {
     let configured = config
@@ -16,7 +18,7 @@ pub fn setup_instructions(config: &AppConfig) -> String {
         .as_deref()
         .map_or_else(|| "未配置".into(), |path| path.display().to_string());
     format!(
-        "未找到可用的 Headroom 环境（当前 Python：{configured}）。\r\n\r\n请在 PowerShell 运行：\r\npython -m venv \"$env:USERPROFILE\\.headroom\\venv\"\r\n& \"$env:USERPROFILE\\.headroom\\venv\\Scripts\\python.exe\" -m pip install \"headroom-ai[code]=={HEADROOM_VERSION}\"\r\n\r\n完成后从托盘选择“重新检测 Headroom 环境”。"
+        "未找到可用的 Headroom 环境（当前 Python：{configured}）。\r\n\r\n请在 PowerShell 运行：\r\npython -m venv \"$env:USERPROFILE\\.headroom\\venv\"\r\n& \"$env:USERPROFILE\\.headroom\\venv\\Scripts\\python.exe\" -m pip install \"headroom-ai[code]=={HEADROOM_VERSION}\"\r\n\r\n也接受 Headroom 0.34.0。完成后从托盘选择“重新检测 Headroom 环境”。"
     )
 }
 
@@ -59,9 +61,7 @@ pub fn validate_python(path: &Path) -> bool {
         return false;
     }
     let mut command = Command::new(path);
-    let check = format!(
-        "import sys,importlib.metadata as m; assert sys.version_info >= (3,10); assert m.version('headroom-ai') == '{HEADROOM_VERSION}'; import headroom.cli"
-    );
+    let check = python_headroom_check();
     hidden(&mut command)
         .args(["-c", &check])
         .stdin(Stdio::null())
@@ -69,6 +69,17 @@ pub fn validate_python(path: &Path) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+fn python_headroom_check() -> String {
+    let versions = HEADROOM_VERSIONS
+        .iter()
+        .map(|version| format!("'{version}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "import sys,importlib.metadata as m; assert sys.version_info >= (3,10); assert m.version('headroom-ai') in ({versions}); import headroom.cli"
+    )
 }
 
 pub fn select_python() -> Result<Option<PathBuf>> {
@@ -227,8 +238,21 @@ mod tests {
     }
 
     #[test]
-    fn setup_instructions_pin_supported_headroom_version() {
+    fn setup_instructions_recommend_current_and_keep_previous() {
         let instructions = setup_instructions(&AppConfig::default());
-        assert!(instructions.contains("headroom-ai[code]==0.34.0"));
+        assert!(instructions.contains("headroom-ai[code]==0.35.0"));
+        assert!(instructions.contains("0.34.0"));
+    }
+
+    #[test]
+    fn python_probe_accepts_supported_headroom_versions() {
+        let check = python_headroom_check();
+        assert!(check.contains("'0.34.0'"));
+        assert!(check.contains("'0.35.0'"));
+        assert!(check.contains(" in ("));
+        assert_eq!(HEADROOM_VERSIONS.last().copied(), Some(HEADROOM_VERSION));
+        for version in HEADROOM_VERSIONS {
+            assert!(HEADROOM_VERSIONS_LABEL.contains(version));
+        }
     }
 }
